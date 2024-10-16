@@ -1,0 +1,17 @@
+[package]
+name = "sharedstate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+message-encoding = "0.2.4"
+sequenced-broadcast = { version = "0.1.1" }
+tokio = { version = "1.40", features = ["full"] }
+tokio-util = "0.7.12"
+futures-util = "0.3.31"
+tracing = "0.1.40"
+slab = "0.4.9"
+rand_chacha = "0.3.1"
+
+[dev-dependencies]
+tracing-subscriber = "0.3.18"
