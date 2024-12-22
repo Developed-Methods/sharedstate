@@ -1,10 +1,10 @@
 [package]
 name = "sharedstate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Patrick Lorio <patrick@methods.dev>"]
-description = "Async structure to allow sequenced broadcasts with history"
-repository = "https://github.com/Developed-Methods/sequenced-broadcast"
+description = "Sync heavily read state across many servers"
+repository = "https://github.com/Developed-Methods/sharedstate"
 license = "BSD-2-Clause"
 license-file = "LICENSE.txt"
 
