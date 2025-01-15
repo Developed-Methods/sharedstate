@@ -114,6 +114,7 @@ impl<D: DeterministicState> RecoverableState<D> {
 
 impl<D: DeterministicState> DeterministicState for RecoverableState<D> {
     type Action = D::Action;
+    type AuthorityAction = D::AuthorityAction;
 
     fn id(&self) -> u64 {
         self.state.id()
@@ -123,7 +124,11 @@ impl<D: DeterministicState> DeterministicState for RecoverableState<D> {
         self.state.sequence()
     }
 
-    fn update(&mut self, action: &Self::Action) {
+    fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
+        self.state.authority(action)
+    }
+
+    fn update(&mut self, action: &Self::AuthorityAction) {
         self.state.update(action)
     }
 }
@@ -180,6 +185,11 @@ mod test {
 
     impl DeterministicState for MockState {
         type Action = ();
+        type AuthorityAction = ();
+
+        fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
+            action
+        }
 
         fn id(&self) -> u64 {
             1

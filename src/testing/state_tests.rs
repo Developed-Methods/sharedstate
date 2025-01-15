@@ -1,4 +1,4 @@
-use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant}};
+use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 use message_encoding::MessageEncoding;
 
@@ -12,6 +12,7 @@ pub struct TestState {
 
 impl DeterministicState for TestState {
     type Action = TestStateAction;
+    type AuthorityAction = (u64, TestStateAction);
 
     fn id(&self) -> u64 {
         1
@@ -21,7 +22,14 @@ impl DeterministicState for TestState {
         self.sequence
     }
 
-    fn update(&mut self, action: &Self::Action) {
+    fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
+        (
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            action
+        )
+    }
+
+    fn update(&mut self, (_time, action): &Self::AuthorityAction) {
         self.sequence += 1;
 
         match action {
@@ -99,7 +107,8 @@ impl MessageEncoding for TestStateAction {
 fn slow_state_deadlock_test() {
     super::setup_logging();
 
-    let (state, mut updater) = SharedState::new(TestState { sequence: 0, numbers: [0i64; 6] });
+    let (state, updater) = SharedState::new(TestState { sequence: 0, numbers: [0i64; 6] });
+    let mut updater = updater.into_lead();
 
     let run = Arc::new(AtomicBool::new(true));
     let failed = Arc::new(AtomicBool::new(false));

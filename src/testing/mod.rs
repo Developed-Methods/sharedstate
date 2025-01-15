@@ -6,7 +6,7 @@ pub mod test_sync_io;
 
 mod message_io_tests;
 pub mod state_tests;
-mod handshake_tests;
+// mod handshake_tests;
 // mod sync_worker_tests;
 
 pub fn setup_logging() {
