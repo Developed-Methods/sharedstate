@@ -14,10 +14,6 @@ impl DeterministicState for TestState {
     type Action = TestStateAction;
     type AuthorityAction = (u64, TestStateAction);
 
-    fn id(&self) -> u64 {
-        1
-    }
-
     fn sequence(&self) -> u64 {
         self.sequence
     }

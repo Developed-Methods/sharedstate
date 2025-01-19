@@ -23,6 +23,7 @@ enum StateUpdaterInternals<D: DeterministicState> {
     Follower {
         updater: FollowUpdater<D>,
         rx: SequencedReceiver<D::AuthorityAction>,
+        tx: SequencedSender<D::AuthorityAction>,
         next: Option<(u64, D::AuthorityAction)>,
     },
 }
@@ -64,8 +65,12 @@ impl<D: DeterministicState> StateUpdater<D> where D::AuthorityAction: Clone {
         )
     }
 
-    pub fn follower(rx: SequencedReceiver<D::AuthorityAction>, updater: FollowUpdater<D>) -> Self {
-        let internals = StateUpdaterInternals::Follower { updater, rx, next: None };
+    pub fn follower(rx: SequencedReceiver<D::AuthorityAction>, updater: FollowUpdater<D>) -> (Self, SequencedReceiver<D::AuthorityAction>) {
+        let (authority_tx, authority_rx) = channel::<(u64, D::AuthorityAction)>(1024);
+        let authority_tx = SequencedSender::new(updater.next_sequence(), authority_tx);
+        let authority_rx = SequencedReceiver::new(updater.next_sequence(), authority_rx);
+
+        let internals = StateUpdaterInternals::Follower { updater, rx, tx: authority_tx, next: None };
         let (replace_tx, replace_rx) = channel::<ReplaceRequest<D>>(1);
 
         tokio::spawn(StateUpdaterWorker {
@@ -74,9 +79,12 @@ impl<D: DeterministicState> StateUpdater<D> where D::AuthorityAction: Clone {
             next_update_action_rx: replace_rx,
         }.start());
 
-        StateUpdater {
-            replace_req_tx: replace_tx,
-        }
+        (
+            StateUpdater {
+                replace_req_tx: replace_tx,
+            },
+            authority_rx
+        )
     }
 
     pub async fn update_internals(&mut self, wait_for_close: bool) -> UpdateInternalsAction<D> {
@@ -137,7 +145,11 @@ impl<D: DeterministicState> UpdateInternalsAction<D> {
         }
     }
 
-    pub fn reset_follow(&mut self, state_rx: StateAndReceiver<D>) {
+    pub fn reset_follow(&mut self, state_rx: StateAndReceiver<D>) -> SequencedReceiver<D::AuthorityAction> {
+        let (tx, rx) = channel(1024);
+        let tx = SequencedSender::new(state_rx.state.sequence(), tx);
+        let rx = SequencedReceiver::new(state_rx.state.sequence(), rx);
+
         let mut inner = self.inner.take().panic("missing inner");
         inner.internals = match inner.internals {
             StateUpdaterInternals::Leader { updater, .. } => {
@@ -147,6 +159,7 @@ impl<D: DeterministicState> UpdateInternalsAction<D> {
                 StateUpdaterInternals::Follower {
                     updater,
                     rx: state_rx.receiver,
+                    tx,
                     next: None
                 }
             }
@@ -156,32 +169,36 @@ impl<D: DeterministicState> UpdateInternalsAction<D> {
                 StateUpdaterInternals::Follower {
                     updater,
                     rx: state_rx.receiver,
+                    tx,
                     next: None,
                 }
             }
         };
 
         self.inner = Some(inner);
+        rx
     }
 
-    pub fn setup_follow(&mut self, rx: SequencedReceiver<D::AuthorityAction>) -> Result<(), u64> {
-        if self.next_sequence() != rx.next_seq() {
+    pub fn setup_follow(&mut self, action_rx: SequencedReceiver<D::AuthorityAction>) -> Result<(), u64> {
+        if self.next_sequence() != action_rx.next_seq() {
             return Err(self.next_sequence());
         }
 
         let mut inner = self.inner.take().panic("missing inner");
         inner.internals = match inner.internals {
-            StateUpdaterInternals::Leader { updater, .. } => {
+            StateUpdaterInternals::Leader { updater, tx, .. } => {
                 StateUpdaterInternals::Follower {
                     updater: updater.follow(),
-                    rx,
+                    rx: action_rx,
+                    tx,
                     next: None
                 }
             }
-            StateUpdaterInternals::Follower { updater, .. } => {
+            StateUpdaterInternals::Follower { updater, tx, .. } => {
                 StateUpdaterInternals::Follower {
                     updater,
-                    rx,
+                    rx: action_rx,
+                    tx,
                     next: None,
                 }
             }
@@ -191,25 +208,30 @@ impl<D: DeterministicState> UpdateInternalsAction<D> {
         Ok(())
     }
 
-    pub fn setup_leader<F: FnOnce(&mut StatePtr<D>)>(&mut self, update: F, action_rx: Receiver<D::Action>) -> SequencedReceiver<D::AuthorityAction> {
+    pub fn become_leader<F: FnOnce(&mut StatePtr<D>) -> bool>(&mut self, update: F, action_rx: Receiver<D::Action>) -> Option<SequencedReceiver<D::AuthorityAction>> {
         let mut inner = self.inner.take().panic("missing inner");
+        let mut new_rx = None;
 
-        let updater = match inner.internals {
-            StateUpdaterInternals::Leader { mut updater, .. } => {
-                updater.update_state(update);
-                updater
-            }
-            StateUpdaterInternals::Follower { updater, .. } => {
+        let (updater, tx) = match inner.internals {
+            StateUpdaterInternals::Leader { updater, tx, .. } => (updater, tx),
+            StateUpdaterInternals::Follower { updater, tx, .. } => {
                 let mut updater = updater.lead();
-                updater.update_state(update);
-                updater
+
+                let seq = updater.next_sequence();
+                let should_update_feed = updater.update_state(update);
+
+                if should_update_feed || seq != updater.next_sequence() {
+                    let (new_tx, rx) = channel(1024);
+                    let seq = updater.next_sequence();
+                    let new_tx = SequencedSender::new(seq, new_tx);
+                    new_rx = Some(SequencedReceiver::new(seq, rx));
+
+                    (updater, new_tx)
+                } else {
+                    (updater, tx)
+                }
             }
         };
-
-        let (tx, rx) = channel(1024);
-        let seq = updater.next_sequence();
-        let tx = SequencedSender::new(seq, tx);
-        let rx = SequencedReceiver::new(seq, rx);
 
         inner.internals = StateUpdaterInternals::Leader {
             updater,
@@ -219,7 +241,7 @@ impl<D: DeterministicState> UpdateInternalsAction<D> {
         };
 
         self.inner = Some(inner);
-        rx
+        new_rx
     }
 
     pub fn apply(self) {
@@ -339,7 +361,7 @@ impl<D: DeterministicState> StateUpdaterWorker<D> where D::AuthorityAction: Clon
                         }
                     }
                 }
-                StateUpdaterInternals::Follower { updater, rx, next } => {
+                StateUpdaterInternals::Follower { updater, rx, tx, next } => {
                     for _ in 0..1024 {
                         let (seq, action) = match next.take() {
                             Some(action) => action,
@@ -358,8 +380,20 @@ impl<D: DeterministicState> StateUpdaterWorker<D> where D::AuthorityAction: Clon
                             }
                         };
 
-                        if !updater.queue(seq, action) {
+                        if !updater.queue(seq, action.clone()) {
                             panic!("invalid sequence, expected: {} but got: {}", updater.next_sequence(), seq);
+                        }
+
+                        match tx.safe_send(seq, action).await {
+                            Ok(_) => {}
+                            Err(SequencedSenderError::InvalidSequence(expected, _)) => {
+                                panic!("sending invalid sequence, expected: {} but sent: {}", expected, seq);
+                            }
+                            Err(SequencedSenderError::ChannelClosed(_)) => {
+                                tracing::warn!("leader authority queue closed");
+                                internals_dead = true;
+                                continue 'main_loop;
+                            }
                         }
                     }
 
@@ -450,18 +484,17 @@ mod test {
             assert_eq!(seq, 4);
         }
 
-
         /* go to leader */
         let (tx, mut rx) = {
             let mut update = updater.update_internals(false).await;
             let (tx, rx) = channel(1024);
 
-            let rx = update.setup_leader(|state| {
+            let rx = update.become_leader(|state| {
                 state.sequence = 1;
                 state.numbers[0] = 100;
                 state.numbers[1] = 200;
-            }, rx);
-        println!("EHRE");
+                true
+            }, rx).unwrap();
 
             update.apply();
 

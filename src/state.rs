@@ -6,8 +6,6 @@ pub trait DeterministicState: Sized + Send + Sync + Clone + 'static {
     type Action: Sized + Send + Sync + 'static;
     type AuthorityAction: Sized + Send + Sync + 'static;
 
-    fn id(&self) -> u64;
-
     fn sequence(&self) -> u64;
 
     fn authority(&self, action: Self::Action) -> Self::AuthorityAction;
@@ -163,17 +161,19 @@ impl<D: DeterministicState> LeaderUpdater<D> {
         &self.state
     }
 
-    pub fn update_state<F: FnOnce(&mut StatePtr<D>)>(&mut self, update: F) {
+    pub fn update_state<R, F: FnOnce(&mut StatePtr<D>) -> R>(&mut self, update: F) -> R {
         let mut ptr = StatePtr {
             item: &mut self.state,
             as_mut: false
         };
 
-        update(&mut ptr);
+        let result = update(&mut ptr);
 
         if ptr.as_mut {
             self.updater.reset(self.state.clone());
         }
+
+        result
     }
 
     pub fn next_sequence(&self) -> u64 {
@@ -419,11 +419,10 @@ impl<'a, D: DeterministicState> Iterator for StateActionIter<'a, D> {
 mod test {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{DeterministicState, SharedState};
+    use super::*;
 
     #[derive(Clone, Debug, Default)]
     struct TestState {
-        id: u64,
         sequence: u64,
         time: u64,
         numbers: Vec<u64>,
@@ -432,10 +431,6 @@ mod test {
     impl DeterministicState for TestState {
         type Action = u64;
         type AuthorityAction = (u64, u64);
-
-        fn id(&self) -> u64 {
-            self.id
-        }
 
         fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
             (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64, action)

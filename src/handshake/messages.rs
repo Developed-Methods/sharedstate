@@ -1,97 +1,50 @@
 use message_encoding::MessageEncoding;
 
-use crate::{message_io::unknown_id_err, recoverable_state::RecovGenerationEnd};
+use crate::{message_io::unknown_id_err, recoverable_state::{RecovGenerationEnd, RecoverableStateDetails}};
 
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum HandshakeMessage<A: MessageEncoding> {
-    ConnectRequest(ClientConnectRequest),
-    ConnectResponse(ServerConnectResponse<A>),
-    ServerSnapshotResponse(ServerSnapshotResponse),
-    RelayFollowup(ClientRelayFollowup),
+pub enum HandshakeMessage {
+    ConnectRequest(ConnectRequest),
+    ConnectResponse(ConnectResponse),
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum ClientConnectRequest {
+pub enum ConnectRequest {
     Connect,
-    Reconnect {
-        state_id: u64,
-        state_generation: u64,
-        state_sequence: u64
-    },
+    Reconnect(RecoverableStateDetails),
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum ServerConnectResponse<A: MessageEncoding> {
+pub enum ConnectResponse {
     AcceptConnection,
-    AcceptRecovery { generations: Vec<RecovGenerationEnd> },
     RejectConnection,
-    ProposeRelay { leader_address: A },
-    RequestState,
+    AcceptRecovery(RecoverableStateDetails),
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum ServerSnapshotResponse {
-    SnapshotAccept,
-    SnapshotReject,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum ClientRelayFollowup {
-    AcceptRelay,
-    RejectRelay,
-}
-
-impl<A: MessageEncoding> MessageEncoding for HandshakeMessage<A> {
+impl MessageEncoding for HandshakeMessage {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
 
         match self {
             /* Request */
-            Self::ConnectRequest(ClientConnectRequest::Connect) => {
+            Self::ConnectRequest(ConnectRequest::Connect) => {
                 sum += 1u16.write_to(out)?;
             }
-            Self::ConnectRequest(ClientConnectRequest::Reconnect { state_id, state_generation, state_sequence }) => {
+            Self::ConnectRequest(ConnectRequest::Reconnect(details)) => {
                 sum += 2u16.write_to(out)?;
-                sum += state_id.write_to(out)?;
-                sum += state_generation.write_to(out)?;
-                sum += state_sequence.write_to(out)?;
+                sum += details.write_to(out)?;
             }
             /* Response */
-            Self::ConnectResponse(ServerConnectResponse::AcceptConnection) => {
+            Self::ConnectResponse(ConnectResponse::AcceptConnection) => {
                 sum += 3u16.write_to(out)?;
             }
-            Self::ConnectResponse(ServerConnectResponse::RejectConnection) => {
+            Self::ConnectResponse(ConnectResponse::RejectConnection) => {
                 sum += 4u16.write_to(out)?;
             }
-            Self::ConnectResponse(ServerConnectResponse::ProposeRelay { leader_address }) => {
+            Self::ConnectResponse(ConnectResponse::AcceptRecovery(details)) => {
                 sum += 5u16.write_to(out)?;
-                sum += leader_address.write_to(out)?;
-            }
-            Self::ConnectResponse(ServerConnectResponse::RequestState) => {
-                sum += 6u16.write_to(out)?;
-            }
-            Self::ConnectResponse(ServerConnectResponse::AcceptRecovery { generations }) => {
-                sum += 7u16.write_to(out)?;
-                sum += (generations.len() as u64).write_to(out)?;
-                for gen in generations {
-                    sum += gen.generation.write_to(out)?;
-                    sum += gen.next_sequence.write_to(out)?;
-                }
-            }
-            /* ServerSnapshotResponse */
-            Self::ServerSnapshotResponse(ServerSnapshotResponse::SnapshotAccept) => {
-                sum += 8u16.write_to(out)?;
-            }
-            Self::ServerSnapshotResponse(ServerSnapshotResponse::SnapshotReject) => {
-                sum += 9u16.write_to(out)?;
-            }
-            /* RelayFollowup */
-            Self::RelayFollowup(ClientRelayFollowup::AcceptRelay) => {
-                sum += 10u16.write_to(out)?;
-            }
-            Self::RelayFollowup(ClientRelayFollowup::RejectRelay) => {
-                sum += 11u16.write_to(out)?;
+                sum += details.write_to(out)?;
             }
         }
 
@@ -102,33 +55,11 @@ impl<A: MessageEncoding> MessageEncoding for HandshakeMessage<A> {
         let id = u16::read_from(read)?;
 
         match id {
-            1 => Ok(Self::ConnectRequest(ClientConnectRequest::Connect)),
-            2 => Ok(Self::ConnectRequest(ClientConnectRequest::Reconnect {
-                state_id: MessageEncoding::read_from(read)?,
-                state_generation: MessageEncoding::read_from(read)?,
-                state_sequence: MessageEncoding::read_from(read)?,
-            })),
-            3 => Ok(Self::ConnectResponse(ServerConnectResponse::AcceptConnection)),
-            4 => Ok(Self::ConnectResponse(ServerConnectResponse::RejectConnection)),
-            5 => Ok(Self::ConnectResponse(ServerConnectResponse::ProposeRelay {
-                leader_address: MessageEncoding::read_from(read)?,
-            })),
-            6 => Ok(Self::ConnectResponse(ServerConnectResponse::RequestState)),
-            7 => Ok(Self::ConnectResponse(ServerConnectResponse::AcceptRecovery { generations: {
-                let count = u64::read_from(read)? as usize;
-                let mut gens = Vec::with_capacity(count);
-                for _ in 0..count {
-                    gens.push(RecovGenerationEnd {
-                        generation: MessageEncoding::read_from(read)?,
-                        next_sequence: MessageEncoding::read_from(read)?,
-                    });
-                }
-                gens
-            }})),
-            8 => Ok(Self::ServerSnapshotResponse(ServerSnapshotResponse::SnapshotAccept)),
-            9 => Ok(Self::ServerSnapshotResponse(ServerSnapshotResponse::SnapshotReject)),
-            10 => Ok(Self::RelayFollowup(ClientRelayFollowup::AcceptRelay)),
-            11 => Ok(Self::RelayFollowup(ClientRelayFollowup::RejectRelay)),
+            1 => Ok(Self::ConnectRequest(ConnectRequest::Connect)),
+            2 => Ok(Self::ConnectRequest(ConnectRequest::Reconnect(MessageEncoding::read_from(read)?))),
+            3 => Ok(Self::ConnectResponse(ConnectResponse::AcceptConnection)),
+            4 => Ok(Self::ConnectResponse(ConnectResponse::RejectConnection)),
+            5 => Ok(Self::ConnectResponse(ConnectResponse::AcceptRecovery(MessageEncoding::read_from(read)?))),
             id => Err(unknown_id_err(id, "invalid id from HandshakeMessage")),
         }
     }
@@ -136,26 +67,24 @@ impl<A: MessageEncoding> MessageEncoding for HandshakeMessage<A> {
 
 #[cfg(test)]
 mod test {
+    use std::collections::VecDeque;
+
     use message_encoding::test_assert_valid_encoding;
     use crate::recoverable_state::RecovGenerationEnd;
     use super::*;
 
     #[test]
     fn handshake_msg_tests() {
-        test_assert_valid_encoding(HandshakeMessage::<i32>::ConnectRequest(ClientConnectRequest::Connect));
-        test_assert_valid_encoding(HandshakeMessage::<i32>::ConnectRequest(ClientConnectRequest::Reconnect { state_id: 1, state_generation: 2, state_sequence: 3 }));
-        test_assert_valid_encoding(HandshakeMessage::<i32>::ConnectResponse(ServerConnectResponse::RequestState));
-        test_assert_valid_encoding(HandshakeMessage::<i32>::ConnectResponse(ServerConnectResponse::AcceptConnection));
-        test_assert_valid_encoding(HandshakeMessage::<i32>::ConnectResponse(ServerConnectResponse::RejectConnection));
-        test_assert_valid_encoding(HandshakeMessage::<i32>::ConnectResponse(ServerConnectResponse::ProposeRelay { leader_address: 100 }));
-        test_assert_valid_encoding(HandshakeMessage::<i32>::ConnectResponse(ServerConnectResponse::AcceptRecovery { generations: vec![
+        let history: VecDeque<_> = [
             RecovGenerationEnd { generation: 10, next_sequence: 100 },
             RecovGenerationEnd { generation: 11, next_sequence: 100 },
             RecovGenerationEnd { generation: 12, next_sequence: 102 },
-        ] }));
-        test_assert_valid_encoding(HandshakeMessage::<i32>::ServerSnapshotResponse(ServerSnapshotResponse::SnapshotAccept));
-        test_assert_valid_encoding(HandshakeMessage::<i32>::ServerSnapshotResponse(ServerSnapshotResponse::SnapshotReject));
-        test_assert_valid_encoding(HandshakeMessage::<i32>::RelayFollowup(ClientRelayFollowup::AcceptRelay));
-        test_assert_valid_encoding(HandshakeMessage::<i32>::RelayFollowup(ClientRelayFollowup::RejectRelay));
+        ].into_iter().collect();
+
+        test_assert_valid_encoding(HandshakeMessage::ConnectRequest(ConnectRequest::Connect));
+        test_assert_valid_encoding(HandshakeMessage::ConnectRequest(ConnectRequest::Reconnect(RecoverableStateDetails { sequence: 100, id: 20, generation: 3, state_sequence: 9, history: history.clone() })));
+        test_assert_valid_encoding(HandshakeMessage::ConnectResponse(ConnectResponse::AcceptConnection));
+        test_assert_valid_encoding(HandshakeMessage::ConnectResponse(ConnectResponse::RejectConnection));
+        test_assert_valid_encoding(HandshakeMessage::ConnectResponse(ConnectResponse::AcceptRecovery(RecoverableStateDetails { sequence: 100, id: 20, generation: 3, state_sequence: 9, history: history.clone() })));
     }
 }

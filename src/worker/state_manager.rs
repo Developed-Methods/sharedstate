@@ -6,7 +6,7 @@ use tracing::Instrument;
 
 use crate::{state::{DeterministicState, SharedState}, utils::{PanicHelper, TimeoutPanicHelper}};
 
-use super::state_updater::{ReplaceState, StateUpdater, StateUpdaterReset};
+use super::state_updater::{UpdateInternalsAction, StateUpdater, StateUpdaterReset};
 
 pub struct StateMaintainer<D: DeterministicState> {
     req_tx: Sender<Req<D>>,
@@ -39,7 +39,7 @@ enum Req<D: DeterministicState> {
 }
 
 pub struct StateMaintainerReplaceState<D: DeterministicState> {
-    replace: ReplaceState<D>,
+    replace: UpdateInternalsAction<D>,
 }
 
 impl<D: DeterministicState> StateMaintainerReplaceState<D> {
@@ -134,14 +134,14 @@ impl<D: DeterministicState> StateMaintainerWorker<D> where D::Action: Clone {
                     let client = self.sequenced.add_client(state.sequence(), false)
                         .await.expect("failed to add client to new broadcast");
 
-                    self.updater.replace_state(true)
+                    self.updater.update_internals(true)
                         .timeout(Duration::from_millis(500), "timeout waiting for updater to replace state").await
                         .reset(StateUpdaterReset::new(state, client).panic("invalid sequences"));
 
                     let _ = sender_rx.send(sender);
                 }
                 Req::Replace(resp) => {
-                    let replace = self.updater.replace_state(false)
+                    let replace = self.updater.update_internals(false)
                         .timeout(Duration::from_millis(100), "timeout waiting for replace state").await;
                     let _ = resp.send(StateMaintainerReplaceState { replace });
                 }
