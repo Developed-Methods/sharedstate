@@ -11,7 +11,7 @@ use crate::message_io::{read_message_opt, send_message, send_zero_message};
 use crate::state::DeterministicState;
 
 use crate::recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails};
-use crate::utils::LogHelper;
+use crate::utils::{LogHelper, PanicHelper};
 use super::{HandshakeError, MessageHelper};
 use super::messages::*;
 
@@ -127,19 +127,19 @@ impl<I: SyncIO> WantsRecovery<I> {
         &self.details
     }
 
-    pub async fn accept_recover<D: DeterministicState>(mut self, state: &RecoverableState<D>) -> Result<ClientReady<I, D>, HandshakeError> {
+    pub async fn accept_recover<D: DeterministicState>(mut self, details: RecoverableStateDetails) -> Result<ClientReady<I, D>, HandshakeError> {
         let span = tracing::info_span!("WantsRecovery::accept_client");
 
         async {
-            if !state.details().can_recover_follower(&self.details) {
+            if !details.can_recover_follower(&self.details) {
                 return Err(HandshakeError::RecoverError("leader cannot recover client")).log();
             }
 
-            let sequence = state.sequence();
+            let sequence = details.sequence;
 
             I::send(
                 &mut self.buffer,
-                &HandshakeMessage::ConnectResponse(ConnectResponse::AcceptRecovery(state.details().clone())),
+                &HandshakeMessage::ConnectResponse(ConnectResponse::AcceptRecovery(details)),
                 &mut self.conn.write,
                 Duration::from_secs(2)
             ).await.map_err(HandshakeError::SendError).log()?;
@@ -180,13 +180,27 @@ where D::Action: MessageEncoding, D::AuthorityAction: MessageEncoding
         self.sequence
     }
 
-    pub fn start_io_tasks(self, actions_tx: Sender<D::Action>) -> (I::Address, SequencedSender<RecoverableStateAction<D::AuthorityAction>>)
-    {
+    pub fn start_io_tasks(self, actions_tx: Sender<D::Action>) -> (I::Address, SequencedSender<RecoverableStateAction<D::AuthorityAction>>) {
+        let (tx, rx) = channel(1024);
+
+        let sequence = self.sequence;
+        let remote = self.start_io_tasks2(actions_tx, SequencedReceiver::new(sequence, rx)).panic("invalid sequence");
+
+        (
+            remote,
+            SequencedSender::new(sequence, tx)
+        )
+    }
+
+    pub fn start_io_tasks2(self, actions_tx: Sender<D::Action>, mut authority_rx: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>) -> Result<I::Address, u64> {
+        if authority_rx.next_seq() != self.sequence {
+            return Err(self.sequence);
+        }
+
         let Self {
             mut buffer,
             conn: SyncConnection { remote, mut read, mut write },
-            sequence,
-            _phantom: _,
+            ..
         } = self;
 
         /* read messages into action queue */
@@ -210,15 +224,11 @@ where D::Action: MessageEncoding, D::AuthorityAction: MessageEncoding
             }
         });
 
-        let (tx, rx) = channel(1024);
-        let tx = SequencedSender::<RecoverableStateAction<D::AuthorityAction>>::new(sequence, tx);
-        let mut rx = SequencedReceiver::<RecoverableStateAction<D::AuthorityAction>>::new(sequence, rx);
-
         tokio::spawn(async move {
             let mut buffer = Vec::<u8>::with_capacity(1024);
 
             loop {
-                match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+                match tokio::time::timeout(Duration::from_secs(2), authority_rx.recv()).await {
                     Err(_) => {
                         match tokio::time::timeout(Duration::from_secs(2), send_zero_message(&mut write)).await {
                             Ok(Ok(())) => continue,
@@ -249,6 +259,6 @@ where D::Action: MessageEncoding, D::AuthorityAction: MessageEncoding
             }
         });
 
-        (remote, tx)
+        Ok(remote)
     }
 }
