@@ -50,7 +50,6 @@ impl<T: SyncIO> MessageHelper for T {
 
 #[cfg(test)]
 mod test {
-    use futures_util::task::ArcWake;
     use tokio::sync::mpsc::channel;
 
     use super::*;
@@ -82,11 +81,16 @@ mod test {
         let (b_tx, mut server_rx) = channel(1024);
         let (_, mut server_tx) = server.start_io_tasks(b_tx);
 
-        server_tx.send((110, TestStateAction::Add { slot: 1, value: 99 })).await.unwrap();
-
+        server_tx.send((110, TestStateAction::Add { slot: 1, value: 99 }).into()).await.unwrap();
         assert_eq!(
             client.authority_rx.recv().await.unwrap(),
             (1, RecoverableStateAction::StateAction((110, TestStateAction::Add { slot: 1, value: 99 })))
+        );
+
+        server_tx.send((110, TestStateAction::Add { slot: 1, value: 99 }).into()).await.unwrap();
+        assert_eq!(
+            client.authority_rx.recv().await.unwrap(),
+            (2, RecoverableStateAction::StateAction((110, TestStateAction::Add { slot: 1, value: 99 })))
         );
 
         client.action_tx.send(TestStateAction::Add { slot: 0, value: 123 }).await.unwrap();

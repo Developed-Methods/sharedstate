@@ -1,7 +1,7 @@
 use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};
 use tokio::sync::{mpsc::{channel, error::TryRecvError, Receiver, Sender}, oneshot};
 
-use crate::{state::{DeterministicState, FollowUpdater, LeaderUpdater, StatePtr}, utils::PanicHelper};
+use crate::{recoverable_state::{RecoverableState, RecoverableStateDetails}, state::{DeterministicState, FollowUpdater, LeaderUpdater, StatePtr}, utils::PanicHelper};
 
 pub struct StateUpdater<D: DeterministicState> {
     replace_req_tx: Sender<ReplaceRequest<D>>,
@@ -179,33 +179,29 @@ impl<D: DeterministicState> UpdateInternalsAction<D> {
         rx
     }
 
-    pub fn setup_follow(&mut self, action_rx: SequencedReceiver<D::AuthorityAction>) -> Result<(), u64> {
+    pub fn setup_follow<R, F: FnOnce(&mut StatePtr<D>) -> R>(&mut self, action_rx: SequencedReceiver<D::AuthorityAction>, update: F) -> Result<R, u64> {
         if self.next_sequence() != action_rx.next_seq() {
             return Err(self.next_sequence());
         }
 
         let mut inner = self.inner.take().panic("missing inner");
-        inner.internals = match inner.internals {
-            StateUpdaterInternals::Leader { updater, tx, .. } => {
-                StateUpdaterInternals::Follower {
-                    updater: updater.follow(),
-                    rx: action_rx,
-                    tx,
-                    next: None
-                }
-            }
-            StateUpdaterInternals::Follower { updater, tx, .. } => {
-                StateUpdaterInternals::Follower {
-                    updater,
-                    rx: action_rx,
-                    tx,
-                    next: None,
-                }
-            }
+
+        let (mut updater, tx) = match inner.internals {
+            StateUpdaterInternals::Leader { updater, tx, .. } => (updater.follow(), tx),
+            StateUpdaterInternals::Follower { updater, tx, .. } => (updater, tx),
+        };
+
+        let result = updater.update_state(update);
+
+        inner.internals = StateUpdaterInternals::Follower {
+            updater,
+            rx: action_rx,
+            tx,
+            next: None,
         };
 
         self.inner = Some(inner);
-        Ok(())
+        Ok(result)
     }
 
     pub fn become_leader<F: FnOnce(&mut StatePtr<D>) -> bool>(&mut self, update: F, action_rx: Receiver<D::Action>) -> Option<SequencedReceiver<D::AuthorityAction>> {
@@ -464,7 +460,7 @@ mod test {
             let mut tx = SequencedSender::new(seq, tx);
             let rx = SequencedReceiver::new(seq, rx);
 
-            update.setup_follow(rx).unwrap();
+            update.setup_follow(rx, |_| ()).unwrap();
             update.apply();
 
             tx.safe_send(2, (100, TestStateAction::Add { slot: 0, value: 10 })).await.unwrap();

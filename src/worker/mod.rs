@@ -15,7 +15,9 @@
 // use super::{handshake::{ClientConnected, ClientConnectionAccepted, ClientConnectionAcceptedDirect, HandshakeClient, HandshakeServer, RecoveryAttempt, ServerClientReady, ServerNewClient}, io::{SyncConnection, SyncIO}, message_io::{read_message_opt, send_message, send_zero_message}, recoverable_state::{RecoverableState, StateReplaceCheck}};
 
 pub mod state_updater;
-pub mod message_relay;
+pub mod sync_state;
+
+// pub mod message_relay;
 // pub mod state_manager;
 
 // pub struct SyncState<I: SyncIO, D: DeterministicState<Action: MessageEncoding + Clone>> {

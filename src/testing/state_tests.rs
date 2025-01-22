@@ -1,6 +1,6 @@
 use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
-use message_encoding::MessageEncoding;
+use message_encoding::{test_assert_valid_encoding, MessageEncoding};
 
 use crate::{state::{DeterministicState, SharedState}, message_io::unknown_id_err};
 
@@ -97,6 +97,25 @@ impl MessageEncoding for TestStateAction {
             other => Err(unknown_id_err(other, "TestStateAction")),
         }
     }
+}
+
+#[test]
+fn test_state_action_encoding_test() {
+    test_assert_valid_encoding(TestStateAction::Add { slot: 1, value: 2 });
+    test_assert_valid_encoding(TestStateAction::Set { slot: 3, value: 4 });
+
+    test_assert_valid_encoding(TestStateAction::Add { slot: 0, value: 123 });
+
+    let mut out = Vec::new();
+    TestStateAction::Add { slot: 0, value: 123 }.write_to(&mut out).unwrap();
+
+    println!("Data: {:?}", out);
+
+    let data = [0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 123];
+    let mut reader = &data[..];
+    let res = TestStateAction::read_from(&mut reader).unwrap();
+
+    println!("{:?}", res);
 }
 
 #[test]

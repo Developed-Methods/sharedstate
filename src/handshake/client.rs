@@ -1,11 +1,11 @@
-use std::{marker::PhantomData, time::Duration};
+use std::{fmt::Debug, marker::PhantomData, time::Duration};
 
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};
 use tokio::sync::mpsc::{Sender, channel};
 use tracing::Instrument;
 
-use crate::{io::{SyncConnection, SyncIO}, message_io::{read_message, read_message_opt, send_message, send_zero_message}, recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails}, state::DeterministicState};
+use crate::{io::{SyncConnection, SyncIO}, message_io::{read_message, read_message_opt, send_message, send_zero_message}, recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails}, state::DeterministicState, utils::PanicHelper};
 use super::{HandshakeError, MessageHelper};
 use crate::utils::LogHelper;
 use super::messages::*;
@@ -159,6 +159,10 @@ impl<I: SyncIO> FreshConnection<I> {
 }
 
 impl<I: SyncIO> RecoveringConnection<I> {
+    pub fn sequence(&self) -> u64 {
+        self.local_follower_details.sequence
+    }
+
     pub fn recover<D: DeterministicState + Clone>(self, state: &mut RecoverableState<D>) -> Result<ConnectedToLeader<I, D>, HandshakeError> {
         if !self.local_follower_details.eq(state.details()) {
             return Err(HandshakeError::RecoverError("state changed before recovery")).log();
@@ -185,17 +189,16 @@ pub struct LeaderChannels<D: DeterministicState> {
 impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D> 
     where D::Action: MessageEncoding, D::AuthorityAction: MessageEncoding
 {
-    pub fn start_io_workers(self) -> (I::Address, LeaderChannels<D>) {
+    pub fn start_io_workers2(self, mut authority_tx: SequencedSender<RecoverableStateAction<D::AuthorityAction>>) -> Result<(I::Address, Sender<D::Action>), u64> {
+        if authority_tx.seq() != self.sequence {
+            return Err(self.sequence);
+        }
+
         let Self {
             mut buffer,
             conn: SyncConnection { remote, mut read, mut write },
-            sequence,
-            _phantom: _
+            ..
         } = self;
-
-        let (authority_tx, authority_rx) = channel(1024);
-        let mut authority_tx = SequencedSender::new(sequence, authority_tx);
-        let authority_rx = SequencedReceiver::new(sequence, authority_rx);
 
         /* read messages into authority queue */
         tokio::spawn(async move {
@@ -225,7 +228,7 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
         });
 
 
-        let (action_tx, mut action_rx) = channel(1024);
+        let (action_tx, mut action_rx) = channel::<D::Action>(1024);
 
         /* send actions to leader */
         tokio::spawn(async move {
@@ -246,7 +249,11 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
                             }
                         }
                     }
-                    Ok(msg) => {
+                    Ok(None) => {
+                        tracing::info!("action_rx empty, closing sender");
+                        return;
+                    }
+                    Ok(Some(msg)) => {
                         match send_message(&mut buffer, &msg, &mut write, Duration::from_secs(2)).await {
                             Ok(()) => {}
                             Err(error) => {
@@ -259,12 +266,22 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
             }
         });
 
+        Ok((remote, action_tx))
+    }
+
+    pub fn start_io_workers(self) -> (I::Address, LeaderChannels<D>) {
+        let (authority_tx, authority_rx) = channel(1024);
+        let authority_tx = SequencedSender::new(self.sequence, authority_tx);
+        let authority_rx = SequencedReceiver::new(self.sequence, authority_rx);
+
+        let (addr, action_tx) = self.start_io_workers2(authority_tx).panic("invalid sequence");
+
         (
-            remote,
+            addr,
             LeaderChannels {
                 action_tx,
                 authority_rx,
-            }
+            },
         )
     }
 }

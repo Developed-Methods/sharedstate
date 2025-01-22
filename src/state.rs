@@ -84,6 +84,13 @@ pub enum SharedStateUpdater<D: DeterministicState> {
 }
 
 impl<D: DeterministicState> SharedStateUpdater<D> {
+    pub fn shared(&self) -> SharedState<D> {
+        match self {
+            SharedStateUpdater::Leader(l) => l.updater.shared(),
+            SharedStateUpdater::Follower(f) => f.updater.shared(),
+        }
+    }
+
     pub fn next_sequence(&self) -> u64 {
         match self {
             Self::Leader(l) => {
@@ -235,6 +242,23 @@ impl<D: DeterministicState> FollowUpdater<D> {
         self.updater.update();
     }
 
+    pub fn update_state<R, F: FnOnce(&mut StatePtr<D>) -> R>(&mut self, update: F) -> R {
+        let mut state = self.updater.read().clone();
+
+        let mut ptr = StatePtr {
+            item: &mut state,
+            as_mut: false
+        };
+
+        let result = update(&mut ptr);
+
+        if ptr.as_mut {
+            self.updater.reset(state);
+        }
+
+        result
+    }
+
     pub fn flush(&mut self) {
         self.updater.flush_queue();
     }
@@ -277,6 +301,10 @@ struct StateInner<D: DeterministicState> {
 }
 
 impl<D: DeterministicState> StateUpdater<D> {
+    pub fn shared(&self) -> SharedState<D> {
+        SharedState { inner: self.inner.clone() }
+    }
+
     pub fn reset(&mut self, state: D) {
         /* we're the only writer so load can be relaxed */
         let read_pos = self.inner.read_pos.load(Ordering::Relaxed);

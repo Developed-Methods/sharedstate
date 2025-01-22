@@ -10,6 +10,11 @@ pub struct MessageRelaySender<T> {
     tx: Sender<T>,
 }
 
+pub enum RelayOutput<T> {
+    Sender(Sender<T>),
+    SequencedSender(SequencedSender<T>),
+}
+
 impl<T> Clone for MessageRelaySender<T> {
     fn clone(&self) -> Self {
         MessageRelaySender {
@@ -54,11 +59,6 @@ impl<T> Clone for MessageRelay<T> {
             next_sender: self.next_sender.clone(),
         }
     }
-}
-
-pub enum RelayOutput<T> {
-    Sender(Sender<T>),
-    SequencedSender(SequencedSender<T>),
 }
 
 impl<T> RelayOutput<T> {

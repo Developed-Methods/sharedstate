@@ -10,7 +10,7 @@ use crate::io::{SyncConnection, SyncIO};
 use crate::message_io::{read_message_opt, send_message, send_zero_message};
 use crate::state::DeterministicState;
 
-use crate::recoverable_state::{RecoverableState, RecoverableStateDetails};
+use crate::recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails};
 use crate::utils::LogHelper;
 use super::{HandshakeError, MessageHelper};
 use super::messages::*;
@@ -180,7 +180,7 @@ where D::Action: MessageEncoding, D::AuthorityAction: MessageEncoding
         self.sequence
     }
 
-    pub fn start_io_tasks(self, actions_tx: Sender<D::Action>) -> (I::Address, SequencedSender<D::AuthorityAction>)
+    pub fn start_io_tasks(self, actions_tx: Sender<D::Action>) -> (I::Address, SequencedSender<RecoverableStateAction<D::AuthorityAction>>)
     {
         let Self {
             mut buffer,
@@ -192,26 +192,27 @@ where D::Action: MessageEncoding, D::AuthorityAction: MessageEncoding
         /* read messages into action queue */
         tokio::spawn(async move {
             loop {
-                match read_message_opt::<D::Action, _>(&mut buffer, &mut read, Duration::from_secs(2), Some(Duration::from_secs(8))).await {
+                match read_message_opt::<D::Action, _>(
+                    &mut buffer,
+                    &mut read,
+                    Duration::from_secs(2),
+                    Some(Duration::from_secs(8))
+                ).await.err_log("got error reading next message from follower") {
                     Ok(Some(action)) => {
                         if actions_tx.send(action).await.is_err() {
                             tracing::info!("action queue closed for follower");
                             return;
                         }
                     }
-                    Ok(None) => {
-                    }
-                    Err(error) => {
-                        tracing::error!(?error, "got error reading next message from follower");
-                        return;
-                    }
+                    Ok(None) => {}
+                    Err(_) => return,
                 }
             }
         });
 
         let (tx, rx) = channel(1024);
-        let tx = SequencedSender::new(sequence, tx);
-        let mut rx = SequencedReceiver::new(sequence, rx);
+        let tx = SequencedSender::<RecoverableStateAction<D::AuthorityAction>>::new(sequence, tx);
+        let mut rx = SequencedReceiver::<RecoverableStateAction<D::AuthorityAction>>::new(sequence, rx);
 
         tokio::spawn(async move {
             let mut buffer = Vec::<u8>::with_capacity(1024);

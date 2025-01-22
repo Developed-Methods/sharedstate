@@ -53,10 +53,16 @@ impl RecoverableStateDetails {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoverableStateAction<A> {
     StateAction(A),
     BumpGeneration,
+}
+
+impl<A> From<A> for RecoverableStateAction<A> {
+    fn from(value: A) -> Self {
+        RecoverableStateAction::StateAction(value)
+    }
 }
 
 impl<A: MessageEncoding> MessageEncoding for RecoverableStateAction<A> {
