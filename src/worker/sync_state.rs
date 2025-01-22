@@ -11,7 +11,7 @@ use super::state_updater::{StateAndReceiver, StateUpdater};
 
 pub struct SyncState<I: SyncIO, D: DeterministicState> {
     shared: SharedState<RecoverableState<D>>,
-    event_tx: Sender<Event<I::Address>>,
+    event_tx: Sender<Event<I, D>>,
     client_actions_tx: Sender<D::Action>,
 }
 
@@ -34,14 +34,15 @@ struct SyncStateWorker<I: SyncIO, D: DeterministicState> {
     event_tx: Sender<Event<I, D>>,
     event_rx: Receiver<Event<I, D>>,
     updater: StateUpdater<RecoverableState<D>>,
-    lead_actions_rx: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
 
-    broadcast_settings: SequencedBroadcastSettings,
-    broadcast: SequencedBroadcast<RecoverableStateAction<D::AuthorityAction>>,
-    broadcast_tx: SequencedSender<RecoverableStateAction<D::AuthorityAction>>,
+    // lead_actions_rx: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
 
-    client_actions_tx: Sender<D::Action>,
-    client_actions_rx: Receiver<D::Action>,
+    // broadcast_settings: SequencedBroadcastSettings,
+    // broadcast: SequencedBroadcast<RecoverableStateAction<D::AuthorityAction>>,
+    // broadcast_tx: SequencedSender<RecoverableStateAction<D::AuthorityAction>>,
+
+    // client_actions_tx: Sender<D::Action>,
+    // client_actions_rx: Receiver<D::Action>,
 }
 
 enum Status<D: DeterministicState> {
