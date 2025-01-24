@@ -1,9 +1,10 @@
+use futures_util::TryFutureExt;
 use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};
 use tokio::sync::{mpsc::{error::TryRecvError, Receiver, Sender, channel}, oneshot};
 use tokio_util::sync::CancellationToken;
 use std::{future::Future, marker::PhantomData, sync::Arc};
 
-use crate::{recoverable_state::RecoverableStateAction, state::DeterministicState, utils::PanicHelper};
+use crate::{recoverable_state::RecoverableStateAction, utils::PanicHelper};
 
 pub struct MessageRelay<M: MessageIO> {
     next_request_tx: Sender<NextRequest<M>>,
@@ -176,16 +177,24 @@ impl<T> Default for RecoverableActionMessages<T> {
     }
 }
 
+pub enum ClientActionSender<A> {
+    ToRemote(Sender<A>),
+    ToLocalLeader(Sender<RecoverableStateAction<A>>),
+}
+
 impl<A: Send + 'static> MessageIO for RecoverableActionMessages<A> {
     type Message = A;
     type Receiver = Receiver<A>;
-    type Sender = Sender<RecoverableStateAction<A>>;
+    type Sender = ClientActionSender<A>;
 
     async fn send(tx: &mut Self::Sender, item: Self::Message) -> Result<(), Self::Message> {
-        tx.send(RecoverableStateAction::StateAction(item)).await.map_err(|e| match e.0 {
-            RecoverableStateAction::StateAction(a) => a,
-            _ => panic!(),
-        })
+        match tx {
+            ClientActionSender::ToRemote(s) => s.send(item).await.map_err(|e| e.0),
+            ClientActionSender::ToLocalLeader(s) => s.send(RecoverableStateAction::StateAction(item)).await.map_err(|e| match e.0 {
+                RecoverableStateAction::StateAction(a) => a,
+                _ => panic!(),
+            })
+        }
     }
 
     async fn receive(rx: &mut Self::Receiver) -> Option<Self::Message> {
@@ -193,7 +202,10 @@ impl<A: Send + 'static> MessageIO for RecoverableActionMessages<A> {
     }
 
     fn is_tx_closed(tx: &Self::Sender) -> bool {
-        tx.is_closed()
+        match tx {
+            ClientActionSender::ToRemote(s) => s.is_closed(),
+            ClientActionSender::ToLocalLeader(s) => s.is_closed(),
+        }
     }
 
     fn can_replace_rx(_current: &Self::Receiver, _option: &Self::Receiver) -> bool {
