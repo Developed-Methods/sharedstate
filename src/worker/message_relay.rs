@@ -3,7 +3,7 @@ use tokio::sync::{mpsc::{error::TryRecvError, Receiver, Sender, channel}, onesho
 use tokio_util::sync::CancellationToken;
 use std::{future::Future, marker::PhantomData, sync::Arc};
 
-use crate::utils::PanicHelper;
+use crate::{recoverable_state::RecoverableStateAction, state::DeterministicState, utils::PanicHelper};
 
 pub struct MessageRelay<M: MessageIO> {
     next_request_tx: Sender<NextRequest<M>>,
@@ -149,6 +149,43 @@ impl<T: Send + 'static> MessageIO for MpscMessages<T> {
 
     async fn send(tx: &mut Self::Sender, item: Self::Message) -> Result<(), Self::Message> {
         tx.send(item).await.map_err(|e| e.0)
+    }
+
+    async fn receive(rx: &mut Self::Receiver) -> Option<Self::Message> {
+        rx.recv().await
+    }
+
+    fn is_tx_closed(tx: &Self::Sender) -> bool {
+        tx.is_closed()
+    }
+
+    fn can_replace_rx(_current: &Self::Receiver, _option: &Self::Receiver) -> bool {
+        true
+    }
+
+    fn try_receive(rx: &mut Self::Receiver) -> Option<Self::Message> {
+        rx.try_recv().ok()
+    }
+}
+
+pub struct RecoverableActionMessages<T>(PhantomData<T>);
+
+impl<T> Default for RecoverableActionMessages<T> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<A: Send + 'static> MessageIO for RecoverableActionMessages<A> {
+    type Message = A;
+    type Receiver = Receiver<A>;
+    type Sender = Sender<RecoverableStateAction<A>>;
+
+    async fn send(tx: &mut Self::Sender, item: Self::Message) -> Result<(), Self::Message> {
+        tx.send(RecoverableStateAction::StateAction(item)).await.map_err(|e| match e.0 {
+            RecoverableStateAction::StateAction(a) => a,
+            _ => panic!(),
+        })
     }
 
     async fn receive(rx: &mut Self::Receiver) -> Option<Self::Message> {

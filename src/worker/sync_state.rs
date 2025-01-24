@@ -7,7 +7,7 @@ use tracing::Instrument;
 
 use crate::{handshake::{ConnectedToLeader, ConnectionEstablished, HandshakeClient, HandshakeServer, LeaderChannels, NewClient, RecoveringConnection, WantsRecovery, WantsState}, io::{SyncConnection, SyncIO}, recoverable_state::{RecoverableState, RecoverableStateAction}, state::{self, DeterministicState, LeaderUpdater, SharedState, SharedStateUpdater}, utils::{LogHelper, PanicHelper, TimeoutPanicHelper}};
 
-use super::{message_relay::{MessageRelay, MpscMessages, SequencedMessages}, state_updater::{StateAndReceiver, StateUpdater}};
+use super::{message_relay::{MessageRelay, MpscMessages, RecoverableActionMessages, SequencedMessages}, state_updater::{StateAndReceiver, StateUpdater}};
 
 pub struct SyncState<I: SyncIO, D: DeterministicState> {
     shared: SharedState<RecoverableState<D>>,
@@ -26,20 +26,20 @@ enum Event<I: SyncIO, D: DeterministicState> {
 }
 
 struct SyncStateWorker<I: SyncIO, D: DeterministicState> {
-    status: Status<D>,
+    // status: Status<D>,
     io: Arc<I>,
 
     local: I::Address,
     leader: I::Address,
-    alt: Vec<I::Address>,
+    peers: Vec<I::Address>,
 
     shared: SharedState<RecoverableState<D>>,
     event_tx: Sender<Event<I, D>>,
     event_rx: Receiver<Event<I, D>>,
-    updater: StateUpdater<RecoverableState<D>>,
 
+    updater: StateUpdater<RecoverableState<D>>,
     actions_tx: Sender<D::Action>,
-    action_relay: MessageRelay<MpscMessages<D::Action>>,
+    action_relay: MessageRelay<RecoverableActionMessages<D::Action>>,
     authority_relay: MessageRelay<SequencedMessages<RecoverableStateAction<D::AuthorityAction>>>,
 
     // lead_actions_rx: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
@@ -52,63 +52,90 @@ struct SyncStateWorker<I: SyncIO, D: DeterministicState> {
     // client_actions_rx: Receiver<D::Action>,
 }
 
-enum Status<D: DeterministicState> {
-    Leading(Sender<RecoverableStateAction<D::Action>>),
-    Following,
-    Disconnected(SequencedSender<RecoverableStateAction<D::AuthorityAction>>),
-    Connecting,
-}
+// enum Status<D: DeterministicState> {
+//     Leading(Sender<RecoverableStateAction<D::Action>>),
+//     Following,
+//     Disconnected(SequencedSender<RecoverableStateAction<D::AuthorityAction>>),
+//     Connecting,
+// }
 
-impl<I: SyncIO, D: DeterministicState> SyncState<I, D> where D::AuthorityAction: Clone {
+impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D> 
+    where D::Action: MessageEncoding,
+          D::AuthorityAction: MessageEncoding + Clone
+ {
     pub fn new(
         io: I,
         local: I::Address,
         leader: I::Address,
-        alt_leaders: Vec<I::Address>,
         state: RecoverableState<D>,
         broadcast_settings: SequencedBroadcastSettings,
     ) -> Self {
-        // let (broadcast, broadcast_tx) = SequencedBroadcast::new(state.sequence(), broadcast_settings.clone());
-        // let (shared, updater) = SharedState::new(state);
+        let (event_tx, event_rx) = channel(1024);
 
-        // let (event_tx, event_rx) = channel(32);
-        // let (client_actions_tx, client_actions_rx) = channel(2048);
+        let (broadcast, broadcast_tx) = SequencedBroadcast::new(state.sequence(), broadcast_settings.clone());
+        let (shared, updater) = SharedState::new(state);
 
-        todo!()
+        let (actions_tx, actions_rx) = channel::<D::Action>(1024);
 
-        // let (status, leader_rx) = if local == leader {
-        //     let (actions_tx, actions_rx) = channel(1024);
-        //     let (updater, leader_rx) = StateUpdater::leader(actions_rx, updater.into_lead());
+        let worker = if local == leader {
+            let (lead_actions_tx, lead_actions_rx) = channel(1024);
+            let action_relay = MessageRelay::new(actions_rx, lead_actions_tx);
 
-        //     (
-        //         Status::Leading(actions_tx),
-        //         leader_rx,
-        //     )
-        // } else {
-        //     let (leader_tx, leader_rx) = channel(1024);
-        //     SequencedReceiver::new(state.sequence(), receiver)
-        //     StateUpdater::follower(rx, updater)
-        // };
+            let (updater, leader_rx) = StateUpdater::leader(lead_actions_rx, updater.into_lead());
+            let authority_relay = MessageRelay::new(leader_rx, broadcast_tx);
 
-        // tokio::spawn(SyncStateWorker {
-        //     status,
-        //     io,
-        //     local,
-        //     leader,
-        //     shared: shared.clone(),
-        //     event_tx: event_tx.clone(),
-        //     event_rx,
-        //     updater,
-        //     lead_actions_rx,
-        //     client_actions_tx: client_actions_tx.clone(),
-        //     client_actions_rx,
-        // }.start());
+            SyncStateWorker {
+                io: Arc::new(io),
 
-        // Self {
-        //     shared,
-        //     event_tx,
-        //     client_actions_tx,
-        // }
+                leader,
+                local,
+                peers: vec![],
+
+                shared: shared.clone(),
+                event_tx: event_tx.clone(),
+                event_rx,
+
+                updater,
+                actions_tx: actions_tx.clone(),
+                action_relay,
+                authority_relay,
+                broadcast_settings,
+                broadcast,
+            }
+        } else {
+            let leader_rx = SequencedReceiver::new(updater.next_sequence(), channel(1).1);
+            let (updater, authority_rx) = StateUpdater::follower(leader_rx, updater.into_follow());
+
+            let action_relay = MessageRelay::new(actions_rx, channel(1).0);
+            let authority_relay = MessageRelay::new(authority_rx, broadcast_tx);
+
+            SyncStateWorker {
+                io: Arc::new(io),
+
+                leader,
+                local,
+                peers: vec![],
+
+                shared: shared.clone(),
+                event_tx: event_tx.clone(),
+                event_rx,
+
+                updater,
+                actions_tx: actions_tx.clone(),
+                action_relay,
+                authority_relay,
+                broadcast_settings,
+                broadcast,
+            }
+        };
+
+        tokio::spawn(worker.start());
+
+        Self {
+            shared,
+            event_tx,
+            client_actions_tx: actions_tx,
+        }
     }
 
     pub async fn set_leader(&self, leader: I::Address) {
@@ -126,15 +153,55 @@ impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncStateWorker<I, D>
 
             match event {
                 Event::NewLeader(leader) => {
-                    // if leader == self.leader {
-                    //     continue;
-                    // }
+                    if leader == self.leader {
+                        continue;
+                    }
 
-                    // tracing::info!("leader updated, from: {:?} to: {:?}", self.leader, leader);
-                    // self.leader = leader;
+                    let old_leader = std::mem::replace(&mut self.leader, leader);
+                    if self.leader == self.local {
+                        tracing::info!(?old_leader, "becoming leader");
 
-                    // if self.leader == self.local {
-                    // }
+                        let (actions_tx, actions_rx) = channel(1024);
+                        actions_tx.try_send(RecoverableStateAction::BumpGeneration).panic("failed to queue first action");
+
+                        let _ = self.action_relay.replace_output(actions_tx)
+                            .timeout(Duration::from_millis(100), "replace action queue output").await
+                            .panic("failed to replace action relay output");
+
+                        let update = self.updater.update_internals(false)
+                            .timeout(Duration::from_millis(100), "update internals to move to leader").await;
+
+                        let authority_rx = update.become_leader(|_state| false, actions_rx).panic("was already leading");
+
+                        self.authority_relay.replace_input(authority_rx, true)
+                            .timeout(Duration::from_millis(100), "replace authority input").await
+                            .panic("failed to replace authority input");
+                    } else {
+                        if old_leader == self.local {
+                            tracing::info!(new_leader = ?self.leader, "becoming follower");
+                        }
+
+                        let update = self.updater.update_internals(false)
+                            .timeout(Duration::from_millis(100), "update internals").await;
+
+                        /* setup follow with dead end as need to a new connection to leader */
+                        let (tx, rx) = channel(1);
+                        update.setup_follow(SequencedReceiver::new(update.next_sequence(), rx), |_| ());
+
+
+                        let mut leader_options = VecDeque::new();
+                        leader_options.push_back(leader);
+                        leader_options.extend(self.peers.iter().cloned());
+
+                        let event_tx = self.event_tx.clone();
+                        tokio::spawn(async move {
+                            event_tx.send(Event::AttemptConnect({
+                                let mut options = VecDeque::new();
+                                options.push_back(leader);
+                                options
+                            })).await.panic("worker crashed");
+                        });
+                    }
                 }
                 Event::AttemptConnect(mut options) => {
                     if self.leader == self.local {
@@ -144,7 +211,7 @@ impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncStateWorker<I, D>
 
                     if options.is_empty() {
                         options.push_back(self.leader.clone());
-                        options.extend(self.alt.iter().cloned());
+                        options.extend(self.peers.iter().cloned());
                     }
 
                     let event_tx = self.event_tx.clone();
