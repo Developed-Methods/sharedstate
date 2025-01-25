@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{collections::VecDeque, fmt::Debug, sync::Arc, time::Duration};
 
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedBroadcast, SequencedBroadcastSettings, SequencedReceiver, SequencedSender};
@@ -25,6 +25,20 @@ enum Event<I: SyncIO, D: DeterministicState> {
     NewClient(SyncConnection<I>),
     NewFreshClient(WantsState<I>),
     NewClientWantsRecovery(WantsRecovery<I>),
+}
+
+impl<I: SyncIO, D: DeterministicState> Debug for Event<I, D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NewLeader(addr) => write!(f, "NewLeader({:?})", addr),
+            Self::AttemptConnect(opts) => write!(f, "AttemptConnect({})", opts.len()),
+            Self::FreshConnection(_, state) => write!(f, "FreshConnection(seq: {})", state.sequence()),
+            Self::RecoveringConnection(recov) => write!(f, "RecoveringConnection(seq: {})", recov.sequence()),
+            Self::NewClient(s) => write!(f, "NewClient({:?})", s.remote),
+            Self::NewFreshClient(s) => write!(f, "NewFreshClient({:?})", s.remote()), 
+            Self::NewClientWantsRecovery(s) => write!(f, "NewClientWantsRecovery(remote: {:?}, seq: {})", s.remote(), s.details().sequence), 
+        }
+    }
 }
 
 struct SyncStateWorker<I: SyncIO, D: DeterministicState> {
@@ -183,9 +197,12 @@ where D::Action: MessageEncoding,
                 }
             };
 
+            tracing::info!("Process Event: {:?}", event);
+
             match event {
                 Event::NewLeader(leader) => {
-                    if leader == self.leader {
+                    if self.leader == leader {
+                        tracing::info!("no leader change");
                         continue;
                     }
 
@@ -203,14 +220,15 @@ where D::Action: MessageEncoding,
                         let mut update = self.updater.update_internals(false)
                             .timeout(Duration::from_millis(100), "update internals to move to leader").await;
 
-                        let authority_rx = update.become_leader(|_state| false, actions_rx).panic("was already leading");
-
-                        self.authority_relay.replace_input(authority_rx, true)
-                            .timeout(Duration::from_millis(100), "replace authority input").await
-                            .panic("failed to replace authority input");
+                        if update.become_leader(|_state| false, actions_rx).is_some() {
+                            panic!("feed should not need update moving from local to lead");
+                        }
                     } else {
                         if old_leader == self.local {
                             tracing::info!(new_leader = ?self.leader, "becoming follower");
+                        }
+                        else {
+                            tracing::info!(new_leader = ?self.leader, ?old_leader, "leader changed");
                         }
 
                         let mut update = self.updater.update_internals(false)
@@ -363,7 +381,7 @@ where D::Action: MessageEncoding,
                     /* TODO: remove wait */
                     tokio::time::sleep(Duration::from_millis(100)).await;
 
-                    let Some(authority_rx) = self.broadcast.add_client(state.sequence(), true)
+                    let Ok(authority_rx) = self.broadcast.add_client(state.sequence(), true)
                         .timeout(Duration::from_millis(100), "failed to add client").await
                         .err_log("failed to add fresh client to broadcast") else { continue };
 
@@ -374,7 +392,7 @@ where D::Action: MessageEncoding,
                             .err_log("failed to send client fresh state") else { return };
 
                         let remote = ready.start_io_tasks2(actions_tx, authority_rx)
-                            .panic("sequence and state sequences do not match");
+                            .log().panic("sequence and state sequences do not match");
 
                         tracing::info!(?remote, "Fresh client accepted");
                     }.instrument(tracing::Span::current()));
@@ -386,6 +404,7 @@ where D::Action: MessageEncoding,
                     let authority_rx_opt = if can_recover {
                         self.broadcast.add_client(recover.details().sequence, true)
                             .timeout(Duration::from_millis(100), "failed to add client").await
+                            .ok()
                     } else {
                         None
                     };
@@ -398,7 +417,8 @@ where D::Action: MessageEncoding,
                                 .accept_recover::<D>(details).await
                                 .err_log("failed to recover state") else { return };
 
-                            let remote = ready.start_io_tasks2(actions_tx, authority_rx);
+                            let remote = ready.start_io_tasks2(actions_tx, authority_rx)
+                                .log().panic("invalid sequence");
 
                             tracing::info!(?remote, "Recover client accepted");
                         }.instrument(tracing::Span::current()));
@@ -406,7 +426,7 @@ where D::Action: MessageEncoding,
                     else {
                         let state = self.shared.read().clone();
 
-                        let Some(authority_rx) = self.broadcast.add_client(state.sequence(), true)
+                        let Ok(authority_rx) = self.broadcast.add_client(state.sequence(), true)
                             .timeout(Duration::from_millis(100), "failed to add client").await
                             .err_log("failed to add new fresh client") else { continue };
 
@@ -415,9 +435,10 @@ where D::Action: MessageEncoding,
                                 .accept_client_with_state(&state).await
                                 .err_log("failed to send client new state") else { return };
 
-                            let remote = ready.start_io_tasks2(actions_tx, authority_rx);
+                            let remote = ready.start_io_tasks2(actions_tx, authority_rx)
+                                .log().panic("invalid sequence");
 
-                            tracing::info!(?remote, "Recover client accepted");
+                            tracing::info!(?remote, "Recovery rejected client accepted with fresh state");
                         }.instrument(tracing::Span::current()));
                     }
                 }
@@ -477,11 +498,29 @@ mod test {
 
         action_b.send(TestStateAction::Add { slot: 1, value: 10 }).await.unwrap();
         action_c.send(TestStateAction::Add { slot: 1, value: 100 }).await.unwrap();
+
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         assert_eq!(shared_a.read().state().numbers[1], 111);
         assert_eq!(shared_b.read().state().numbers[1], 111);
         assert_eq!(shared_c.read().state().numbers[1], 111);
+
+        sync_a.set_leader(2).await;
+        sync_b.set_leader(2).await;
+        sync_c.set_leader(2).await;
+
+        tokio::time::sleep(Duration::from_millis(4_000)).await;
+
+        action_a.send(TestStateAction::Add { slot: 1, value: 1 }).await.unwrap();
+        action_b.send(TestStateAction::Add { slot: 1, value: 10 }).await.unwrap();
+        action_c.send(TestStateAction::Add { slot: 1, value: 100 }).await.unwrap();
+
+        tracing::info!("new actions sent");
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+
+        assert_eq!(shared_a.read().state().numbers[1], 222);
+        assert_eq!(shared_b.read().state().numbers[1], 222);
+        assert_eq!(shared_c.read().state().numbers[1], 222);
     }
 }
 

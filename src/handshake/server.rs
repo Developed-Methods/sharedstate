@@ -135,7 +135,7 @@ impl<I: SyncIO> WantsRecovery<I> {
                 return Err(HandshakeError::RecoverError("leader cannot recover client")).log();
             }
 
-            let sequence = details.sequence;
+            let sequence = self.details.sequence;
 
             I::send(
                 &mut self.buffer,
@@ -194,6 +194,7 @@ where D::Action: MessageEncoding, D::AuthorityAction: MessageEncoding
 
     pub fn start_io_tasks2(self, actions_tx: Sender<D::Action>, mut authority_rx: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>) -> Result<I::Address, u64> {
         if authority_rx.next_seq() != self.sequence {
+            tracing::error!("authority sequence: {} does not match recovery sequence: {}", authority_rx.next_seq(), self.sequence);
             return Err(self.sequence);
         }
 
@@ -222,7 +223,7 @@ where D::Action: MessageEncoding, D::AuthorityAction: MessageEncoding
                     Err(_) => return,
                 }
             }
-        });
+        }.instrument(tracing::info_span!("read from client", ?remote)));
 
         tokio::spawn(async move {
             let mut buffer = Vec::<u8>::with_capacity(1024);
@@ -257,7 +258,7 @@ where D::Action: MessageEncoding, D::AuthorityAction: MessageEncoding
                     }
                 }
             }
-        });
+        }.instrument(tracing::info_span!("write to client", ?remote)));
 
         Ok(remote)
     }

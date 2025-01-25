@@ -319,9 +319,9 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sequenced-broadcast"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28a4460cdfc7973d8cfe10062bf35b41a2f84c7c24eda798459a3cf48e8493bf"
+checksum = "a6df31b1cc9f95fdaad19c6006291954708cdfb411edd7c637015754be16f39d"
 dependencies = [
  "tokio",
  "tokio-util",

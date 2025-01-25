@@ -225,7 +225,7 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
                     }
                 }
             }
-        });
+        }.instrument(tracing::info_span!("read from leader", ?remote)));
 
 
         let (action_tx, mut action_rx) = channel::<D::Action>(1024);
@@ -264,7 +264,7 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
                     }
                 }
             }
-        });
+        }.instrument(tracing::info_span!("write to leader", ?remote)));
 
         Ok((remote, action_tx))
     }
