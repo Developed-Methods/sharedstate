@@ -1,4 +1,4 @@
-use std::{fmt::Debug, marker::PhantomData, time::Duration};
+use std::{marker::PhantomData, time::Duration};
 
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};

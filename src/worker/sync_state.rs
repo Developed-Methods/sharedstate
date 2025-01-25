@@ -14,7 +14,7 @@ pub struct SyncState<I: SyncIO, D: DeterministicState> {
     shared: SharedState<RecoverableState<D>>,
     event_tx: Sender<Event<I, D>>,
     client_actions_tx: Sender<D::Action>,
-    cancel: Arc<CancellationToken>,
+    cancel: CancellationToken,
 }
 
 enum Event<I: SyncIO, D: DeterministicState> {
@@ -60,7 +60,7 @@ struct SyncStateWorker<I: SyncIO, D: DeterministicState> {
     broadcast_settings: SequencedBroadcastSettings,
     broadcast: SequencedBroadcast<RecoverableStateAction<D::AuthorityAction>>,
 
-    cancel: Arc<CancellationToken>,
+    cancel: CancellationToken,
 }
 
 impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D> 
@@ -74,7 +74,7 @@ impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D>
         state: RecoverableState<D>,
         broadcast_settings: SequencedBroadcastSettings,
     ) -> Self {
-        let cancel = Arc::new(CancellationToken::new());
+        let cancel = CancellationToken::new();
         let (event_tx, event_rx) = channel(1024);
 
         let worker_span = tracing::info_span!("SyncStateWorker", ?local);
@@ -153,8 +153,18 @@ impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D>
         }
     }
 
+    pub fn shared(&self) -> SharedState<RecoverableState<D>> {
+        self.shared.clone()
+    }
+
     pub async fn set_leader(&self, leader: I::Address) {
         self.event_tx.send(Event::NewLeader(leader)).await.panic("worker closed");
+    }
+}
+
+impl<I: SyncIO, D: DeterministicState> Drop for SyncState<I, D> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
@@ -184,6 +194,8 @@ where D::Action: MessageEncoding,
                         }
                     };
                 }
+
+                tracing::info!("stopping next_client acceptor");
             }.instrument(tracing::Span::current()));
         }
 
@@ -446,8 +458,8 @@ where D::Action: MessageEncoding,
         }
 
         let _ = async move {
-            tracing::info!("starting shutdown");
-
+            tracing::info!(events_tx_count = self.event_tx.strong_count(), "starting shutdown");
+            
             /* drop event_tx to flush out event_rx */
             drop(self.event_tx);
 
@@ -456,15 +468,40 @@ where D::Action: MessageEncoding,
                 count += 1;
             }
 
-            tracing::info!(dead_events = count, "done");
-        }.await.instrument(tracing::info_span!("SyncStateWorker shutdown"));
+            tracing::info!(dead_events = count, "worker shutdown complete");
+        }.await.instrument(tracing::info_span!("SyncStateWorker::shutdown"));
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::testing::{setup_logging, state_tests::{TestState, TestStateAction}, test_sync_io::{TestSyncIO, TestSyncNet}};
+    use crate::testing::{setup_logging, state_tests::{TestState, TestStateAction}, test_sync_io::TestSyncNet};
     use super::*;
+
+    #[tokio::test]
+    async fn sync_state_drop_test() {
+        setup_logging();
+
+        let net = TestSyncNet::new();
+
+        let a = net.io(1).await;
+        let b = net.io(2).await;
+        let c = net.io(3).await;
+
+        let sync_a = SyncState::new(a, 1, 1, RecoverableState::new(100, TestState::default()), SequencedBroadcastSettings::default());
+        let sync_b = SyncState::new(b, 2, 1, RecoverableState::new(200, TestState::default()), SequencedBroadcastSettings::default());
+        let sync_c = SyncState::new(c, 3, 1, RecoverableState::new(100, TestState::default()), SequencedBroadcastSettings::default());
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        drop(sync_a);
+        drop(sync_b);
+        drop(sync_c);
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        tracing::info!("should be done");
+    }
 
     #[tokio::test]
     async fn sync_state_test() {

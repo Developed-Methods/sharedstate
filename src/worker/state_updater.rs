@@ -1,7 +1,7 @@
 use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};
 use tokio::sync::{mpsc::{channel, error::TryRecvError, Receiver, Sender}, oneshot};
 
-use crate::{recoverable_state::{RecoverableState, RecoverableStateDetails}, state::{DeterministicState, FollowUpdater, LeaderUpdater, StatePtr}, utils::PanicHelper};
+use crate::{state::{DeterministicState, FollowUpdater, LeaderUpdater, StatePtr}, utils::PanicHelper};
 
 pub struct StateUpdater<D: DeterministicState> {
     replace_req_tx: Sender<ReplaceRequest<D>>,

@@ -1,6 +1,6 @@
 use message_encoding::MessageEncoding;
 
-use crate::{message_io::unknown_id_err, recoverable_state::{RecovGenerationEnd, RecoverableStateDetails}};
+use crate::{message_io::unknown_id_err, recoverable_state::RecoverableStateDetails};
 
 
 #[derive(Debug, PartialEq, Eq)]
