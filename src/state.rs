@@ -1,4 +1,5 @@
-use std::{collections::VecDeque, ops::{Deref, DerefMut}, sync::{atomic::{AtomicUsize, Ordering}, Arc, RwLock, RwLockReadGuard, TryLockError}};
+use std::{collections::VecDeque, ops::{Deref, DerefMut}, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
+use parking_lot::{RwLock, RwLockReadGuard};
 
 use crate::utils::PanicHelper;
 
@@ -67,7 +68,7 @@ impl<D: DeterministicState> StateInner<D> {
         for _ in 0..1048576 {
             let pos = self.read_pos.load(Ordering::Acquire);
             let idx = pos & 0x1;
-            if let Ok(lock) = self.states[idx].try_read() {
+            if let Some(lock) = self.states[idx].try_read() {
                 return lock;
             }
             std::hint::spin_loop();
@@ -264,7 +265,7 @@ impl<D: DeterministicState> FollowUpdater<D> {
     }
 
     pub fn read_state(&self) -> RwLockReadGuard<D> {
-        self.updater.inner.states[0].read().panic("failed to read lock")
+        self.updater.inner.states[0].read()
     }
 
     pub fn next_sequence(&self) -> u64 {
@@ -275,8 +276,8 @@ impl<D: DeterministicState> FollowUpdater<D> {
         self.updater.flush_queue();
 
         let state = {
-            let state0 = self.updater.inner.states[0].read().panic("failed to read lock state");
-            let state1 = self.updater.inner.states[1].read().panic("failed to read lock state");
+            let state0 = self.updater.inner.states[0].read();
+            let state1 = self.updater.inner.states[1].read();
             assert_eq!(state0.sequence(), state1.sequence());
             state0.clone()
         };
@@ -316,14 +317,14 @@ impl<D: DeterministicState> StateUpdater<D> {
         let state_sequence = state.sequence();
 
         {
-            let mut state_lock = self.inner.states[write_idx].write().unwrap();
+            let mut state_lock = self.inner.states[write_idx].write();
             *state_lock = state.clone();
         }
 
         self.inner.read_pos.store(write_pos, Ordering::Release);
 
         {
-            let mut state_lock = self.inner.states[read_pos & 0x1].write().unwrap();
+            let mut state_lock = self.inner.states[read_pos & 0x1].write();
             *state_lock = state;
         }
 
@@ -352,12 +353,7 @@ impl<D: DeterministicState> StateUpdater<D> {
     pub fn update_ready(&self) -> bool {
         let read_pos = self.inner.read_pos.load(Ordering::Relaxed);
         let write_pos = read_pos.overflowing_add(1).0;
-
-        match self.inner.states[write_pos & 0x1].try_write() {
-            Ok(_) => true,
-            Err(TryLockError::WouldBlock) => false,
-            Err(TryLockError::Poisoned(p)) => panic!("state lock poinsoned: {:?}", p),
-        }
+        self.inner.states[write_pos & 0x1].try_write().is_some()
     }
 
     pub fn flush_queue(&mut self) {
@@ -387,7 +383,7 @@ impl<D: DeterministicState> StateUpdater<D> {
 
         /* apply all actions available in the queue */
         {
-            let mut state = self.inner.states[write_idx].write().unwrap();
+            let mut state = self.inner.states[write_idx].write();
             let mut offset = self.queue_offset[write_idx];
 
             let mut next_seq = state.sequence() + 1;

@@ -339,11 +339,12 @@ dependencies = [
 
 [[package]]
 name = "sharedstate"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "assert_matches",
  "futures-util",
  "message-encoding",
+ "parking_lot",
  "rand_chacha",
  "sequenced-broadcast",
  "slab",

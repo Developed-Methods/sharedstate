@@ -1,6 +1,6 @@
 [package]
 name = "sharedstate"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 authors = ["Patrick Lorio <patrick@methods.dev>"]
 description = "Sync heavily read state across many servers"
@@ -16,6 +16,7 @@ futures-util = "0.3.31"
 tracing = "0.1.40"
 slab = "0.4.9"
 rand_chacha = "0.3.1"
+parking_lot = "0.12.3"
 
 [dev-dependencies]
 tracing-subscriber = "0.3.18"
