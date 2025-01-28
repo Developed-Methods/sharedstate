@@ -9,8 +9,15 @@ pub trait LogHelper {
 impl<R, E: Debug> LogHelper for Result<R, E> {
     #[track_caller]
     fn log(self) -> Self {
-        let name = std::any::type_name::<E>().rsplit("::").next().unwrap();
-        self.err_log(name)
+        let msg = std::any::type_name::<E>().rsplit("::").next().unwrap();
+        match self {
+            Err(error) => {
+                let caller = Location::caller();
+                tracing::error!(?error, "Error({}:{}), {} ", caller.file(), caller.line(), msg);
+                Err(error)
+            }
+            ok => ok,
+        }
     }
 
     #[track_caller]

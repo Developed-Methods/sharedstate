@@ -1,9 +1,11 @@
-use std::{borrow::Cow, time::Duration};
+use std::{marker::PhantomData, time::Duration};
 
 use message_encoding::MessageEncoding;
+use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};
+use tokio::sync::mpsc::{Sender, channel};
 use tracing::Instrument;
 
-use crate::{state::DeterministicState, io::{SyncConnection, SyncIO}, message_io::{read_message, send_message}, recoverable_state::{RecovGenerationEnd, RecoverableState}};
+use crate::{io::{SyncConnection, SyncIO}, message_io::{read_message, read_message_opt, send_message, send_zero_message}, recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails}, state::DeterministicState, utils::PanicHelper};
 use super::{HandshakeError, MessageHelper};
 use crate::utils::LogHelper;
 use super::messages::*;
@@ -14,49 +16,21 @@ pub struct HandshakeClient<I: SyncIO> {
     conn: SyncConnection<I>,
 }
 
-pub struct ClientFreshConnect<I: SyncIO> {
+pub enum ConnectionEstablished<I: SyncIO> {
+    FreshConnection(FreshConnection<I>),
+    RecoveringConnection(RecoveringConnection<I>),
+}
+
+pub struct FreshConnection<I: SyncIO> {
     buffer: Vec<u8>,
     conn: SyncConnection<I>,
 }
 
-pub struct ClientRecovering<I: SyncIO> {
+pub struct RecoveringConnection<I: SyncIO> {
     buffer: Vec<u8>,
     conn: SyncConnection<I>,
-    recovery: RecoveryAttempt,
-    generations: Vec<RecovGenerationEnd>,
-}
-
-pub struct ClientServerWantsState<I: SyncIO> {
-    buffer: Vec<u8>,
-    conn: SyncConnection<I>,
-    recovery: RecoveryAttempt,
-}
-
-pub struct ClientWouldBeRelayed<I: SyncIO> {
-    buffer: Vec<u8>,
-    conn: SyncConnection<I>,
-    reconnect: Option<RecoveryAttempt>,
-    address: I::Address,
-}
-
-pub enum ClientConnectionAccepted<I: SyncIO> {
-    FreshConnection(ClientFreshConnect<I>),
-    RecoveringConnection(ClientRecovering<I>),
-    RequestingState(ClientServerWantsState<I>),
-    RelayOption(ClientWouldBeRelayed<I>),
-}
-
-pub enum ClientConnectionAcceptedDirect<I: SyncIO> {
-    FreshConnection(ClientFreshConnect<I>),
-    RecoveringConnection(ClientRecovering<I>),
-    RequestingState(ClientServerWantsState<I>),
-}
-
-#[derive(Clone)]
-pub struct RecoveryAttempt {
-    pub state_id: u64,
-    pub state_generation: u64,
-    pub state_sequence: u64,
+    local_follower_details: RecoverableStateDetails,
+    leader_details: RecoverableStateDetails,
 }
 
 impl<I: SyncIO> HandshakeClient<I> {
@@ -67,26 +41,22 @@ impl<I: SyncIO> HandshakeClient<I> {
         }
     }
 
-    pub async fn connect(self) -> Result<ClientConnectionAccepted<I>, HandshakeError<I::Address>> {
+    pub async fn connect(self) -> Result<ConnectionEstablished<I>, HandshakeError> {
         self.reconnect_opt(None).await
     }
 
-    pub async fn reconnect(self, recover: RecoveryAttempt) -> Result<ClientConnectionAccepted<I>, HandshakeError<I::Address>> {
+    pub async fn reconnect(self, recover: RecoverableStateDetails) -> Result<ConnectionEstablished<I>, HandshakeError> {
         self.reconnect_opt(Some(recover)).await
     }
 
-    pub async fn reconnect_opt(mut self, reconnect: Option<RecoveryAttempt>) -> Result<ClientConnectionAccepted<I>, HandshakeError<I::Address>> {
+    pub async fn reconnect_opt(mut self, reconnect: Option<RecoverableStateDetails>) -> Result<ConnectionEstablished<I>, HandshakeError> {
         let span = tracing::info_span!("HandshakeClient::connect", reconnect = reconnect.is_some());
 
         async {
-            if let Some(recover) = reconnect.clone() {
+            if let Some(recover) = reconnect {
                 I::send(
                     &mut self.buffer,
-                    &HandshakeMessage::ConnectRequest(ClientConnectRequest::Reconnect {
-                        state_id: recover.state_id,
-                        state_generation: recover.state_generation,
-                        state_sequence: recover.state_sequence,
-                    }),
+                    &HandshakeMessage::ConnectRequest(ConnectRequest::Reconnect(recover.clone())),
                     &mut self.conn.write,
                     Duration::from_secs(2)
                 ).await.map_err(HandshakeError::SendError).log()?;
@@ -103,34 +73,30 @@ impl<I: SyncIO> HandshakeClient<I> {
                     None => return Err(HandshakeError::UnexpectedEmptyMessage).log(),
                 };
 
-                match response {
-                    ServerConnectResponse::RejectConnection => {}
-                    ServerConnectResponse::AcceptConnection => return Err(HandshakeError::UnexpectedResponse(
-                        HandshakeMessage::ConnectResponse(ServerConnectResponse::AcceptConnection)
-                    )),
-                    ServerConnectResponse::ProposeRelay { leader_address } => return Ok(ClientConnectionAccepted::RelayOption(ClientWouldBeRelayed {
+                return match response {
+                    ConnectResponse::AcceptRecovery(details) => {
+                        if !details.can_recover_follower(&recover) {
+                            return Err(HandshakeError::RecoverError("server accepted recovery but send recovery details that are not supported")).log();
+                        }
+
+                        Ok(ConnectionEstablished::RecoveringConnection(RecoveringConnection {
+                            buffer: self.buffer,
+                            conn: self.conn,
+                            local_follower_details: recover,
+                            leader_details: details,
+                        }))
+                    },
+                    ConnectResponse::AcceptConnection => Ok(ConnectionEstablished::FreshConnection(FreshConnection {
                         buffer: self.buffer,
                         conn: self.conn,
-                        reconnect,
-                        address: leader_address,
                     })),
-                    ServerConnectResponse::RequestState => return Ok(ClientConnectionAccepted::RequestingState(ClientServerWantsState {
-                        buffer: self.buffer,
-                        conn: self.conn,
-                        recovery: recover,
-                    })),
-                    ServerConnectResponse::AcceptRecovery { generations } => return Ok(ClientConnectionAccepted::RecoveringConnection(ClientRecovering {
-                        buffer: self.buffer,
-                        conn: self.conn,
-                        recovery: recover,
-                        generations,
-                    })),
-                }
+                    ConnectResponse::RejectConnection => Err(HandshakeError::ConnectionRejected).log(),
+                };
             }
 
             I::send(
                 &mut self.buffer,
-                &HandshakeMessage::ConnectRequest(ClientConnectRequest::Connect),
+                &HandshakeMessage::ConnectRequest(ConnectRequest::Connect),
                 &mut self.conn.write,
                 Duration::from_secs(2)
             ).await.map_err(HandshakeError::SendError).log()?;
@@ -148,43 +114,27 @@ impl<I: SyncIO> HandshakeClient<I> {
             };
 
             match response {
-                ServerConnectResponse::ProposeRelay { leader_address } => Ok(ClientConnectionAccepted::RelayOption(ClientWouldBeRelayed {
-                    buffer: self.buffer,
-                    conn: self.conn,
-                    reconnect,
-                    address: leader_address,
-                })),
-                ServerConnectResponse::AcceptConnection => Ok(ClientConnectionAccepted::FreshConnection(ClientFreshConnect {
+                ConnectResponse::AcceptConnection => Ok(ConnectionEstablished::FreshConnection(FreshConnection {
                     buffer: self.buffer,
                     conn: self.conn,
                 })),
+                ConnectResponse::RejectConnection => Err(HandshakeError::ConnectionRejected).log(),
                 other => Err(HandshakeError::UnexpectedResponse(HandshakeMessage::ConnectResponse(other))).log(),
             }
         }.instrument(span).await
     }
 }
 
-pub struct ClientConnected<'a, I: SyncIO, D: DeterministicState> {
-    pub buffer: Vec<u8>,
-    pub conn: SyncConnection<I>,
-    pub state: Cow<'a, RecoverableState<D>>,
-    pub remote_state: bool,
+pub struct ConnectedToLeader<I: SyncIO, D: DeterministicState> {
+    buffer: Vec<u8>,
+    conn: SyncConnection<I>,
+    sequence: u64,
+    _phantom: PhantomData<D>,
 }
 
-impl<'a, I: SyncIO, D: DeterministicState> ClientConnected<'a, I, D> {
-    pub fn into_owned(self) -> ClientConnected<'static, I, D> {
-        ClientConnected {
-            buffer: self.buffer,
-            conn: self.conn,
-            state: Cow::Owned(self.state.into_owned()),
-            remote_state: self.remote_state,
-        }
-    }
-}
-
-impl<I: SyncIO> ClientFreshConnect<I> {
-    pub async fn load_state<D: DeterministicState + MessageEncoding>(mut self) -> Result<ClientConnected<'static, I, D>, HandshakeError<I::Address>> {
-        let span = tracing::info_span!("ClientFreshConnect::load_state");
+impl<I: SyncIO> FreshConnection<I> {
+    pub async fn load_state<D: DeterministicState + MessageEncoding>(mut self) -> Result<(ConnectedToLeader<I, D>, RecoverableState<D>), HandshakeError> {
+        let span = tracing::info_span!("FreshConnection::load_state");
 
         async {
             let Some(state) = read_message::<RecoverableState<D>, _>(
@@ -195,173 +145,143 @@ impl<I: SyncIO> ClientFreshConnect<I> {
                 return Err(HandshakeError::UnexpectedEmptyMessage).log();
             };
 
-            Ok(ClientConnected {
-                buffer: self.buffer,
-                conn: self.conn,
-                state: Cow::Owned(state),
-                remote_state: true,
-            })
+            Ok((
+                ConnectedToLeader {
+                    buffer: self.buffer,
+                    conn: self.conn,
+                    sequence: state.sequence(),
+                    _phantom: PhantomData,
+                },
+                state
+            ))
         }.instrument(span).await
     }
 }
 
-impl<I: SyncIO> ClientRecovering<I> {
-    pub fn recover<D: DeterministicState + Clone>(self, mut state: RecoverableState<D>) -> Result<ClientConnected<'static, I, D>, HandshakeError<I::Address>> {
-        if state.id() != self.recovery.state_id || state.generation() != self.recovery.state_generation || state.sequence() != self.recovery.state_sequence {
-            return Err(HandshakeError::InvalidStateIdOrSequence).log();
+impl<I: SyncIO> RecoveringConnection<I> {
+    pub fn sequence(&self) -> u64 {
+        self.local_follower_details.sequence
+    }
+
+    pub fn recover<D: DeterministicState + Clone>(self, state: &mut RecoverableState<D>) -> Result<ConnectedToLeader<I, D>, HandshakeError> {
+        if !self.local_follower_details.eq(state.details()) {
+            return Err(HandshakeError::RecoverError("state changed before recovery")).log();
         }
 
-        state.set_generations(self.generations)
-            .map_err(HandshakeError::RecoverError)?;
+        if !state.upgrade(&self.leader_details) {
+            panic!("cannot update state based on leader details, should have been validated earlier in library");
+        }
 
-        Ok(ClientConnected {
+        Ok(ConnectedToLeader {
             buffer: self.buffer,
             conn: self.conn,
-            state: Cow::Owned(state),
-            remote_state: false,
+            sequence: state.sequence(),
+            _phantom: PhantomData,
         })
     }
 }
 
-impl<I: SyncIO> ClientServerWantsState<I> {
-    pub async fn provide_state<'a, D: DeterministicState + MessageEncoding>(mut self, state: Cow<'a, RecoverableState<D>>) -> Result<ClientConnected<'a, I, D>, HandshakeError<I::Address>> {
-        let span = tracing::info_span!("ClientServerWantsState::provide_state", id = state.id(), seq = state.sequence());
+pub struct LeaderChannels<D: DeterministicState> {
+    pub action_tx: Sender<D::Action>,
+    pub authority_rx: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
+}
 
-        async {
-            if state.id() != self.recovery.state_id {
-                return Err(HandshakeError::InvalidStateIdOrSequence).log();
-            }
+impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D> 
+    where D::Action: MessageEncoding, D::AuthorityAction: MessageEncoding
+{
+    pub fn start_io_workers2(self, mut authority_tx: SequencedSender<RecoverableStateAction<D::AuthorityAction>>) -> Result<(I::Address, Sender<D::Action>), u64> {
+        if authority_tx.seq() != self.sequence {
+            return Err(self.sequence);
+        }
 
-            send_message(
-                &mut self.buffer,
-                &state,
-                &mut self.conn.write,
-                Duration::from_secs(2)
-            ).await.map_err(HandshakeError::SendError)?;
+        let Self {
+            mut buffer,
+            conn: SyncConnection { remote, mut read, mut write },
+            ..
+        } = self;
 
-            let response = I::read_msg(
-                &mut self.buffer,
-                &mut self.conn.read,
-                Duration::from_secs(2)
-            ).await.map_err(HandshakeError::ReadError)?;
-
-            let response = match response {
-                Some(HandshakeMessage::ServerSnapshotResponse(response)) => response,
-                None => return Err(HandshakeError::UnexpectedEmptyMessage).log(),
-                Some(other) => return Err(HandshakeError::UnexpectedResponse(other)).log(),
-            };
-
-            match response {
-                ServerSnapshotResponse::SnapshotAccept => Ok(ClientConnected {
-                    buffer: self.buffer,
-                    conn: self.conn,
-                    state,
-                    remote_state: false,
-                }),
-                ServerSnapshotResponse::SnapshotReject => {
-                    let recv = I::read_msg(
-                        &mut self.buffer,
-                        &mut self.conn.read,
-                        Duration::from_secs(2)
-                    ).await.map_err(HandshakeError::ReadError).log()?;
-
-                    let response = match recv {
-                        Some(HandshakeMessage::ConnectResponse(response)) => response,
-                        Some(other) => return Err(HandshakeError::UnexpectedResponse(other)).log(),
-                        None => return Err(HandshakeError::UnexpectedEmptyMessage).log(),
-                    };
-
-                    match response {
-                        ServerConnectResponse::RejectConnection => {
-                            I::send(
-                                &mut self.buffer,
-                                &HandshakeMessage::ConnectRequest(ClientConnectRequest::Connect),
-                                &mut self.conn.write,
-                                Duration::from_secs(2),
-                            ).await.log().map_err(HandshakeError::SendError)?;
-
-                            let recv = I::read_msg(
-                                &mut self.buffer,
-                                &mut self.conn.read,
-                                Duration::from_secs(2)
-                            ).await
-                                .map_err(HandshakeError::ReadError).log()?
-                                .ok_or(HandshakeError::UnexpectedEmptyMessage).log()?;
-                            
-                            if !matches!(recv, HandshakeMessage::<I::Address>::ConnectResponse(ServerConnectResponse::AcceptConnection)) {
-                                return Err(HandshakeError::UnexpectedResponse(recv)).log();
+        /* read messages into authority queue */
+        tokio::spawn(async move {
+            loop {
+                match read_message_opt::<(u64, RecoverableStateAction<D::AuthorityAction>), _>(&mut buffer, &mut read, Duration::from_secs(2), Some(Duration::from_secs(8))).await {
+                    Ok(Some((seq, action))) => {
+                        match authority_tx.safe_send(seq, action).await {
+                            Ok(_) => {}
+                            Err(SequencedSenderError::ChannelClosed(_)) => {
+                                tracing::info!("sequenced sender for leader connection closed");
+                                return;
                             }
-
-                            ClientFreshConnect {
-                                buffer: self.buffer,
-                                conn: self.conn,
-                            }.load_state().await
+                            Err(SequencedSenderError::InvalidSequence(actual, _)) => {
+                                tracing::error!("leader sent wrong sequence, expected: {} but got: {}", actual, seq);
+                                return;
+                            }
                         }
-                        ServerConnectResponse::AcceptRecovery { generations } => {
-                            ClientRecovering {
-                                buffer: self.buffer,
-                                conn: self.conn,
-                                recovery: self.recovery,
-                                generations,
-                            }.recover(state.into_owned())
-                        }
-                        other => Err(HandshakeError::UnexpectedResponse(HandshakeMessage::ConnectResponse(other))).log(),
+                    }
+                    Ok(None) => {
+                    }
+                    Err(error) => {
+                        tracing::error!(?error, "got error reading next message from leader");
+                        return;
                     }
                 }
             }
-        }.instrument(span).await
+        }.instrument(tracing::info_span!("read from leader", ?remote)));
+
+
+        let (action_tx, mut action_rx) = channel::<D::Action>(1024);
+
+        /* send actions to leader */
+        tokio::spawn(async move {
+            let mut buffer = Vec::<u8>::with_capacity(1024);
+
+            loop {
+                match tokio::time::timeout(Duration::from_secs(2), action_rx.recv()).await {
+                    Err(_) => {
+                        match tokio::time::timeout(Duration::from_secs(2), send_zero_message(&mut write)).await {
+                            Ok(Ok(())) => continue,
+                            Err(_) => {
+                                tracing::error!("timeout sending zero message to leader");
+                                return;
+                            }
+                            Ok(Err(error)) => {
+                                tracing::error!(?error, "failed to send zero message to leader");
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::info!("action_rx empty, closing sender");
+                        return;
+                    }
+                    Ok(Some(msg)) => {
+                        match send_message(&mut buffer, &msg, &mut write, Duration::from_secs(2)).await {
+                            Ok(()) => {}
+                            Err(error) => {
+                                tracing::error!(?error, "failed to send action to leader");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }.instrument(tracing::info_span!("write to leader", ?remote)));
+
+        Ok((remote, action_tx))
+    }
+
+    pub fn start_io_workers(self) -> (I::Address, LeaderChannels<D>) {
+        let (authority_tx, authority_rx) = channel(1024);
+        let authority_tx = SequencedSender::new(self.sequence, authority_tx);
+        let authority_rx = SequencedReceiver::new(self.sequence, authority_rx);
+
+        let (addr, action_tx) = self.start_io_workers2(authority_tx).panic("invalid sequence");
+
+        (
+            addr,
+            LeaderChannels {
+                action_tx,
+                authority_rx,
+            },
+        )
     }
 }
-
-impl<I: SyncIO> ClientWouldBeRelayed<I> {
-    pub fn leader_address(&self) -> I::Address {
-        self.address.clone()
-    }
-
-    pub async fn accept_relay(mut self) -> Result<ClientConnectionAcceptedDirect<I>, HandshakeError<I::Address>> {
-        let span = tracing::info_span!("ClientWouldBeRelayed::accept_relay");
-
-        async {
-            I::send(
-                &mut self.buffer,
-                &HandshakeMessage::RelayFollowup(ClientRelayFollowup::AcceptRelay),
-                &mut self.conn.write,
-                Duration::from_secs(2)
-            ).await.map_err(HandshakeError::SendError)?;
-
-            let connect = HandshakeClient {
-                buffer: self.buffer,
-                conn: self.conn,
-            }.reconnect_opt(self.reconnect).await?;
-
-            connect.into_no_relay().map_err(|_| HandshakeError::RelayLoopDetected)
-        }.instrument(span).await
-    }
-
-    pub async fn reject_relay(mut self) -> Result<I::Address, HandshakeError<I::Address>> {
-        let span = tracing::info_span!("ClientWouldBeRelayed::reject_relay");
-
-        async {
-            I::send(
-                &mut self.buffer,
-                &HandshakeMessage::RelayFollowup(ClientRelayFollowup::RejectRelay),
-                &mut self.conn.write,
-                Duration::from_secs(2)
-            ).await.map_err(HandshakeError::SendError)?;
-
-            Ok(self.address)
-        }.instrument(span).await
-    }
-}
-
-impl<I: SyncIO> ClientConnectionAccepted<I> {
-    pub fn into_no_relay(self) -> Result<ClientConnectionAcceptedDirect<I>, Self> {
-        match self {
-            ClientConnectionAccepted::RequestingState(a) => Ok(ClientConnectionAcceptedDirect::RequestingState(a)),
-            ClientConnectionAccepted::FreshConnection(a) => Ok(ClientConnectionAcceptedDirect::FreshConnection(a)),
-            ClientConnectionAccepted::RecoveringConnection(a) => Ok(ClientConnectionAcceptedDirect::RecoveringConnection(a)),
-            other => Err(other),
-        }
-    }
-}
-

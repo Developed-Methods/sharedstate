@@ -2,12 +2,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{RwLock, RwLockWriteGuard};
 
-pub mod test_sync_io;
-
 mod message_io_tests;
+pub mod test_sync_io;
 pub mod state_tests;
-mod handshake_tests;
-// mod sync_worker_tests;
 
 pub fn setup_logging() {
     let _ = tracing_subscriber::fmt()

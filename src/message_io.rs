@@ -92,11 +92,9 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(buffer: &mu
     if let Some(max_size) = M::MAX_SIZE {
         buffer.reserve(MESSAGE_HEADER_SIZE + max_size);
         assert!(max_size < (MessageSizeHeader::MAX as usize));
-        buffer.extend((max_size as MessageSizeHeader).to_be_bytes());
-    } else {
-        buffer.extend((0 as MessageSizeHeader).to_be_bytes());
     }
 
+    buffer.extend((0 as MessageSizeHeader).to_be_bytes());
     assert_eq!(buffer.len(), MESSAGE_HEADER_SIZE);
 
     let bytes_written = message.write_to(buffer)?;
@@ -159,5 +157,27 @@ pub const fn m_max_opt_list(samples: &'static [Option<usize>]) -> Option<usize> 
     match samples[0] {
         None => None,
         Some(max) => scan(max, 1, samples),
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use tokio::io::duplex;
+
+    use super::*;
+    use crate::testing::state_tests::TestStateAction;
+
+    #[tokio::test]
+    async fn message_io_test() {
+        let (mut a, mut b) = duplex(2048);
+        let mut buffer = Vec::with_capacity(1024);
+
+        let send = TestStateAction::Add { slot: 0, value: 123 };
+        send_message(&mut buffer, &send, &mut a, Duration::from_secs(1)).await.unwrap();
+
+        let read = read_message_opt(&mut buffer, &mut b, Duration::from_secs(1), Some(Duration::from_secs(2))).await.unwrap();
+        assert_eq!(Some(send), read);
     }
 }

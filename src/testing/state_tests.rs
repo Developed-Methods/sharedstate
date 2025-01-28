@@ -1,6 +1,6 @@
-use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant}};
+use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
-use message_encoding::MessageEncoding;
+use message_encoding::{test_assert_valid_encoding, MessageEncoding};
 
 use crate::{state::{DeterministicState, SharedState}, message_io::unknown_id_err};
 
@@ -12,16 +12,20 @@ pub struct TestState {
 
 impl DeterministicState for TestState {
     type Action = TestStateAction;
-
-    fn id(&self) -> u64 {
-        1
-    }
+    type AuthorityAction = (u64, TestStateAction);
 
     fn sequence(&self) -> u64 {
         self.sequence
     }
 
-    fn update(&mut self, action: &Self::Action) {
+    fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
+        (
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            action
+        )
+    }
+
+    fn update(&mut self, (_time, action): &Self::AuthorityAction) {
         self.sequence += 1;
 
         match action {
@@ -96,10 +100,30 @@ impl MessageEncoding for TestStateAction {
 }
 
 #[test]
+fn test_state_action_encoding_test() {
+    test_assert_valid_encoding(TestStateAction::Add { slot: 1, value: 2 });
+    test_assert_valid_encoding(TestStateAction::Set { slot: 3, value: 4 });
+
+    test_assert_valid_encoding(TestStateAction::Add { slot: 0, value: 123 });
+
+    let mut out = Vec::new();
+    TestStateAction::Add { slot: 0, value: 123 }.write_to(&mut out).unwrap();
+
+    println!("Data: {:?}", out);
+
+    let data = [0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 123];
+    let mut reader = &data[..];
+    let res = TestStateAction::read_from(&mut reader).unwrap();
+
+    println!("{:?}", res);
+}
+
+#[test]
 fn slow_state_deadlock_test() {
     super::setup_logging();
 
-    let (state, mut updater) = SharedState::new(TestState { sequence: 0, numbers: [0i64; 6] });
+    let (state, updater) = SharedState::new(TestState { sequence: 0, numbers: [0i64; 6] });
+    let mut updater = updater.into_lead();
 
     let run = Arc::new(AtomicBool::new(true));
     let failed = Arc::new(AtomicBool::new(false));

@@ -1,41 +1,93 @@
-use sequenced_broadcast::SequencedReceiver;
+use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};
 use tokio::sync::{mpsc::{channel, error::TryRecvError, Receiver, Sender}, oneshot};
 
-use crate::{state::{DeterministicState, SharedStateUpdater}, utils::PanicHelper};
+use crate::{state::{DeterministicState, FollowUpdater, LeaderUpdater, StatePtr}, utils::PanicHelper};
 
 pub struct StateUpdater<D: DeterministicState> {
     replace_req_tx: Sender<ReplaceRequest<D>>,
 }
 
-struct ReplaceRequest<D: DeterministicState> {
-    wait_for_rx_closed: bool,
-    response: oneshot::Sender<ReplaceState<D>>,
+struct StateUpdaterWorker<D: DeterministicState> {
+    internals: StateUpdaterInternals<D>,
+    next_update_action: Option<ReplaceRequest<D>>,
+    next_update_action_rx: Receiver<ReplaceRequest<D>>,
 }
 
-impl<D: DeterministicState> StateUpdater<D> {
-    pub fn fresh(updater: SharedStateUpdater<D>) -> Self {
-        let (_, rx) = channel(1);
-        Self::new(SequencedReceiver::new(updater.next_queued_sequence(), rx), updater)
-    }
+enum StateUpdaterInternals<D: DeterministicState> {
+    Leader {
+        updater: LeaderUpdater<D>,
+        rx: Receiver<D::Action>,
+        tx: SequencedSender<D::AuthorityAction>,
+        next: Option<D::Action>,
+    },
+    Follower {
+        updater: FollowUpdater<D>,
+        rx: SequencedReceiver<D::AuthorityAction>,
+        tx: SequencedSender<D::AuthorityAction>,
+        next: Option<(u64, D::AuthorityAction)>,
+    },
+}
 
-    pub fn new(rx: SequencedReceiver<D::Action>, updater: SharedStateUpdater<D>) -> Self {
-        assert_eq!(rx.next_seq(), updater.next_queued_sequence());
+struct ReplaceRequest<D: DeterministicState> {
+    wait_for_rx_closed: bool,
+    response: oneshot::Sender<UpdateInternalsAction<D>>,
+}
 
-        let (replace_req_tx, replace_req_rx) = channel(1);
+pub struct UpdateInternalsAction<D: DeterministicState> {
+    inner: Option<ReplaceStateActionInner<D>>,
+}
 
-        tokio::spawn(StateUpdaterTask {
-            rx,
-            updater,
-            replace_req_rx,
-            next_replace: None,
+struct ReplaceStateActionInner<D: DeterministicState> {
+    internals: StateUpdaterInternals<D>,
+    provide: oneshot::Sender<StateUpdaterInternals<D>>,
+}
+
+impl<D: DeterministicState> StateUpdater<D> where D::AuthorityAction: Clone {
+    pub fn leader(rx: Receiver<D::Action>, updater: LeaderUpdater<D>) -> (Self, SequencedReceiver<D::AuthorityAction>) {
+        let (authority_tx, authority_rx) = channel::<(u64, D::AuthorityAction)>(1024);
+        let authority_tx = SequencedSender::new(updater.next_sequence(), authority_tx);
+        let authority_rx = SequencedReceiver::new(updater.next_sequence(), authority_rx);
+
+        let (replace_tx, replace_rx) = channel::<ReplaceRequest<D>>(1);
+
+        let internals = StateUpdaterInternals::Leader { updater, rx, tx: authority_tx, next: None };
+        tokio::spawn(StateUpdaterWorker {
+            internals,
+            next_update_action: None,
+            next_update_action_rx: replace_rx,
         }.start());
 
-        StateUpdater {
-            replace_req_tx,
-        }
+        (
+            StateUpdater {
+                replace_req_tx: replace_tx,
+            },
+            authority_rx,
+        )
     }
 
-    pub async fn replace_state(&mut self, wait_for_close: bool) -> ReplaceState<D> {
+    pub fn follower(rx: SequencedReceiver<D::AuthorityAction>, updater: FollowUpdater<D>) -> (Self, SequencedReceiver<D::AuthorityAction>) {
+        let (authority_tx, authority_rx) = channel::<(u64, D::AuthorityAction)>(1024);
+        let authority_tx = SequencedSender::new(updater.next_sequence(), authority_tx);
+        let authority_rx = SequencedReceiver::new(updater.next_sequence(), authority_rx);
+
+        let internals = StateUpdaterInternals::Follower { updater, rx, tx: authority_tx, next: None };
+        let (replace_tx, replace_rx) = channel::<ReplaceRequest<D>>(1);
+
+        tokio::spawn(StateUpdaterWorker {
+            internals,
+            next_update_action: None,
+            next_update_action_rx: replace_rx,
+        }.start());
+
+        (
+            StateUpdater {
+                replace_req_tx: replace_tx,
+            },
+            authority_rx
+        )
+    }
+
+    pub async fn update_internals(&mut self, wait_for_close: bool) -> UpdateInternalsAction<D> {
         let (tx, rx) = oneshot::channel();
 
         self.replace_req_tx.send(ReplaceRequest {
@@ -43,189 +95,429 @@ impl<D: DeterministicState> StateUpdater<D> {
             response: tx,
         }).await.panic("worker closed");
 
-        rx.await.panic("worker closed")
+        let mut internals = rx.await.panic("worker closed");
+
+        let inner = internals.inner.as_mut().unwrap();
+        match &mut inner.internals {
+            StateUpdaterInternals::Leader { updater, .. } => updater.flush(),
+            StateUpdaterInternals::Follower { updater, .. } => updater.flush(),
+        }
+
+        internals
     }
 }
 
-pub struct ReplaceState<D: DeterministicState> {
-    inner: Option<ReplaceInner<D>>,
-}
-
-pub struct StateUpdaterReset<D: DeterministicState> {
+pub struct StateAndReceiver<D: DeterministicState> {
     state: D,
-    receiver: SequencedReceiver<D::Action>,
+    receiver: SequencedReceiver<D::AuthorityAction>,
 }
 
-impl<D: DeterministicState> StateUpdaterReset<D> {
-    pub fn new(state: D, receiver: SequencedReceiver<D::Action>) -> Result<Self, (D, SequencedReceiver<D::Action>)> {
+impl<D: DeterministicState> StateAndReceiver<D> {
+    pub fn create(state: D, receiver: SequencedReceiver<D::AuthorityAction>) -> Result<Self, (D, SequencedReceiver<D::AuthorityAction>)> {
         if state.sequence() != receiver.next_seq() {
             return Err((state, receiver));
         }
-
-        Ok(StateUpdaterReset {
+        Ok(StateAndReceiver {
             state,
             receiver
         })
     }
 }
 
-impl<D: DeterministicState> ReplaceState<D> {
-    pub fn sequence(&self) -> u64 {
-        self.state().sequence()
+
+impl<D: DeterministicState> UpdateInternalsAction<D> {
+    pub fn next_sequence(&self) -> u64 {
+        match &self.inner.as_ref().unwrap().internals {
+            StateUpdaterInternals::Follower { updater, .. } => updater.next_sequence(),
+            StateUpdaterInternals::Leader { updater, .. } => updater.next_sequence(),
+        }
     }
 
-    pub fn state(&self) -> &D {
+    pub fn use_state<R, F: Fn(&D) -> R>(&self, visit: F) -> R {
         let inner = self.inner.as_ref().unwrap();
-        &inner.state
-    }
 
-    pub fn reset(mut self, reset: StateUpdaterReset<D>) -> (D, SequencedReceiver<D::Action>) {
-        let inner = self.inner.as_mut().unwrap();
-        let old_state = std::mem::replace(&mut inner.state, reset.state);
-        let old_rx = std::mem::replace(&mut inner.receiver, reset.receiver);
-        (old_state, old_rx)
-    }
-
-    pub fn replace_state(&mut self, state: D) -> Result<D, D> {
-        let inner = self.inner.as_mut().unwrap();
-        if state.sequence() != inner.state.sequence() {
-            return Err(state);
+        match &inner.internals {
+            StateUpdaterInternals::Leader { updater, .. } => visit(updater.state()),
+            StateUpdaterInternals::Follower { updater, .. } => {
+                let lock = updater.read_state();
+                visit(&*lock)
+            }
         }
-        Ok(std::mem::replace(&mut inner.state, state))
     }
 
-    pub fn replace_receiver(&mut self, rx: SequencedReceiver<D::Action>) -> Result<SequencedReceiver<D::Action>, SequencedReceiver<D::Action>> {
-        let inner = self.inner.as_mut().unwrap();
-        if rx.next_seq() != inner.receiver.next_seq() {
-            return Err(rx);
+    pub fn reset_follow(&mut self, state_rx: StateAndReceiver<D>) -> SequencedReceiver<D::AuthorityAction> {
+        let (tx, rx) = channel(1024);
+        let tx = SequencedSender::new(state_rx.state.sequence(), tx);
+        let rx = SequencedReceiver::new(state_rx.state.sequence(), rx);
+
+        let mut inner = self.inner.take().panic("missing inner");
+        inner.internals = match inner.internals {
+            StateUpdaterInternals::Leader { updater, .. } => {
+                let mut updater = updater.follow();
+                updater.reset(state_rx.state);
+
+                StateUpdaterInternals::Follower {
+                    updater,
+                    rx: state_rx.receiver,
+                    tx,
+                    next: None
+                }
+            }
+            StateUpdaterInternals::Follower { mut updater, .. } => {
+                updater.reset(state_rx.state);
+
+                StateUpdaterInternals::Follower {
+                    updater,
+                    rx: state_rx.receiver,
+                    tx,
+                    next: None,
+                }
+            }
+        };
+
+        self.inner = Some(inner);
+        rx
+    }
+
+    pub fn setup_follow<R, F: FnOnce(&mut StatePtr<D>) -> R>(&mut self, action_rx: SequencedReceiver<D::AuthorityAction>, update: F) -> Result<R, u64> {
+        if self.next_sequence() != action_rx.next_seq() {
+            return Err(self.next_sequence());
         }
-        Ok(std::mem::replace(&mut inner.receiver, rx))
+
+        let mut inner = self.inner.take().panic("missing inner");
+
+        let (mut updater, tx) = match inner.internals {
+            StateUpdaterInternals::Leader { updater, tx, .. } => (updater.follow(), tx),
+            StateUpdaterInternals::Follower { updater, tx, .. } => (updater, tx),
+        };
+
+        let result = updater.update_state(update);
+
+        inner.internals = StateUpdaterInternals::Follower {
+            updater,
+            rx: action_rx,
+            tx,
+            next: None,
+        };
+
+        self.inner = Some(inner);
+        Ok(result)
     }
 
-    pub fn send(self) {
-        /* send handled by drop */
+    pub fn become_leader<F: FnOnce(&mut StatePtr<D>) -> bool>(&mut self, update: F, action_rx: Receiver<D::Action>) -> Option<SequencedReceiver<D::AuthorityAction>> {
+        let mut inner = self.inner.take().panic("missing inner");
+        let mut new_rx = None;
+
+        let (updater, tx) = match inner.internals {
+            StateUpdaterInternals::Leader { updater, tx, .. } => (updater, tx),
+            StateUpdaterInternals::Follower { updater, tx, .. } => {
+                let mut updater = updater.lead();
+
+                let seq = updater.next_sequence();
+                let should_update_feed = updater.update_state(update);
+
+                if should_update_feed || seq != updater.next_sequence() {
+                    let (new_tx, rx) = channel(1024);
+                    let seq = updater.next_sequence();
+                    let new_tx = SequencedSender::new(seq, new_tx);
+                    new_rx = Some(SequencedReceiver::new(seq, rx));
+
+                    (updater, new_tx)
+                } else {
+                    (updater, tx)
+                }
+            }
+        };
+
+        inner.internals = StateUpdaterInternals::Leader {
+            updater,
+            rx: action_rx,
+            tx,
+            next: None,
+        };
+
+        self.inner = Some(inner);
+        new_rx
+    }
+
+    pub fn apply(self) {
     }
 }
 
-struct ReplaceInner<D: DeterministicState> {
-    state: D,
-    receiver: SequencedReceiver<D::Action>,
-    provide: oneshot::Sender<(D, SequencedReceiver<D::Action>)>,
-}
-
-impl<D: DeterministicState> Drop for ReplaceState<D> {
+impl<D: DeterministicState> Drop for UpdateInternalsAction<D> {
     fn drop(&mut self) {
-        let inner = self.inner.take().unwrap();
-
-        inner.provide.send((
-            inner.state,
-            inner.receiver,
-        )).panic("worker shutdown");
+        let inner = self.inner.take().panic("inner already taken");
+        inner.provide.send(
+            inner.internals
+        ).panic("worker shutdown");
     }
 }
 
-pub struct StateUpdaterTask<D: DeterministicState> {
-    rx: SequencedReceiver<D::Action>,
-    updater: SharedStateUpdater<D>,
-    replace_req_rx: Receiver<ReplaceRequest<D>>,
-    next_replace: Option<ReplaceRequest<D>>,
-}
-
-impl<D: DeterministicState> StateUpdaterTask<D> {
+impl<D: DeterministicState> StateUpdaterWorker<D> where D::AuthorityAction: Clone {
     pub async fn start(mut self) {
-        loop {
-            while let Some(replace) = self.next_replace.take() {
-                if replace.wait_for_rx_closed && !self.rx.is_closed() {
-                    self.next_replace = Some(replace);
+        let mut internals_dead = false;
+
+        'main_loop: loop {
+            if self.next_update_action.is_none() {
+                if internals_dead {
+                    internals_dead = false;
+
+                    self.next_update_action = self.next_update_action_rx.recv().await;
+                    if self.next_update_action.is_none() {
+                        tracing::info!("RX disconnected and no more updates available, closing worker");
+                        break;
+                    }
+                } else {
+                    self.next_update_action = match self.next_update_action_rx.try_recv() {
+                        Ok(v) => Some(v),
+                        Err(TryRecvError::Empty) => None,
+                        Err(TryRecvError::Disconnected) => {
+                            tracing::info!("RX disconnected and no more updates available, closing worker");
+                            break;
+                        }
+                    };
+                }
+            }
+
+            while let Some(replace) = self.next_update_action.take() {
+                if replace.wait_for_rx_closed && !internals_dead {
+                    self.next_update_action = Some(replace);
                     break;
                 }
 
-                self.updater.flush_queue();
-                let state = self.updater.read().clone();
-
                 let (tx, rx) = oneshot::channel();
 
-                replace.response.send(ReplaceState {
-                    inner: Some(ReplaceInner {
-                        state,
-                        receiver: self.rx,
-                        provide: tx
+                replace.response
+                    .send(UpdateInternalsAction {
+                        inner: Some(ReplaceStateActionInner {
+                            internals: self.internals,
+                            provide: tx,
+                        })
                     })
-                }).panic("replace request caller closed response channel");
+                    .panic("failed to send update actions to caller");
 
-                let (
-                    new_state,
-                    receiver,
-                ) = rx.await.panic("replace response not provided");
+                self.internals = rx.await
+                    .panic("update did not return internals");
 
-                assert_eq!(new_state.sequence(), receiver.next_seq());
-
-                self.updater.reset(new_state);
-                self.rx = receiver;
-
-                match self.replace_req_rx.try_recv() {
-                    Ok(item) => {
-                        self.next_replace = Some(item);
-                    }
-                    Err(TryRecvError::Disconnected) => {
-                        tracing::info!("StateUpdater dropped, closing worker");
-                        return;
-                    }
-                    Err(TryRecvError::Empty) => {
-                        break;
-                    }
-                }
+                self.next_update_action = self.next_update_action_rx.try_recv().ok();
             }
 
-            'next_rx: loop {
-                tokio::task::yield_now().await;
+            let mut blocked = false;
 
-                if self.updater.update_ready() {
-                    self.updater.update();
-                }
+            match &mut self.internals {
+                StateUpdaterInternals::Leader { updater, rx, tx, next } => {
+                    for _ in 0..1024 {
+                        let action = match next.take() {
+                            Some(action) => action,
+                            None => {
+                                match rx.try_recv() {
+                                    Ok(action) => action,
+                                    Err(TryRecvError::Disconnected) => {
+                                        internals_dead = true;
+                                        continue 'main_loop;
+                                    }
+                                    Err(TryRecvError::Empty) => {
+                                        blocked = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        };
 
-                let next = if self.next_replace.is_none() {
-                    tokio::select! {
-                        update = self.replace_req_rx.recv() => {
-                            let Some(update) = update else {
-                                tracing::info!("StateUpdater dropped, closing worker");
-                                return;
-                            };
-
-                            self.next_replace = Some(update);
-                            break;
-                        },
-                        next = self.rx.recv() => next,
-                    }
-                } else {
-                    self.rx.recv().await
-                };
-
-                let Some((seq, action)) = next else {
-                    break
-                };
-
-                self.updater.queue_sequenced(seq, action)
-                    .panic("invalid sequence provided to state");
-
-                for _ in 0..1024 {
-                    match self.rx.try_recv() {
-                        Ok((seq, action)) => {
-                            if self.updater.queue_sequenced(seq, action).is_err() {
-                                panic!("invalid sequence provided to state");
+                        let (seq, authority) = updater.queue(action);
+                        match tx.safe_send(seq, authority.clone()).await {
+                            Ok(_) => {}
+                            Err(SequencedSenderError::InvalidSequence(expected, _)) => {
+                                panic!("sending invalid sequence, expected: {} but sent: {}", expected, seq);
+                            }
+                            Err(SequencedSenderError::ChannelClosed(_)) => {
+                                tracing::warn!("leader authority queue closed");
+                                internals_dead = true;
+                                continue 'main_loop;
                             }
                         }
-                        Err(TryRecvError::Empty) => continue 'next_rx,
-                        Err(TryRecvError::Disconnected) => break 'next_rx,
+                    }
+
+                    updater.update();
+
+                    if !blocked {
+                        continue 'main_loop;
+                    }
+
+                    tokio::select! {
+                        action = self.next_update_action_rx.recv() => {
+                            /* note: if none (closed), top of loop will kill worker */
+                            self.next_update_action = action;
+                        }
+                        action = rx.recv() => {
+                            *next = action;
+                            if next.is_none() {
+                                internals_dead = true;
+                            }
+                        }
                     }
                 }
+                StateUpdaterInternals::Follower { updater, rx, tx, next } => {
+                    for _ in 0..1024 {
+                        let (seq, action) = match next.take() {
+                            Some(action) => action,
+                            None => {
+                                match rx.try_recv() {
+                                    Ok(action) => action,
+                                    Err(TryRecvError::Disconnected) => {
+                                        internals_dead = true;
+                                        continue 'main_loop;
+                                    }
+                                    Err(TryRecvError::Empty) => {
+                                        blocked = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        };
 
-                self.updater.update();
-                if self.updater.update_ready() {
-                    self.updater.update();
+                        if !updater.queue(seq, action.clone()) {
+                            panic!("invalid sequence, expected: {} but got: {}", updater.next_sequence(), seq);
+                        }
+
+                        match tx.safe_send(seq, action).await {
+                            Ok(_) => {}
+                            Err(SequencedSenderError::InvalidSequence(expected, _)) => {
+                                panic!("sending invalid sequence, expected: {} but sent: {}", expected, seq);
+                            }
+                            Err(SequencedSenderError::ChannelClosed(_)) => {
+                                tracing::warn!("leader authority queue closed");
+                                internals_dead = true;
+                                continue 'main_loop;
+                            }
+                        }
+                    }
+
+                    updater.update();
+
+                    if !blocked {
+                        continue 'main_loop;
+                    }
+
+                    tokio::select! {
+                        action = self.next_update_action_rx.recv() => {
+                            /* note: if none (closed), top of loop will kill worker */
+                            self.next_update_action = action;
+                        }
+                        action = rx.recv() => {
+                            *next = action;
+                            if next.is_none() {
+                                internals_dead = true;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use assert_matches::assert_matches;
+
+    use crate::{state::SharedState, testing::state_tests::{TestState, TestStateAction}};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn state_updater_test() {
+        let (shared, updater) = SharedState::new(TestState::default());
+
+        let (tx, rx) = channel(1024);
+        let (mut updater, mut rx) = StateUpdater::leader(rx, updater.into_lead());
+
+        tx.send(TestStateAction::Add { slot: 0, value: 33 }).await.unwrap();
+        tx.send(TestStateAction::Add { slot: 1, value: 22 }).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let seq = {
+            let lock = shared.read();
+            let state = &*lock;
+
+            assert_eq!(state.numbers[0], 33);
+            assert_eq!(state.numbers[1], 22);
+            state.sequence()
+        };
+
+        assert_matches!(rx.recv().await.unwrap(), (0, (_, TestStateAction::Add { slot: 0, value: 33 })));
+        assert_matches!(rx.recv().await.unwrap(), (1, (_, TestStateAction::Add { slot: 1, value: 22 })));
+        assert_eq!(seq, 2);
+
+        /* go to follower */
+        {
+            let mut update = updater.update_internals(false).await;
+
+            let (tx, rx) = channel(1024);
+            let mut tx = SequencedSender::new(seq, tx);
+            let rx = SequencedReceiver::new(seq, rx);
+
+            update.setup_follow(rx, |_| ()).unwrap();
+            update.apply();
+
+            tx.safe_send(2, (100, TestStateAction::Add { slot: 0, value: 10 })).await.unwrap();
+            tx.safe_send(3, (100, TestStateAction::Add { slot: 1, value: 20 })).await.unwrap();
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+
+            let seq = {
+                let lock = shared.read();
+                let state = &*lock;
+
+                assert_eq!(state.numbers[0], 43);
+                assert_eq!(state.numbers[1], 42);
+                state.sequence()
+            };
+
+            assert_eq!(seq, 4);
+        }
+
+        /* go to leader */
+        let (tx, mut rx) = {
+            let mut update = updater.update_internals(false).await;
+            let (tx, rx) = channel(1024);
+
+            let rx = update.become_leader(|state| {
+                state.sequence = 1;
+                state.numbers[0] = 100;
+                state.numbers[1] = 200;
+                true
+            }, rx).unwrap();
+
+            update.apply();
+
+            (tx, rx)
+        };
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        {
+            let lock = shared.read();
+            let state = &*lock;
+
+            assert_eq!(state.numbers[0], 100);
+            assert_eq!(state.numbers[1], 200);
+            assert_eq!(1, state.sequence());
+        }
+
+        tx.send(TestStateAction::Add { slot: 0, value: 99 }).await.unwrap();
+        assert_matches!(rx.recv().await.unwrap(), (1, (_, TestStateAction::Add { slot: 0, value: 99 })));
+
+        {
+            let lock = shared.read();
+            let state = &*lock;
+
+            assert_eq!(state.numbers[0], 199);
+            assert_eq!(state.numbers[1], 200);
+            assert_eq!(2, state.sequence());
+        }
+    }
+}
