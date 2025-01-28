@@ -427,22 +427,6 @@ impl<D: DeterministicState> StateUpdater<D> {
     }
 }
 
-pub struct StateActionIter<'a, D: DeterministicState> {
-    queue: &'a VecDeque<(u64, D::AuthorityAction)>,
-    pos: usize,
-}
-
-impl<'a, D: DeterministicState> Iterator for StateActionIter<'a, D> {
-    type Item = (u64, &'a D::AuthorityAction);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let (seq, value) = self.queue.get(self.pos)?;
-        self.pos += 1;
-        Some((*seq, value))
-    }
-}
-
-
 #[cfg(test)]
 mod test {
     use std::time::{SystemTime, UNIX_EPOCH};

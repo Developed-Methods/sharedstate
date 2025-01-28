@@ -160,6 +160,10 @@ impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D>
     pub async fn set_leader(&self, leader: I::Address) {
         self.event_tx.send(Event::NewLeader(leader)).await.panic("worker closed");
     }
+
+    pub fn actions_tx(&self) -> Sender<D::Action> {
+        self.client_actions_tx.clone()
+    }
 }
 
 impl<I: SyncIO, D: DeterministicState> Drop for SyncState<I, D> {

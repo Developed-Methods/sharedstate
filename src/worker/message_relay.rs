@@ -1,4 +1,3 @@
-use futures_util::TryFutureExt;
 use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};
 use tokio::sync::{mpsc::{error::TryRecvError, Receiver, Sender, channel}, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -80,11 +79,11 @@ pub trait MessageIO: Default + 'static {
 
     fn receive(rx: &mut Self::Receiver) -> impl Future<Output = Option<Self::Message>> + Send;
 
-    fn can_replace_rx(current: &Self::Receiver, option: &Self::Receiver) -> bool {
+    fn can_replace_rx(_current: &Self::Receiver, _option: &Self::Receiver) -> bool {
         true
     }
 
-    fn can_replace_tx(current: &Self::Sender, option: &Self::Sender) -> bool {
+    fn can_replace_tx(_current: &Self::Sender, _option: &Self::Sender) -> bool {
         true
     }
 
