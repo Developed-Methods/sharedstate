@@ -181,6 +181,7 @@ impl<D: DeterministicState> UpdateInternalsAction<D> {
 
     pub fn setup_follow<R, F: FnOnce(&mut StatePtr<D>) -> R>(&mut self, action_rx: SequencedReceiver<D::AuthorityAction>, update: F) -> Result<R, u64> {
         if self.next_sequence() != action_rx.next_seq() {
+            tracing::error!("setup_follow invalid sequence, expected: {} but got: {}", self.next_sequence(), action_rx.next_seq());
             return Err(self.next_sequence());
         }
 

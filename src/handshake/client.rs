@@ -2,7 +2,7 @@ use std::{marker::PhantomData, time::Duration};
 
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};
-use tokio::sync::mpsc::{Sender, channel};
+use tokio::{sync::mpsc::{channel, Sender}, task::JoinHandle};
 use tracing::Instrument;
 
 use crate::{io::{SyncConnection, SyncIO}, message_io::{read_message, read_message_opt, send_message, send_zero_message}, recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails}, state::DeterministicState, utils::PanicHelper};
@@ -159,8 +159,12 @@ impl<I: SyncIO> FreshConnection<I> {
 }
 
 impl<I: SyncIO> RecoveringConnection<I> {
-    pub fn sequence(&self) -> u64 {
+    pub fn local_sequence(&self) -> u64 {
         self.local_follower_details.sequence
+    }
+
+    pub fn leader_sequence(&self) -> u64 {
+        self.leader_details.sequence
     }
 
     pub fn recover<D: DeterministicState + Clone>(self, state: &mut RecoverableState<D>) -> Result<ConnectedToLeader<I, D>, HandshakeError> {
@@ -184,12 +188,13 @@ impl<I: SyncIO> RecoveringConnection<I> {
 pub struct LeaderChannels<D: DeterministicState> {
     pub action_tx: Sender<D::Action>,
     pub authority_rx: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
+    pub reader_task: JoinHandle<SequencedSender<RecoverableStateAction<D::AuthorityAction>>>,
 }
 
 impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D> 
     where D::Action: MessageEncoding, D::AuthorityAction: MessageEncoding
 {
-    pub fn start_io_workers2(self, mut authority_tx: SequencedSender<RecoverableStateAction<D::AuthorityAction>>) -> Result<(I::Address, Sender<D::Action>), u64> {
+    pub fn start_io_workers2(self, mut authority_tx: SequencedSender<RecoverableStateAction<D::AuthorityAction>>) -> Result<(I::Address, Sender<D::Action>, JoinHandle<SequencedSender<RecoverableStateAction<D::AuthorityAction>>>), u64> {
         if authority_tx.seq() != self.sequence {
             return Err(self.sequence);
         }
@@ -201,19 +206,19 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
         } = self;
 
         /* read messages into authority queue */
-        tokio::spawn(async move {
+        let read_task = tokio::spawn(async move {
             loop {
                 match read_message_opt::<(u64, RecoverableStateAction<D::AuthorityAction>), _>(&mut buffer, &mut read, Duration::from_secs(2), Some(Duration::from_secs(8))).await {
                     Ok(Some((seq, action))) => {
                         match authority_tx.safe_send(seq, action).await {
                             Ok(_) => {}
                             Err(SequencedSenderError::ChannelClosed(_)) => {
-                                tracing::info!("sequenced sender for leader connection closed");
-                                return;
+                                tracing::info!(seq, "sequenced sender for leader connection closed");
+                                break;
                             }
                             Err(SequencedSenderError::InvalidSequence(actual, _)) => {
                                 tracing::error!("leader sent wrong sequence, expected: {} but got: {}", actual, seq);
-                                return;
+                                break;
                             }
                         }
                     }
@@ -221,12 +226,13 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
                     }
                     Err(error) => {
                         tracing::error!(?error, "got error reading next message from leader");
-                        return;
+                        break;
                     }
                 }
             }
-        }.instrument(tracing::info_span!("read from leader", ?remote)));
 
+            authority_tx
+        }.instrument(tracing::info_span!("read from leader", ?remote)));
 
         let (action_tx, mut action_rx) = channel::<D::Action>(1024);
 
@@ -266,7 +272,7 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
             }
         }.instrument(tracing::info_span!("write to leader", ?remote)));
 
-        Ok((remote, action_tx))
+        Ok((remote, action_tx, read_task))
     }
 
     pub fn start_io_workers(self) -> (I::Address, LeaderChannels<D>) {
@@ -274,13 +280,18 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
         let authority_tx = SequencedSender::new(self.sequence, authority_tx);
         let authority_rx = SequencedReceiver::new(self.sequence, authority_rx);
 
-        let (addr, action_tx) = self.start_io_workers2(authority_tx).panic("invalid sequence");
+        let (
+            addr,
+            action_tx,
+            reader_task
+        ) = self.start_io_workers2(authority_tx).panic("invalid sequence");
 
         (
             addr,
             LeaderChannels {
                 action_tx,
                 authority_rx,
+                reader_task
             },
         )
     }
