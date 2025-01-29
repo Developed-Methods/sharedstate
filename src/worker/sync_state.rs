@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, fmt::Debug, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
+use std::{collections::VecDeque, fmt::Debug, panic::Location, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
 
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedBroadcast, SequencedBroadcastSettings, SequencedReceiver, SequencedSender};
@@ -33,7 +33,7 @@ impl<I: SyncIO, D: DeterministicState> Debug for Event<I, D> {
             Self::NewLeader(addr) => write!(f, "NewLeader({:?})", addr),
             Self::AttemptConnect(attempt, opts) => write!(f, "AttemptConnect(attempt: {}, options: {})", attempt, opts.len()),
             Self::FreshConnection(_, state) => write!(f, "FreshConnection(seq: {})", state.sequence()),
-            Self::RecoveringConnection(recov) => write!(f, "RecoveringConnection(seq: {})", recov.sequence()),
+            Self::RecoveringConnection(recov) => write!(f, "RecoveringConnection(local_seq: {}, leader_seq: {})", recov.local_sequence(), recov.leader_sequence()),
             Self::NewClient(s) => write!(f, "NewClient({:?})", s.remote),
             Self::NewFreshClient(s) => write!(f, "NewFreshClient({:?})", s.remote()), 
             Self::NewClientWantsRecovery(s) => write!(f, "NewClientWantsRecovery(remote: {:?}, seq: {})", s.remote(), s.details().sequence), 
@@ -245,15 +245,18 @@ where D::Action: MessageEncoding,
                             panic!("feed should not need update moving from local to lead");
                         }
                     } else {
-                        if old_leader == self.local {
-                            tracing::info!(new_leader = ?self.leader, "becoming follower");
-                        }
-                        else {
-                            tracing::info!(new_leader = ?self.leader, ?old_leader, "leader changed");
-                        }
-
                         let mut update = self.updater.update_internals(false)
                             .timeout(Duration::from_millis(100), "update internals").await;
+                        let next_seq = update.next_sequence();
+
+                        let needs_connect = if old_leader == self.local {
+                            tracing::info!(new_leader = ?self.leader, next_seq, "becoming follower");
+                            true
+                        }
+                        else {
+                            tracing::info!(new_leader = ?self.leader, ?old_leader, next_seq, "leader changed");
+                            false
+                        };
 
                         /* setup follow with dead end as need to a new connection to leader */
                         update.setup_follow(SequencedReceiver::new(update.next_sequence(), channel(1).1), |_| ())
@@ -266,10 +269,12 @@ where D::Action: MessageEncoding,
                         let event_tx = self.event_tx.clone();
                         let attempt = self.connect_attempts.clone();
 
-                        tokio::spawn(async move {
-                            let at = attempt.fetch_add(1, Ordering::SeqCst) + 1;
-                            event_tx.send(Event::AttemptConnect(at, leader_options)).await.panic("worker crashed");
-                        }.instrument(tracing::Span::current()));
+                        if needs_connect {
+                            tokio::spawn(async move {
+                                let at = attempt.fetch_add(1, Ordering::SeqCst) + 1;
+                                event_tx.send(Event::AttemptConnect(at, leader_options)).await.panic("worker crashed");
+                            }.instrument(tracing::Span::current()));
+                        }
                     }
                 }
                 Event::AttemptConnect(attempt, mut options) => {
@@ -296,6 +301,7 @@ where D::Action: MessageEncoding,
                     let state_details = self.shared.read().details().clone();
 
                     let span = tracing::info_span!("AttemptConnect", ?addr);
+
                     tokio::spawn(async move {
                         let Ok(conn) = io.connect(&addr).await.err_log("failed to connect to leader") else {
                             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -309,8 +315,10 @@ where D::Action: MessageEncoding,
                         let handshake = HandshakeClient::new(conn);
 
                         let established_res = if 0 < state_details.state_sequence {
+                            tracing::info!("attempt reconnect: {:?}", state_details);
                             handshake.reconnect(state_details).await.err_log("failed to reconnect")
                         } else {
+                            tracing::info!("attempt fresh connect");
                             handshake.connect().await.err_log("failed to connect")
                         };
 
@@ -377,9 +385,11 @@ where D::Action: MessageEncoding,
 
                     tokio::spawn(async move {
                         let _ = reader_task.await.err_log("failed to join reader task");
+                        tracing::info!("Connection to leader closed, sending new connection attempt");
+
                         let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
                         event_tx.send(Event::AttemptConnect(attempt, VecDeque::new())).await.panic("worker closed");
-                    });
+                    }.instrument(tracing::Span::current()));
                 }
                 Event::RecoveringConnection(recovering) => {
                     if self.leader == self.local {
@@ -388,8 +398,8 @@ where D::Action: MessageEncoding,
                     }
 
                     let (leader_tx, leader_rx) = channel(1024);
-                    let leader_tx = SequencedSender::new(recovering.sequence(), leader_tx);
-                    let leader_rx = SequencedReceiver::new(recovering.sequence(), leader_rx);
+                    let leader_tx = SequencedSender::new(recovering.local_sequence(), leader_tx);
+                    let leader_rx = SequencedReceiver::new(recovering.local_sequence(), leader_rx);
 
                     let connection = self.updater
                         .update_internals(false)
@@ -410,9 +420,11 @@ where D::Action: MessageEncoding,
 
                     tokio::spawn(async move {
                         let _ = reader_task.await.err_log("failed to join reader task");
+
+                        tracing::info!("Connection to leader closed, sending new connection attempt");
                         let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
                         event_tx.send(Event::AttemptConnect(attempt, VecDeque::new())).await.panic("worker closed");
-                    });
+                    }.instrument(tracing::Span::current()));
                 }
                 Event::NewClient(conn) => {
                     let event_tx = self.event_tx.clone();
@@ -470,6 +482,9 @@ where D::Action: MessageEncoding,
 
                     if let Some(authority_rx) = authority_rx_opt {
                         tokio::spawn(async move {
+                            let leader_seq = details.sequence;
+                            let client_seq = authority_rx.next_seq();
+
                             let Ok(ready) = recover
                                 .accept_recover::<D>(details).await
                                 .err_log("failed to recover state") else { return };
@@ -477,7 +492,7 @@ where D::Action: MessageEncoding,
                             let remote = ready.start_io_tasks2(actions_tx, authority_rx)
                                 .log().panic("invalid sequence");
 
-                            tracing::info!(?remote, "Recover client accepted");
+                            tracing::info!(?remote, client_seq, leader_seq, "Recover client accepted");
                         }.instrument(tracing::Span::current()));
                     }
                     else {

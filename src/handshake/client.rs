@@ -159,8 +159,12 @@ impl<I: SyncIO> FreshConnection<I> {
 }
 
 impl<I: SyncIO> RecoveringConnection<I> {
-    pub fn sequence(&self) -> u64 {
+    pub fn local_sequence(&self) -> u64 {
         self.local_follower_details.sequence
+    }
+
+    pub fn leader_sequence(&self) -> u64 {
+        self.leader_details.sequence
     }
 
     pub fn recover<D: DeterministicState + Clone>(self, state: &mut RecoverableState<D>) -> Result<ConnectedToLeader<I, D>, HandshakeError> {
@@ -209,7 +213,7 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
                         match authority_tx.safe_send(seq, action).await {
                             Ok(_) => {}
                             Err(SequencedSenderError::ChannelClosed(_)) => {
-                                tracing::info!("sequenced sender for leader connection closed");
+                                tracing::info!(seq, "sequenced sender for leader connection closed");
                                 break;
                             }
                             Err(SequencedSenderError::InvalidSequence(actual, _)) => {
