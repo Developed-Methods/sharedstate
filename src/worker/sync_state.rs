@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, fmt::Debug, panic::Location, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
+use std::{collections::VecDeque, fmt::Debug, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
 
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedBroadcast, SequencedBroadcastSettings, SequencedReceiver, SequencedSender};
