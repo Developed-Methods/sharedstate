@@ -1,7 +1,7 @@
-use std::{collections::VecDeque, fmt::Debug, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
+use std::{collections::VecDeque, fmt::Debug, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 use message_encoding::MessageEncoding;
-use sequenced_broadcast::{SequencedBroadcast, SequencedBroadcastSettings, SequencedReceiver, SequencedSender};
+use sequenced_broadcast::{SequencedBroadcast, SequencedBroadcastMetrics, SequencedBroadcastSettings, SequencedReceiver, SequencedSender};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -15,6 +15,20 @@ pub struct SyncState<I: SyncIO, D: DeterministicState> {
     event_tx: Sender<Event<I, D>>,
     client_actions_tx: Sender<D::Action>,
     cancel: CancellationToken,
+    metrics: Arc<SyncStateMetrics>,
+}
+
+#[derive(Default, Debug)]
+pub struct SyncStateMetrics {
+    pub broadcast: SequencedBroadcastMetrics,
+    pub broadcast_last_update: AtomicU64,
+
+    pub connection_attempts: AtomicU64,
+    pub last_seen: AtomicU64,
+
+    pub connecting: AtomicBool,
+    pub connected: AtomicBool,
+    pub leading: AtomicBool,
 }
 
 enum Event<I: SyncIO, D: DeterministicState> {
@@ -62,6 +76,7 @@ struct SyncStateWorker<I: SyncIO, D: DeterministicState> {
     broadcast: SequencedBroadcast<RecoverableStateAction<D::AuthorityAction>>,
 
     cancel: CancellationToken,
+    metrics: Arc<SyncStateMetrics>,
 }
 
 impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D> 
@@ -85,6 +100,9 @@ impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D>
         let (shared, updater) = SharedState::new(state);
 
         let (actions_tx, actions_rx) = channel::<D::Action>(1024);
+
+        let metrics = Arc::new(SyncStateMetrics::default());
+        metrics.broadcast.update(broadcast.metrics_ref());
 
         let worker = if local == leader {
             let (lead_actions_tx, lead_actions_rx) = channel(1024);
@@ -113,6 +131,7 @@ impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D>
                 broadcast,
 
                 cancel: cancel.clone(),
+                metrics: metrics.clone(),
             }
         } else {
             event_tx
@@ -145,6 +164,7 @@ impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D>
                 broadcast,
 
                 cancel: cancel.clone(),
+                metrics: metrics.clone(),
             }
         };
 
@@ -155,6 +175,7 @@ impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D>
             event_tx,
             client_actions_tx: actions_tx,
             cancel,
+            metrics,
         }
     }
 
@@ -168,6 +189,14 @@ impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D>
 
     pub fn actions_tx(&self) -> Sender<D::Action> {
         self.client_actions_tx.clone()
+    }
+
+    pub fn metrics_ref(&self) -> &SyncStateMetrics {
+        &self.metrics
+    }
+
+    pub fn metrics(&self) -> Arc<SyncStateMetrics> {
+        self.metrics.clone()
     }
 }
 
@@ -213,12 +242,17 @@ where D::Action: MessageEncoding,
                 event_opt = self.event_rx.recv() => {
                     event_opt.expect("should not be possible, have local reference")
                 }
+                _ = tokio::time::sleep(Duration::from_millis(128)) => {
+                    self.update_metrics();
+                    continue;
+                }
                 _ = self.cancel.cancelled() => {
                     break;
                 }
             };
 
             tracing::info!("Process Event: {:?}", event);
+            self.update_metrics();
 
             match event {
                 Event::NewLeader(leader) => {
@@ -230,6 +264,11 @@ where D::Action: MessageEncoding,
                     let old_leader = std::mem::replace(&mut self.leader, leader);
                     if self.leader == self.local {
                         tracing::info!(?old_leader, "becoming leader");
+
+                        self.metrics.leading.store(true, Ordering::Release);
+                        self.metrics.connected.store(false, Ordering::Release);
+                        self.metrics.connecting.store(false, Ordering::Release);
+                        self.metrics.connection_attempts.store(0, Ordering::Release);
 
                         let (actions_tx, actions_rx) = channel(1024);
                         actions_tx.try_send(RecoverableStateAction::BumpGeneration).panic("failed to queue first action");
@@ -269,6 +308,11 @@ where D::Action: MessageEncoding,
                         let event_tx = self.event_tx.clone();
                         let attempt = self.connect_attempts.clone();
 
+                        self.metrics.leading.store(false, Ordering::Release);
+                        self.metrics.connected.store(false, Ordering::Release);
+                        self.metrics.connecting.store(true, Ordering::Release);
+                        self.metrics.connection_attempts.store(0, Ordering::Release);
+
                         if needs_connect {
                             tokio::spawn(async move {
                                 let at = attempt.fetch_add(1, Ordering::SeqCst) + 1;
@@ -287,6 +331,8 @@ where D::Action: MessageEncoding,
                         tracing::info!("ignoring connection attempt and new item queued");
                         continue;
                     }
+
+                    self.metrics.connection_attempts.fetch_add(1, Ordering::AcqRel);
 
                     if options.is_empty() {
                         options.push_back(self.leader.clone());
@@ -376,16 +422,30 @@ where D::Action: MessageEncoding,
                         .panic("failed to replace output");
 
                     /* replace broadcast and drop all subscribers */
-                    let (broadcast, broadcast_tx) = SequencedBroadcast::new(authority_rx.next_seq(), self.broadcast_settings.clone());
+                    let (broadcast, broadcast_tx) = SequencedBroadcast::new(
+                        authority_rx.next_seq(),
+                        self.broadcast_settings.clone()
+                    );
                     self.broadcast = broadcast;
                     self.authority_relay = MessageRelay::new(authority_rx, broadcast_tx);
 
+                    self.metrics.leading.store(false, Ordering::Release);
+                    self.metrics.connected.store(true, Ordering::Release);
+                    self.metrics.connecting.store(false, Ordering::Release);
+                    self.metrics.connection_attempts.store(0, Ordering::Release);
+
                     let event_tx = self.event_tx.clone();
                     let attempts = self.connect_attempts.clone();
+                    let metrics = self.metrics.clone();
 
                     tokio::spawn(async move {
                         let _ = reader_task.await.err_log("failed to join reader task");
                         tracing::info!("Connection to leader closed, sending new connection attempt");
+
+                        metrics.leading.store(false, Ordering::Release);
+                        metrics.connected.store(false, Ordering::Release);
+                        metrics.connecting.store(true, Ordering::Release);
+                        metrics.connection_attempts.store(0, Ordering::Release);
 
                         let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
                         event_tx.send(Event::AttemptConnect(attempt, VecDeque::new())).await.panic("worker closed");
@@ -415,11 +475,22 @@ where D::Action: MessageEncoding,
                         .timeout(Duration::from_millis(100), "timeout replacing output").await
                         .panic("failed to replace output");
 
+                    self.metrics.leading.store(false, Ordering::Release);
+                    self.metrics.connected.store(true, Ordering::Release);
+                    self.metrics.connecting.store(false, Ordering::Release);
+                    self.metrics.connection_attempts.store(0, Ordering::Release);
+
                     let event_tx = self.event_tx.clone();
                     let attempts = self.connect_attempts.clone();
+                    let metrics = self.metrics.clone();
 
                     tokio::spawn(async move {
                         let _ = reader_task.await.err_log("failed to join reader task");
+
+                        metrics.leading.store(false, Ordering::Release);
+                        metrics.connected.store(false, Ordering::Release);
+                        metrics.connecting.store(true, Ordering::Release);
+                        metrics.connection_attempts.store(0, Ordering::Release);
 
                         tracing::info!("Connection to leader closed, sending new connection attempt");
                         let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -530,6 +601,17 @@ where D::Action: MessageEncoding,
 
             tracing::info!(dead_events = count, "worker shutdown complete");
         }.await.instrument(tracing::info_span!("SyncStateWorker::shutdown"));
+    }
+
+    fn update_metrics(&self) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        self.metrics.last_seen.store(now, Ordering::Release);
+
+        let last_broadcast = self.metrics.broadcast_last_update.load(Ordering::Acquire);
+        if 100 < now.max(last_broadcast) - last_broadcast {
+            self.metrics.broadcast.update(self.broadcast.metrics_ref());
+            self.metrics.broadcast_last_update.store(now, Ordering::Release);
+        }
     }
 }
 
