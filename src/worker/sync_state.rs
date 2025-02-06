@@ -111,6 +111,8 @@ impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D>
             let (updater, leader_rx) = StateUpdater::leader(lead_actions_rx, updater.into_lead());
             let authority_relay = MessageRelay::new(leader_rx, broadcast_tx);
 
+            metrics.leading.store(true, Ordering::Release);
+
             SyncStateWorker {
                 io,
 
@@ -143,6 +145,8 @@ impl<I: SyncIO, D: DeterministicState + MessageEncoding> SyncState<I, D>
 
             let action_relay = MessageRelay::new(actions_rx, ClientActionSender::ToRemote(channel(1).0));
             let authority_relay = MessageRelay::new(authority_rx, broadcast_tx);
+
+            metrics.connecting.store(true, Ordering::Release);
 
             SyncStateWorker {
                 io,
