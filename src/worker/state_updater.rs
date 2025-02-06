@@ -1,3 +1,5 @@
+use std::{sync::{atomic::{AtomicU64, Ordering}, Arc, LazyLock}, time::Instant};
+
 use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};
 use tokio::sync::{mpsc::{channel, error::TryRecvError, Receiver, Sender}, oneshot};
 
@@ -5,12 +7,14 @@ use crate::{state::{DeterministicState, FollowUpdater, LeaderUpdater, StatePtr},
 
 pub struct StateUpdater<D: DeterministicState> {
     replace_req_tx: Sender<ReplaceRequest<D>>,
+    worker_loop: Arc<AtomicU64>,
 }
 
 struct StateUpdaterWorker<D: DeterministicState> {
     internals: StateUpdaterInternals<D>,
     next_update_action: Option<ReplaceRequest<D>>,
     next_update_action_rx: Receiver<ReplaceRequest<D>>,
+    worker_loop: Arc<AtomicU64>,
 }
 
 enum StateUpdaterInternals<D: DeterministicState> {
@@ -49,17 +53,20 @@ impl<D: DeterministicState> StateUpdater<D> where D::AuthorityAction: Clone {
         let authority_rx = SequencedReceiver::new(updater.next_sequence(), authority_rx);
 
         let (replace_tx, replace_rx) = channel::<ReplaceRequest<D>>(1);
+        let worker_loop = Arc::new(AtomicU64::new(0));
 
         let internals = StateUpdaterInternals::Leader { updater, rx, tx: authority_tx, next: None };
         tokio::spawn(StateUpdaterWorker {
             internals,
             next_update_action: None,
             next_update_action_rx: replace_rx,
+            worker_loop: worker_loop.clone(),
         }.start());
 
         (
             StateUpdater {
                 replace_req_tx: replace_tx,
+                worker_loop,
             },
             authority_rx,
         )
@@ -72,16 +79,19 @@ impl<D: DeterministicState> StateUpdater<D> where D::AuthorityAction: Clone {
 
         let internals = StateUpdaterInternals::Follower { updater, rx, tx: authority_tx, next: None };
         let (replace_tx, replace_rx) = channel::<ReplaceRequest<D>>(1);
+        let worker_loop = Arc::new(AtomicU64::new(0));
 
         tokio::spawn(StateUpdaterWorker {
             internals,
             next_update_action: None,
             next_update_action_rx: replace_rx,
+            worker_loop: worker_loop.clone(),
         }.start());
 
         (
             StateUpdater {
                 replace_req_tx: replace_tx,
+                worker_loop,
             },
             authority_rx
         )
@@ -104,6 +114,10 @@ impl<D: DeterministicState> StateUpdater<D> where D::AuthorityAction: Clone {
         }
 
         internals
+    }
+
+    pub fn worker_loop(&self) -> u64 {
+        self.worker_loop.load(Ordering::Acquire)
     }
 }
 
@@ -254,11 +268,26 @@ impl<D: DeterministicState> Drop for UpdateInternalsAction<D> {
     }
 }
 
+static WORKER_ID: LazyLock<Arc<AtomicU64>> = LazyLock::new(|| Arc::new(AtomicU64::new(1)));
+
 impl<D: DeterministicState> StateUpdaterWorker<D> where D::AuthorityAction: Clone {
-    pub async fn start(mut self) {
+    async fn start(self) {
+        let id = WORKER_ID.fetch_add(1, Ordering::SeqCst);
+        tracing::info!(id, "StateUpdaterWorker Started");
+        let start = Instant::now();
+
+        self._start().await;
+        let elapsed = start.elapsed();
+        tracing::info!(id, ?elapsed, "StateUpdaterWorker Stopped");
+    }
+
+    async fn _start(mut self) {
         let mut internals_dead = false;
 
         'main_loop: loop {
+            self.worker_loop.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+
             if self.next_update_action.is_none() {
                 if internals_dead {
                     internals_dead = false;

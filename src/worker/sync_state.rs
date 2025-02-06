@@ -29,6 +29,10 @@ pub struct SyncStateMetrics {
     pub connecting: AtomicBool,
     pub connected: AtomicBool,
     pub leading: AtomicBool,
+
+    pub authority_relay_worker_loops: AtomicU64,
+    pub action_relay_worker_loops: AtomicU64,
+    pub state_updater_loops: AtomicU64,
 }
 
 enum Event<I: SyncIO, D: DeterministicState> {
@@ -222,6 +226,8 @@ where D::Action: MessageEncoding,
 
             tokio::spawn(async move {
                 loop {
+                    tokio::task::yield_now().await;
+
                     tokio::select! {
                         client_res = io.next_client() => {
                             let Ok(client) = client_res.err_log("failed to get next_client") else {
@@ -242,6 +248,8 @@ where D::Action: MessageEncoding,
         }
 
         loop {
+            tokio::task::yield_now().await;
+
             let event = tokio::select! {
                 event_opt = self.event_rx.recv() => {
                     event_opt.expect("should not be possible, have local reference")
@@ -609,12 +617,14 @@ where D::Action: MessageEncoding,
 
     fn update_metrics(&self) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        self.metrics.last_seen.store(now, Ordering::Release);
+        self.metrics.last_seen.store(now, Ordering::Relaxed);
+        self.metrics.action_relay_worker_loops.store(self.action_relay.worker_loops(), Ordering::Relaxed);
+        self.metrics.authority_relay_worker_loops.store(self.authority_relay.worker_loops(), Ordering::Relaxed);
 
         let last_broadcast = self.metrics.broadcast_last_update.load(Ordering::Acquire);
         if 100 < now.max(last_broadcast) - last_broadcast {
             self.metrics.broadcast.update(self.broadcast.metrics_ref());
-            self.metrics.broadcast_last_update.store(now, Ordering::Release);
+            self.metrics.broadcast_last_update.store(now, Ordering::Relaxed);
         }
     }
 }

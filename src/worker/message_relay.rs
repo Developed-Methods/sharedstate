@@ -1,13 +1,14 @@
 use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};
 use tokio::sync::{mpsc::{error::TryRecvError, Receiver, Sender, channel}, oneshot};
 use tokio_util::sync::CancellationToken;
-use std::{future::Future, marker::PhantomData, sync::Arc};
+use std::{future::Future, marker::PhantomData, sync::{atomic::{AtomicU64, Ordering}, Arc, LazyLock}, time::Instant};
 
 use crate::{recoverable_state::RecoverableStateAction, utils::PanicHelper};
 
 pub struct MessageRelay<M: MessageIO> {
     next_request_tx: Sender<NextRequest<M>>,
     cancel: Arc<CancellationToken>,
+    worker_loops: Arc<AtomicU64>,
     _phantom: PhantomData<M>,
 }
 
@@ -16,6 +17,7 @@ impl<M: MessageIO> MessageRelay<M> {
         let (tx, rx) = channel(32);
 
         let cancel = Arc::new(CancellationToken::new());
+        let worker_loops = Arc::new(AtomicU64::new(0));
 
         tokio::spawn(Worker {
             output,
@@ -25,11 +27,13 @@ impl<M: MessageIO> MessageRelay<M> {
             next_request: None,
             cancel: cancel.clone(),
             input_closed: false,
+            worker_loops: worker_loops.clone(),
         }.start());
 
         MessageRelay {
             next_request_tx: tx,
             cancel,
+            worker_loops: worker_loops.clone(),
             _phantom: PhantomData,
         }
     }
@@ -61,6 +65,10 @@ impl<M: MessageIO> MessageRelay<M> {
         })?;
 
         rx.await.panic("worker closed")
+    }
+
+    pub fn worker_loops(&self) -> u64 {
+        self.worker_loops.load(Ordering::Acquire)
     }
 }
 
@@ -224,6 +232,7 @@ struct Worker<M: MessageIO> {
     next_request: Option<NextRequest<M>>,
     next_input_rx: Receiver<NextRequest<M>>,
     cancel: Arc<CancellationToken>,
+    worker_loops: Arc<AtomicU64>,
 }
 
 enum NextRequest<M: MessageIO> {
@@ -242,9 +251,24 @@ struct ChangeOutputRequest<M: MessageIO> {
     callback: oneshot::Sender<Result<M::Sender, M::Sender>>,
 }
 
+static WORKER_ID: LazyLock<Arc<AtomicU64>> = LazyLock::new(|| Arc::new(AtomicU64::new(1)));
+
 impl<M: MessageIO> Worker<M> {
-    async fn start(mut self) {
+    async fn start(self) {
+        let id = WORKER_ID.fetch_add(1, Ordering::SeqCst);
+        tracing::info!(id, "MessageRelayWorker Started");
+        let start = Instant::now();
+
+        self._start().await;
+        let elapsed = start.elapsed();
+        tracing::info!(id, ?elapsed, "MessageRelayWorker Stopped");
+    }
+
+    async fn _start(mut self) {
         loop {
+            self.worker_loops.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+
             /* read from input */
             {
                 if self.input_item.is_none() {
@@ -457,32 +481,5 @@ mod test {
         assert!(send_num - receive_num <= 1024.max(send_num / 10_000));
     }
 
-//     use crate::utils::TimeoutPanicHelper;
-// 
-//     use super::*;
-// 
-//     #[tokio::test]
-//     async fn message_relay_test() {
-//         let (in_tx, in_rx) = channel(1024);
-//         let (out_tx, mut out_rx) = channel(1024);
-// 
-//         let relay = MessageRelay::<&'static str>::new(in_rx, RelayOutput::Sender(out_tx));
-// 
-//         in_tx.send("Hello WOrld").test_timeout().await.unwrap();
-//         assert_eq!(out_rx.recv().test_timeout().await.unwrap(), "Hello WOrld");
-// 
-//         let (sequenced_tx, mut sequenced_rx) = channel(1024);
-//         let mut old_sender = relay.replace_output(RelayOutput::SequencedSender(SequencedSender::new(100, sequenced_tx)))
-//             .test_timeout().await.unwrap()
-//             .test_timeout().await.unwrap();
-// 
-//         in_tx.send("new message").test_timeout().await.unwrap();
-//         out_rx.recv().expect_timeout().await;
-// 
-//         old_sender.send("out of bound").test_timeout().await.unwrap();
-//         assert_eq!(out_rx.recv().test_timeout().await.unwrap(), "out of bound");
-// 
-//         assert_eq!(sequenced_rx.recv().test_timeout().await.unwrap(), (100, "new message"));
-//     }
 }
 
