@@ -256,15 +256,15 @@ static WORKER_ID: LazyLock<Arc<AtomicU64>> = LazyLock::new(|| Arc::new(AtomicU64
 impl<M: MessageIO> Worker<M> {
     async fn start(self) {
         let id = WORKER_ID.fetch_add(1, Ordering::SeqCst);
-        tracing::info!(id, "MessageRelayWorker Started");
+        tracing::info!(id, "{}|MessageRelayWorker Started", id);
         let start = Instant::now();
 
-        self._start().await;
+        self._start(id).await;
         let elapsed = start.elapsed();
-        tracing::info!(id, ?elapsed, "MessageRelayWorker Stopped");
+        tracing::info!(id, ?elapsed, "{}|MessageRelayWorker Stopped", id);
     }
 
-    async fn _start(mut self) {
+    async fn _start(mut self, id: u64) {
         loop {
             self.worker_loops.fetch_add(1, Ordering::Relaxed);
             tokio::task::yield_now().await;
@@ -298,7 +298,7 @@ impl<M: MessageIO> Worker<M> {
                     self.next_request = match self.next_input_rx.try_recv() {
                         Ok(v) => Some(v),
                         Err(TryRecvError::Disconnected) => {
-                            tracing::info!("MessageRelay dropped, closing worker");
+                            tracing::info!("{}|MessageRelay dropped, closing worker", id);
                             return;
                         },
                         Err(TryRecvError::Empty) => None,
@@ -312,7 +312,7 @@ impl<M: MessageIO> Worker<M> {
                             self.next_request = next;
                         }
                         _ = self.cancel.cancelled() => {
-                            tracing::info!("MessageRelay dropped, ending worker");
+                            tracing::info!("{}|MessageRelay dropped, ending worker", id);
                             return;
                         }
                     }

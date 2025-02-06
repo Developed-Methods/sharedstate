@@ -9,7 +9,7 @@ license-file = "LICENSE.txt"
 
 [dependencies]
 message-encoding = "0.2.4"
-sequenced-broadcast = "0.2.2"
+sequenced-broadcast = "0.2.3"
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = "0.7.12"
 futures-util = "0.3.31"

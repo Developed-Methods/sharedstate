@@ -273,15 +273,15 @@ static WORKER_ID: LazyLock<Arc<AtomicU64>> = LazyLock::new(|| Arc::new(AtomicU64
 impl<D: DeterministicState> StateUpdaterWorker<D> where D::AuthorityAction: Clone {
     async fn start(self) {
         let id = WORKER_ID.fetch_add(1, Ordering::SeqCst);
-        tracing::info!(id, "StateUpdaterWorker Started");
+        tracing::info!(id, "{}|StateUpdaterWorker Started", id);
         let start = Instant::now();
 
-        self._start().await;
+        self._start(id).await;
         let elapsed = start.elapsed();
-        tracing::info!(id, ?elapsed, "StateUpdaterWorker Stopped");
+        tracing::info!(id, ?elapsed, "{}|StateUpdaterWorker Stopped", id);
     }
 
-    async fn _start(mut self) {
+    async fn _start(mut self, id: u64) {
         let mut internals_dead = false;
 
         'main_loop: loop {
@@ -294,7 +294,7 @@ impl<D: DeterministicState> StateUpdaterWorker<D> where D::AuthorityAction: Clon
 
                     self.next_update_action = self.next_update_action_rx.recv().await;
                     if self.next_update_action.is_none() {
-                        tracing::info!("RX disconnected and no more updates available, closing worker");
+                        tracing::info!("{}|RX disconnected and no more updates available, closing worker", id);
                         break;
                     }
                 } else {
@@ -302,7 +302,7 @@ impl<D: DeterministicState> StateUpdaterWorker<D> where D::AuthorityAction: Clon
                         Ok(v) => Some(v),
                         Err(TryRecvError::Empty) => None,
                         Err(TryRecvError::Disconnected) => {
-                            tracing::info!("RX disconnected and no more updates available, closing worker");
+                            tracing::info!("{}|RX disconnected and no more updates available, closing worker", id);
                             break;
                         }
                     };
@@ -361,7 +361,7 @@ impl<D: DeterministicState> StateUpdaterWorker<D> where D::AuthorityAction: Clon
                                 panic!("sending invalid sequence, expected: {} but sent: {}", expected, seq);
                             }
                             Err(SequencedSenderError::ChannelClosed(_)) => {
-                                tracing::warn!("leader authority queue closed");
+                                tracing::warn!("{}|leader authority queue closed", id);
                                 internals_dead = true;
                                 continue 'main_loop;
                             }
@@ -407,16 +407,16 @@ impl<D: DeterministicState> StateUpdaterWorker<D> where D::AuthorityAction: Clon
                         };
 
                         if !updater.queue(seq, action.clone()) {
-                            panic!("invalid sequence, expected: {} but got: {}", updater.next_sequence(), seq);
+                            panic!("{}|invalid sequence, expected: {} but got: {}", id, updater.next_sequence(), seq);
                         }
 
                         match tx.safe_send(seq, action).await {
                             Ok(_) => {}
                             Err(SequencedSenderError::InvalidSequence(expected, _)) => {
-                                panic!("sending invalid sequence, expected: {} but sent: {}", expected, seq);
+                                panic!("{}|sending invalid sequence, expected: {} but sent: {}", id, expected, seq);
                             }
                             Err(SequencedSenderError::ChannelClosed(_)) => {
-                                tracing::warn!("leader authority queue closed");
+                                tracing::warn!("{}|leader authority queue closed", id);
                                 internals_dead = true;
                                 continue 'main_loop;
                             }
