@@ -4,6 +4,7 @@ use std::time::Duration;
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedReceiver, SequencedSender};
 use tokio::sync::mpsc::{channel, Sender};
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::io::{SyncConnection, SyncIO};
@@ -204,60 +205,80 @@ where D::Action: MessageEncoding, D::AuthorityAction: MessageEncoding
             ..
         } = self;
 
+        let cancel = CancellationToken::new();
+
         /* read messages into action queue */
+        let read_cancel = cancel.clone();
         tokio::spawn(async move {
             loop {
-                match read_message_opt::<D::Action, _>(
+                let read_fut = read_message_opt::<D::Action, _>(
                     &mut buffer,
                     &mut read,
                     Duration::from_secs(2),
                     Some(Duration::from_secs(8))
-                ).await.err_log("got error reading next message from follower") {
+                );
+
+                let read_res = tokio::select! {
+                    res = read_fut => res,
+                    _ = read_cancel.cancelled() => break,
+                };
+
+                match read_res.err_log("got error reading next message from follower") {
                     Ok(Some(action)) => {
                         if actions_tx.send(action).await.is_err() {
                             tracing::info!("action queue closed for follower");
-                            return;
+                            break;
                         }
                     }
                     Ok(None) => {}
-                    Err(_) => return,
+                    Err(_) => break,
                 }
             }
+
+            read_cancel.cancel();
         }.instrument(tracing::info_span!("read from client", ?remote)));
 
         tokio::spawn(async move {
             let mut buffer = Vec::<u8>::with_capacity(1024);
 
             loop {
-                match tokio::time::timeout(Duration::from_secs(2), authority_rx.recv()).await {
+                let read_fut = tokio::time::timeout(Duration::from_secs(2), authority_rx.recv());
+                let read_res = tokio::select! {
+                    res = read_fut => res,
+                    _ = cancel.cancelled() => break,
+                };
+
+                match read_res {
                     Err(_) => {
                         match tokio::time::timeout(Duration::from_secs(2), send_zero_message(&mut write)).await {
                             Ok(Ok(())) => continue,
                             Err(_) => {
                                 tracing::error!("timeout sending zero message to follower");
-                                return;
+                                break;
                             }
                             Ok(Err(error)) => {
                                 tracing::error!(?error, "failed to send zero message to follower");
-                                return;
+                                break;
                             }
                         }
                     }
                     Ok(None) => {
                         tracing::info!("sequenced queue closed for follower");
-                        return;
+                        break;
                     }
                     Ok(Some(msg)) => {
                         match send_message(&mut buffer, &msg, &mut write, Duration::from_secs(2)).await {
                             Ok(()) => {}
                             Err(error) => {
                                 tracing::error!(?error, "failed to send action to leader");
-                                return;
+                                break;
                             }
                         }
                     }
                 }
             }
+
+            cancel.cancel();
         }.instrument(tracing::info_span!("write to client", ?remote)));
 
         Ok(remote)

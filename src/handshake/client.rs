@@ -3,6 +3,7 @@ use std::{marker::PhantomData, time::Duration};
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};
 use tokio::{sync::mpsc::{channel, Sender}, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::{io::{SyncConnection, SyncIO}, message_io::{read_message, read_message_opt, send_message, send_zero_message}, recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails}, state::DeterministicState, utils::PanicHelper};
@@ -205,10 +206,25 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
             ..
         } = self;
 
+        let cancel = CancellationToken::new();
+
         /* read messages into authority queue */
+        let read_cancel = cancel.clone();
         let read_task = tokio::spawn(async move {
             loop {
-                match read_message_opt::<(u64, RecoverableStateAction<D::AuthorityAction>), _>(&mut buffer, &mut read, Duration::from_secs(2), Some(Duration::from_secs(8))).await {
+                let read_fut = read_message_opt::<(u64, RecoverableStateAction<D::AuthorityAction>), _>(
+                    &mut buffer,
+                    &mut read,
+                    Duration::from_secs(2),
+                    Some(Duration::from_secs(8))
+                );
+
+                let read_res = tokio::select! {
+                    res = read_fut => res,
+                    _ = read_cancel.cancelled() => break,
+                };
+
+                match read_res {
                     Ok(Some((seq, action))) => {
                         match authority_tx.safe_send(seq, action).await {
                             Ok(_) => {}
@@ -231,6 +247,7 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
                 }
             }
 
+            read_cancel.cancel();
             authority_tx
         }.instrument(tracing::info_span!("read from leader", ?remote)));
 
@@ -241,35 +258,43 @@ impl<I: SyncIO, D: DeterministicState> ConnectedToLeader<I, D>
             let mut buffer = Vec::<u8>::with_capacity(1024);
 
             loop {
-                match tokio::time::timeout(Duration::from_secs(2), action_rx.recv()).await {
+                let recv_fut = tokio::time::timeout(Duration::from_secs(2), action_rx.recv());
+                let recv_res = tokio::select! {
+                    res = recv_fut => res,
+                    _ = cancel.cancelled() => break,
+                };
+
+                match recv_res {
                     Err(_) => {
                         match tokio::time::timeout(Duration::from_secs(2), send_zero_message(&mut write)).await {
                             Ok(Ok(())) => continue,
                             Err(_) => {
                                 tracing::error!("timeout sending zero message to leader");
-                                return;
+                                break;
                             }
                             Ok(Err(error)) => {
                                 tracing::error!(?error, "failed to send zero message to leader");
-                                return;
+                                break;
                             }
                         }
                     }
                     Ok(None) => {
                         tracing::info!("action_rx empty, closing sender");
-                        return;
+                        break;
                     }
                     Ok(Some(msg)) => {
                         match send_message(&mut buffer, &msg, &mut write, Duration::from_secs(2)).await {
                             Ok(()) => {}
                             Err(error) => {
                                 tracing::error!(?error, "failed to send action to leader");
-                                return;
+                                break;
                             }
                         }
                     }
                 }
             }
+
+            cancel.cancel();
         }.instrument(tracing::info_span!("write to leader", ?remote)));
 
         Ok((remote, action_tx, read_task))
