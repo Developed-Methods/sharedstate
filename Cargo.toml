@@ -1,6 +1,6 @@
 [package]
 name = "sharedstate"
-version = "0.3.8"
+version = "0.3.9"
 edition = "2021"
 authors = ["Patrick Lorio <patrick@methods.dev>"]
 description = "Sync heavily read state across many servers"

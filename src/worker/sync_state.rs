@@ -345,6 +345,9 @@ where D::Action: MessageEncoding,
                     }
 
                     self.metrics.connection_attempts.fetch_add(1, Ordering::AcqRel);
+                    self.metrics.leading.store(false, Ordering::Release);
+                    self.metrics.connected.store(false, Ordering::Release);
+                    self.metrics.connecting.store(true, Ordering::Release);
 
                     if options.is_empty() {
                         options.push_back(self.leader.clone());
@@ -453,10 +456,6 @@ where D::Action: MessageEncoding,
                     tokio::spawn(async move {
                         let _ = reader_task.await.err_log("failed to join reader task");
                         tracing::info!("Connection to leader closed, sending new connection attempt");
-
-                        metrics.leading.store(false, Ordering::Release);
-                        metrics.connected.store(false, Ordering::Release);
-                        metrics.connecting.store(true, Ordering::Release);
                         metrics.connection_attempts.store(0, Ordering::Release);
 
                         let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -498,10 +497,6 @@ where D::Action: MessageEncoding,
 
                     tokio::spawn(async move {
                         let _ = reader_task.await.err_log("failed to join reader task");
-
-                        metrics.leading.store(false, Ordering::Release);
-                        metrics.connected.store(false, Ordering::Release);
-                        metrics.connecting.store(true, Ordering::Release);
                         metrics.connection_attempts.store(0, Ordering::Release);
 
                         tracing::info!("Connection to leader closed, sending new connection attempt");
