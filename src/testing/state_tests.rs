@@ -4,7 +4,7 @@ use message_encoding::{test_assert_valid_encoding, MessageEncoding};
 
 use crate::{state::{DeterministicState, SharedState}, message_io::unknown_id_err};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TestState {
     pub sequence: u64,
     pub numbers: [i64; 6],

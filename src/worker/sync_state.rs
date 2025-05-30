@@ -476,6 +476,7 @@ where D::Action: MessageEncoding,
                         .update_internals(false)
                         .timeout(Duration::from_millis(100), "update internals").await
                         .setup_follow(leader_rx, |state| recovering.recover(state))
+                        /* todo: fixme got panic */
                         .panic("recovering with invalid sequence")
                         .panic("state updated during connection, sequence change");
 
