@@ -19,14 +19,14 @@ pub struct SharedState<D: DeterministicState> {
 }
 
 impl<D: DeterministicState + Clone> SharedState<D> {
-    pub fn new(state: D) -> (Self, SharedStateUpdater<D>) {
+    pub fn new(state: D) -> (Self, FlushedUpdater<D>) {
         let sequence = state.sequence();
 
         let inner = Arc::new(StateInner {
             read_pos: AtomicUsize::new(0),
             states: [
                 RwLock::new(state.clone()),
-                RwLock::new(state.clone()),
+                RwLock::new(state),
             ]
         });
 
@@ -43,11 +43,40 @@ impl<D: DeterministicState + Clone> SharedState<D> {
 
         (
             shared,
-            SharedStateUpdater::Leader(LeaderUpdater {
-                state,
+            FlushedUpdater {
                 updater,
-            })
+                state: None,
+            }
         )
+    }
+}
+
+pub struct FlushedUpdater<D: DeterministicState> {
+    state: Option<D>,
+    updater: StateUpdater<D>,
+}
+
+impl<D: DeterministicState> FlushedUpdater<D> {
+    pub fn next_sequence(&self) -> u64 {
+        self.updater.queue_next_sequence
+    }
+
+    pub fn into_lead(mut self) -> LeadUpdater<D> {
+        let state = match self.state.take() {
+            None => self.updater.read().clone(),
+            Some(state) => state,
+        };
+
+        LeadUpdater {
+            updater: self.updater,
+            state,
+        }
+    }
+
+    pub fn into_follow(self) -> FollowUpdater<D> {
+        FollowUpdater {
+            updater: self.updater,
+        }
     }
 }
 
@@ -79,72 +108,12 @@ impl<D: DeterministicState> StateInner<D> {
     }
 }
 
-pub enum SharedStateUpdater<D: DeterministicState> {
-    Leader(LeaderUpdater<D>),
-    Follower(FollowUpdater<D>),
-}
-
-impl<D: DeterministicState> SharedStateUpdater<D> {
-    pub fn shared(&self) -> SharedState<D> {
-        match self {
-            SharedStateUpdater::Leader(l) => l.updater.shared(),
-            SharedStateUpdater::Follower(f) => f.updater.shared(),
-        }
-    }
-
-    pub fn next_sequence(&self) -> u64 {
-        match self {
-            Self::Leader(l) => {
-                let v = l.updater.queue_next_sequence;
-                assert_eq!(v, l.state.sequence());
-                v
-            },
-            Self::Follower(f) => f.updater.queue_next_sequence,
-        }
-    }
-
-    pub fn update(&mut self) -> bool {
-        match self {
-            Self::Leader(l) => l.updater.update(),
-            Self::Follower(f) => f.updater.update(),
-        }
-    }
-
-    pub fn into_follow(self) -> FollowUpdater<D> {
-        match self {
-            Self::Follower(f) => f,
-            Self::Leader(l) => l.follow(),
-        }
-    }
-
-    pub fn into_lead(self) -> LeaderUpdater<D> {
-        match self {
-            Self::Leader(l) => l,
-            Self::Follower(f) => f.lead(),
-        }
-    }
-
-    pub fn as_leader(&mut self) -> Option<&mut LeaderUpdater<D>> {
-        match self {
-            Self::Leader(l) => Some(l),
-            _ => None,
-        }
-    }
-
-    pub fn as_follower(&mut self) -> Option<&mut LeaderUpdater<D>> {
-        match self {
-            Self::Leader(l) => Some(l),
-            _ => None,
-        }
-    }
-}
-
-pub struct LeaderUpdater<D: DeterministicState> {
+pub struct LeadUpdater<D: DeterministicState> {
     updater: StateUpdater<D>,
     state: D,
 }
 
-impl<D: DeterministicState> LeaderUpdater<D> {
+impl<D: DeterministicState> LeadUpdater<D> {
     pub fn queue(&mut self, action: D::Action) -> (u64, &D::AuthorityAction) {
         let authority = self.state.authority(action);
 
@@ -157,8 +126,8 @@ impl<D: DeterministicState> LeaderUpdater<D> {
         self.updater.update_ready()
     }
 
-    pub fn update(&mut self) {
-        self.updater.update();
+    pub fn update(&mut self) -> bool {
+        self.updater.update()
     }
 
     pub fn flush(&mut self) {
@@ -188,8 +157,24 @@ impl<D: DeterministicState> LeaderUpdater<D> {
         self.updater.queue_next_sequence
     }
 
-    pub fn follow(self) -> FollowUpdater<D> {
+    pub fn into_follow(self) -> FollowUpdater<D> {
         FollowUpdater { updater: self.updater }
+    }
+
+    pub fn into_flushed(mut self) -> FlushedUpdater<D> {
+        self.updater.flush_queue();
+
+        {
+            let state0 = self.updater.inner.states[0].read();
+            let state1 = self.updater.inner.states[1].read();
+            assert_eq!(state0.sequence(), state1.sequence());
+            assert_eq!(state0.sequence(), self.state.sequence());
+        }
+
+        FlushedUpdater {
+            state: Some(self.state),
+            updater: self.updater,
+        }
     }
 }
 
@@ -198,13 +183,13 @@ pub struct StatePtr<'a, T> {
     as_mut: bool,
 }
 
-impl<'a, T> AsRef<T> for StatePtr<'a, T> {
+impl<T> AsRef<T> for StatePtr<'_, T> {
     fn as_ref(&self) -> &T {
         self.item
     }
 }
 
-impl<'a, T> Deref for StatePtr<'a, T> {
+impl<T> Deref for StatePtr<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -212,14 +197,14 @@ impl<'a, T> Deref for StatePtr<'a, T> {
     }
 }
 
-impl<'a, T> AsMut<T> for StatePtr<'a, T> {
+impl<T> AsMut<T> for StatePtr<'_, T> {
     fn as_mut(&mut self) -> &mut T {
         self.as_mut = true;
         self.item
     }
 }
 
-impl<'a, T> DerefMut for StatePtr<'a, T> {
+impl<T> DerefMut for StatePtr<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut = true;
         self.item
@@ -239,8 +224,8 @@ impl<D: DeterministicState> FollowUpdater<D> {
         self.updater.queue_sequenced(sequence, action).is_ok()
     }
 
-    pub fn update(&mut self) {
-        self.updater.update();
+    pub fn update(&mut self) -> bool {
+        self.updater.update()
     }
 
     pub fn update_state<R, F: FnOnce(&mut StatePtr<D>) -> R>(&mut self, update: F) -> R {
@@ -272,7 +257,22 @@ impl<D: DeterministicState> FollowUpdater<D> {
         self.updater.queue_next_sequence
     }
 
-    pub fn lead(mut self) -> LeaderUpdater<D> {
+    pub fn into_flushed(mut self) -> FlushedUpdater<D> {
+        self.updater.flush_queue();
+
+        {
+            let state0 = self.updater.inner.states[0].read();
+            let state1 = self.updater.inner.states[1].read();
+            assert_eq!(state0.sequence(), state1.sequence());
+        }
+
+        FlushedUpdater {
+            state: None,
+            updater: self.updater,
+        }
+    }
+
+    pub fn into_lead(mut self) -> LeadUpdater<D> {
         self.updater.flush_queue();
 
         let state = {
@@ -282,7 +282,7 @@ impl<D: DeterministicState> FollowUpdater<D> {
             state0.clone()
         };
 
-        LeaderUpdater {
+        LeadUpdater {
             state,
             updater: self.updater,
         }
@@ -373,7 +373,7 @@ impl<D: DeterministicState> StateUpdater<D> {
 
     pub fn update(&mut self) -> bool {
         /* we're the only writer so load can be relaxed */
-        let read_pos = self.inner.read_pos.load(Ordering::Relaxed);
+        let read_pos = self.inner.read_pos.load(Ordering::Acquire);
 
         /* write pos shouldn't be locked or locks should be dropping soon */
         let write_pos = read_pos.overflowing_add(1).0;
@@ -441,7 +441,10 @@ mod test {
         type AuthorityAction = (u64, u64);
 
         fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
-            (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64, action)
+            (
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+                action
+            )
         }
 
         fn sequence(&self) -> u64 {
@@ -456,34 +459,36 @@ mod test {
         }
     }
 
-    // #[test]
-    // fn state_tests() {
-    //     let (state, mut updater) = SharedState::new(TestState::default());
-    //     updater = updater.lead();
+    #[test]
+    fn state_flush_tests() {
+        let (state, updater) = SharedState::new(TestState::default());
+        let mut updater = updater.into_lead();
 
-    //     for i in 0..20 {
-    //         updater.as_leader().unwrap().queue(i);
-    //     }
+        assert_eq!(state.read().sequence, 0);
+        assert_eq!(updater.next_sequence(), 0);
 
-    //     /* flush updates */
-    //     let mut no_update_count = 0;
-    //     loop {
-    //         if !updater.update() {
-    //             no_update_count += 1;
-    //             if no_update_count <= 2 {
-    //                 break;
-    //             }
-    //         } else {
-    //             no_update_count = 0;
-    //         }
-    //     }
+        for i in 0..20 {
+            updater.queue(i);
+        }
 
-    //     assert!(updater.action_history(3).is_none());
-    //     assert_eq!(updater.oldest_seq(), updater.action_history(10).unwrap().next().unwrap().0);
+        updater.flush();
 
-    //     let mut items = updater.action_history(10).unwrap();
-    //     for i in 10..20 {
-    //         assert_eq!(items.next().unwrap(), (i, &(0, i)));
-    //     }
-    // }
+        {
+            assert_eq!(updater.next_sequence(), 20);
+            let read = state.read();
+            assert_eq!(read.numbers.len(), 20);
+        }
+
+        updater.update_state(|state| {
+            state.numbers.clear();
+            state.numbers.push(1);
+            state.sequence = 1000;
+        });
+
+        {
+            assert_eq!(updater.next_sequence(), 1000);
+            let read = state.read();
+            assert_eq!(read.numbers.len(), 1);
+        }
+    }
 }

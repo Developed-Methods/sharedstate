@@ -3,7 +3,7 @@ use std::{sync::{atomic::{AtomicU64, Ordering}, Arc, LazyLock}, time::Instant};
 use sequenced_broadcast::{SequencedReceiver, SequencedSender, SequencedSenderError};
 use tokio::sync::{mpsc::{channel, error::TryRecvError, Receiver, Sender}, oneshot};
 
-use crate::{state::{DeterministicState, FollowUpdater, LeaderUpdater, StatePtr}, utils::PanicHelper};
+use crate::{state::{DeterministicState, FollowUpdater, LeadUpdater, StatePtr}, utils::PanicHelper};
 
 pub struct StateUpdater<D: DeterministicState> {
     replace_req_tx: Sender<ReplaceRequest<D>>,
@@ -19,16 +19,18 @@ struct StateUpdaterWorker<D: DeterministicState> {
 
 enum StateUpdaterInternals<D: DeterministicState> {
     Leader {
-        updater: LeaderUpdater<D>,
+        updater: LeadUpdater<D>,
         rx: Receiver<D::Action>,
-        tx: SequencedSender<D::AuthorityAction>,
         next: Option<D::Action>,
+
+        tx: SequencedSender<D::AuthorityAction>,
     },
     Follower {
         updater: FollowUpdater<D>,
         rx: SequencedReceiver<D::AuthorityAction>,
-        tx: SequencedSender<D::AuthorityAction>,
         next: Option<(u64, D::AuthorityAction)>,
+
+        tx: SequencedSender<D::AuthorityAction>,
     },
 }
 
@@ -47,7 +49,7 @@ struct ReplaceStateActionInner<D: DeterministicState> {
 }
 
 impl<D: DeterministicState> StateUpdater<D> where D::AuthorityAction: Clone {
-    pub fn leader(rx: Receiver<D::Action>, updater: LeaderUpdater<D>) -> (Self, SequencedReceiver<D::AuthorityAction>) {
+    pub fn leader(rx: Receiver<D::Action>, updater: LeadUpdater<D>) -> (Self, SequencedReceiver<D::AuthorityAction>) {
         let (authority_tx, authority_rx) = channel::<(u64, D::AuthorityAction)>(1024);
         let authority_tx = SequencedSender::new(updater.next_sequence(), authority_tx);
         let authority_rx = SequencedReceiver::new(updater.next_sequence(), authority_rx);
@@ -167,7 +169,7 @@ impl<D: DeterministicState> UpdateInternalsAction<D> {
         let mut inner = self.inner.take().panic("missing inner");
         inner.internals = match inner.internals {
             StateUpdaterInternals::Leader { updater, .. } => {
-                let mut updater = updater.follow();
+                let mut updater = updater.into_follow();
                 updater.reset(state_rx.state);
 
                 StateUpdaterInternals::Follower {
@@ -202,7 +204,7 @@ impl<D: DeterministicState> UpdateInternalsAction<D> {
         let mut inner = self.inner.take().panic("missing inner");
 
         let (mut updater, tx) = match inner.internals {
-            StateUpdaterInternals::Leader { updater, tx, .. } => (updater.follow(), tx),
+            StateUpdaterInternals::Leader { updater, tx, .. } => (updater.into_follow(), tx),
             StateUpdaterInternals::Follower { updater, tx, .. } => (updater, tx),
         };
 
@@ -226,7 +228,7 @@ impl<D: DeterministicState> UpdateInternalsAction<D> {
         let (updater, tx) = match inner.internals {
             StateUpdaterInternals::Leader { updater, tx, .. } => (updater, tx),
             StateUpdaterInternals::Follower { updater, tx, .. } => {
-                let mut updater = updater.lead();
+                let mut updater = updater.into_lead();
 
                 let seq = updater.next_sequence();
                 let should_update_feed = updater.update_state(update);
