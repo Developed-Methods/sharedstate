@@ -1,6 +1,6 @@
 use std::{collections::{hash_map::{self, Entry}, HashMap, HashSet}, future::Future, pin::Pin, sync::{atomic::{AtomicU64, Ordering}, Arc}, task::{Context, Poll}};
 use tokio::{io::{duplex, split, AsyncRead, AsyncWrite, DuplexStream, ReadHalf, WriteHalf}, sync::{mpsc::{channel, Receiver, Sender}, oneshot, Mutex, RwLock}};
-use crate::io::{SyncConnection, SyncIO};
+use crate::net::io::{SyncConnection, SyncIO};
 
 use super::blocking_rw_lock;
 
@@ -115,7 +115,7 @@ impl SyncIO for TestSyncIO {
     type Read = BreakableIO<ReadHalf<DuplexStream>>;
     type Write = BreakableIO<WriteHalf<DuplexStream>>;
 
-    async fn connect(&self, remote: &Self::Address) -> std::io::Result<crate::io::SyncConnection<Self>> {
+    async fn connect(&self, remote: &Self::Address) -> std::io::Result<crate::net::io::SyncConnection<Self>> {
         let mut lock = self.net.0.write().await;
 
         let Some(tx) = lock.listeners.get(remote) else {
@@ -153,7 +153,7 @@ impl SyncIO for TestSyncIO {
         })
     }
 
-    async fn next_client(&self) -> std::io::Result<crate::io::SyncConnection<Self>> {
+    async fn next_client(&self) -> std::io::Result<crate::net::io::SyncConnection<Self>> {
         let (peer_id, client) = {
             let mut lock = self.next.lock().await;
             let Some(recv) = lock.recv().await else {

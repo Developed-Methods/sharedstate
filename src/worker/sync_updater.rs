@@ -1,3 +1,5 @@
+use std::{hash::{Hash, Hasher, SipHasher}, time::{SystemTime, UNIX_EPOCH}};
+
 use sequenced_broadcast::{SequencedBroadcast, SequencedBroadcastSettings, SequencedReceiver, SequencedSender};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
@@ -6,7 +8,7 @@ use crate::{recoverable_state::{RecoverableState, RecoverableStateAction, Recove
 
 use super::{follow_worker::{FollowWorker, SequencedRxAndUpdater}, lead_worker::LeadWorker, task_and_cancel::TaskAndCancel};
 
-pub struct SyncState2<I: SourceId, D: DeterministicState> {
+pub struct SyncUpdater<I: SourceId, D: DeterministicState> {
     local_id: I,
 
     local_action_tx: Sender<D::Action>,
@@ -26,9 +28,9 @@ enum Mode<I: SourceId, D: DeterministicState> {
     Dead,
 }
 
-impl<I: SourceId, D: DeterministicState + Default> SyncState2<I, D> where D::AuthorityAction: Clone {
-    pub fn new(local_id: I, broadcast_settings: SequencedBroadcastSettings) -> Self {
-        let (state, updater) = SharedState::new(RecoverableState::new(0, D::default()));
+impl<I: SourceId, D: DeterministicState + Default> SyncUpdater<I, D> where D::AuthorityAction: Clone {
+    pub fn new(local_id: I, state: D, broadcast_settings: SequencedBroadcastSettings) -> Self {
+        let (state, updater) = SharedState::new(RecoverableState::new(0, state));
 
         let (local_action_tx, mut local_action_rx) = channel(2048);
         let (action_tx, action_rx) = channel(2048);
@@ -61,7 +63,7 @@ impl<I: SourceId, D: DeterministicState + Default> SyncState2<I, D> where D::Aut
             });
         }
 
-        SyncState2 {
+        SyncUpdater {
             local_id,
             action_tx,
             local_action_tx,
@@ -138,7 +140,7 @@ impl<I: SourceId, D: DeterministicState + Default> SyncState2<I, D> where D::Aut
     }
 
     pub async fn try_follow(&mut self, action_tx: Sender<(I, D::Action)>, target: FollowTarget<I, D>) -> bool {
-        let mut offline = match std::mem::replace(&mut self.mode, Mode::Dead) {
+        let offline = match std::mem::replace(&mut self.mode, Mode::Dead) {
             Mode::Dead => unreachable!("dead state"),
             Mode::Offline(offline) => offline,
             Mode::Lead(lead) => lead.into_offline_mode().await,
@@ -275,7 +277,10 @@ impl<I: SourceId, D: DeterministicState> OfflineMode<I, D> where D::AuthorityAct
         let (worker, authority_rx) = LeadWorker::new(lead_rx, self.flushed_updater);
 
         if !self.was_leading {
-            lead_tx.try_send(RecoverableStateAction::BumpGeneration).unwrap();
+            let mut hash = SipHasher::new();
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().hash(&mut hash);
+            self.local_id.hash(&mut hash);
+            lead_tx.try_send(RecoverableStateAction::BumpGeneration { new_id: hash.finish() }).unwrap();
         }
 
         LeadMode {
@@ -455,26 +460,26 @@ impl<I: SourceId, D: DeterministicState> ActionToLocalLead<I, D> {
 
 #[cfg(test)]
 mod test {
-    use super::SyncState2;
+    use super::SyncUpdater;
     use std::time::Duration;
     use tokio::sync::mpsc::channel;
-    use crate::{testing::{setup_logging, state_tests::{TestState, TestStateAction}}, worker::sync_state_2::FollowTarget};
+    use crate::{testing::{setup_logging, state_tests::{TestState, TestStateAction}}, worker::sync_updater::FollowTarget};
 
     #[tokio::test]
     async fn sync_state_simple_leader_test() {
-        let a = SyncState2::<u64, TestState>::new(1, Default::default());
+        let a = SyncUpdater::<u64, TestState>::new(1, Default::default(), Default::default());
         a.local_action_tx.send(TestStateAction::Set { slot: 0, value: 33 }).await.unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
-        println!("DONE: {}", a.state.read().state().numbers[0]);
+        assert_eq!(a.state.read().state().numbers[0], 33);
     }
 
     #[tokio::test]
-    async fn sync_state_simple_test() {
+    async fn sync_state_simple_follower_test() {
         setup_logging();
 
-        let mut a = SyncState2::<u64, TestState>::new(1, Default::default());
-        let mut b = SyncState2::<u64, TestState>::new(2, Default::default());
-        let mut c = SyncState2::<u64, TestState>::new(3, Default::default());
+        let mut a = SyncUpdater::<u64, TestState>::new(1, Default::default(), Default::default());
+        let mut b = SyncUpdater::<u64, TestState>::new(2, Default::default(), Default::default());
+        let mut c = SyncUpdater::<u64, TestState>::new(3, Default::default(), Default::default());
 
         {
             let follow = a.add_fresh_subscriber().await.unwrap();
@@ -547,6 +552,8 @@ mod test {
         assert_eq!(a_state.state().numbers[1], 188);
         assert_eq!(a_state.state().numbers[2], 22);
         assert_eq!(a_state.state().numbers[3], 11);
+
+        println!("STATE: {:?}", a_state);
     }
 }
 
