@@ -2,8 +2,10 @@ use std::{fmt::Debug, future::Future, hash::Hash};
 use message_encoding::MessageEncoding;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::recoverable_state::SourceId;
+
 pub trait SyncIO: Sized + Send + Sync + 'static {
-    type Address: MessageEncoding + Debug + Clone + Send + Sync + PartialEq + Eq + Hash + 'static;
+    type Address: MessageEncoding + Debug + Hash + SourceId;
     type Read: AsyncRead + Send + Unpin + 'static;
     type Write: AsyncWrite + Send + Unpin + 'static;
 

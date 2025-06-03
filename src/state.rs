@@ -61,6 +61,52 @@ impl<D: DeterministicState> FlushedUpdater<D> {
         self.updater.queue_next_sequence
     }
 
+    pub fn reset_state(&mut self, state: D) {
+        self.state = None;
+        self.updater.reset(state);
+    }
+
+    pub fn view_state<R, F: FnOnce(&D) -> R>(&self, update: F) -> R {
+        if let Some(state) = &self.state {
+            update(state)
+        } else {
+            let state = self.updater.read();
+            update(&*state)
+        }
+    }
+
+    pub fn mutate_state<R, F: FnOnce(&mut StatePtr<D>) -> R>(&mut self, update: F) -> R {
+        if let Some(state) = &mut self.state {
+            let mut ptr = StatePtr {
+                item: state,
+                as_mut: false
+            };
+
+            let result = update(&mut ptr);
+
+            if ptr.as_mut {
+                self.updater.reset(state.clone());
+            }
+
+            result
+        } else {
+            let mut state = self.updater.read().clone();
+
+            let mut ptr = StatePtr {
+                item: &mut state,
+                as_mut: false
+            };
+
+            let result = update(&mut ptr);
+
+            if ptr.as_mut {
+                self.updater.reset(state);
+            }
+
+            result
+        }
+    }
+
     pub fn into_lead(mut self) -> LeadUpdater<D> {
         let state = match self.state.take() {
             None => self.updater.read().clone(),
@@ -138,21 +184,6 @@ impl<D: DeterministicState> LeadUpdater<D> {
         &self.state
     }
 
-    pub fn update_state<R, F: FnOnce(&mut StatePtr<D>) -> R>(&mut self, update: F) -> R {
-        let mut ptr = StatePtr {
-            item: &mut self.state,
-            as_mut: false
-        };
-
-        let result = update(&mut ptr);
-
-        if ptr.as_mut {
-            self.updater.reset(self.state.clone());
-        }
-
-        result
-    }
-
     pub fn next_sequence(&self) -> u64 {
         self.updater.queue_next_sequence
     }
@@ -216,33 +247,16 @@ pub struct FollowUpdater<D: DeterministicState> {
 }
 
 impl<D: DeterministicState> FollowUpdater<D> {
-    pub fn reset(&mut self, state: D) {
-        self.updater.reset(state);
+    pub fn queue(&mut self, seq: u64, action: D::AuthorityAction) -> &D::AuthorityAction {
+        self.updater.queue_sequenced(seq, action).panic("invalid sequence").1
     }
 
-    pub fn queue(&mut self, sequence: u64, action: D::AuthorityAction) -> bool {
-        self.updater.queue_sequenced(sequence, action).is_ok()
+    pub fn update_ready(&self) -> bool {
+        self.updater.update_ready()
     }
 
     pub fn update(&mut self) -> bool {
         self.updater.update()
-    }
-
-    pub fn update_state<R, F: FnOnce(&mut StatePtr<D>) -> R>(&mut self, update: F) -> R {
-        let mut state = self.updater.read().clone();
-
-        let mut ptr = StatePtr {
-            item: &mut state,
-            as_mut: false
-        };
-
-        let result = update(&mut ptr);
-
-        if ptr.as_mut {
-            self.updater.reset(state);
-        }
-
-        result
     }
 
     pub fn flush(&mut self) {
@@ -479,7 +493,8 @@ mod test {
             assert_eq!(read.numbers.len(), 20);
         }
 
-        updater.update_state(|state| {
+        let mut updater = updater.into_flushed();
+        updater.mutate_state(|state| {
             state.numbers.clear();
             state.numbers.push(1);
             state.sequence = 1000;

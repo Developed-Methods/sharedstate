@@ -8,7 +8,7 @@ use tracing::Instrument;
 
 use crate::{handshake::{ConnectedToLeader, ConnectionEstablished, HandshakeClient, HandshakeServer, LeaderChannels, NewClient, RecoveringConnection, WantsRecovery, WantsState}, io::{SyncConnection, SyncIO}, recoverable_state::{RecoverableState, RecoverableStateAction}, state::{DeterministicState, SharedState}, utils::{LogHelper, PanicHelper, TimeoutPanicHelper}};
 
-use super::{message_relay::{ClientActionSender, MessageRelay, RecoverableActionMessages, SequencedMessages}, state_updater::{StateAndReceiver, StateUpdater}};
+use super::{follow_worker::FollowWorker, lead_worker::LeadWorker, message_relay::{ClientActionSender, MessageRelay, RecoverableActionMessages, SequencedMessages}, state_updater::{StateAndReceiver, StateUpdater}, task_and_cancel::TaskAndCancel};
 
 pub struct SyncState<I: SyncIO, D: DeterministicState> {
     shared: SharedState<RecoverableState<D>>,
@@ -59,6 +59,11 @@ impl<I: SyncIO, D: DeterministicState> Debug for Event<I, D> {
     }
 }
 
+enum StateWorker<D: DeterministicState> {
+    Lead(TaskAndCancel<LeadWorker<RecoverableState<D>>>),
+    Follow(TaskAndCancel<FollowWorker<RecoverableState<D>>>),
+}
+
 struct SyncStateWorker<I: SyncIO, D: DeterministicState> {
     io: Arc<I>,
 
@@ -72,6 +77,7 @@ struct SyncStateWorker<I: SyncIO, D: DeterministicState> {
     connect_attempts: Arc<AtomicU64>,
 
     updater: StateUpdater<RecoverableState<D>>,
+
     actions_tx: Sender<D::Action>,
     action_relay: MessageRelay<RecoverableActionMessages<D::Action>>,
     authority_relay: MessageRelay<SequencedMessages<RecoverableStateAction<D::AuthorityAction>>>,

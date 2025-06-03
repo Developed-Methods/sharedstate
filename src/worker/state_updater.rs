@@ -141,125 +141,126 @@ impl<D: DeterministicState> StateAndReceiver<D> {
 }
 
 
-impl<D: DeterministicState> UpdateInternalsAction<D> {
-    pub fn next_sequence(&self) -> u64 {
-        match &self.inner.as_ref().unwrap().internals {
-            StateUpdaterInternals::Follower { updater, .. } => updater.next_sequence(),
-            StateUpdaterInternals::Leader { updater, .. } => updater.next_sequence(),
-        }
-    }
-
-    pub fn use_state<R, F: Fn(&D) -> R>(&self, visit: F) -> R {
-        let inner = self.inner.as_ref().unwrap();
-
-        match &inner.internals {
-            StateUpdaterInternals::Leader { updater, .. } => visit(updater.state()),
-            StateUpdaterInternals::Follower { updater, .. } => {
-                let lock = updater.read_state();
-                visit(&*lock)
-            }
-        }
-    }
-
-    pub fn reset_follow(&mut self, state_rx: StateAndReceiver<D>) -> SequencedReceiver<D::AuthorityAction> {
-        let (tx, rx) = channel(1024);
-        let tx = SequencedSender::new(state_rx.state.sequence(), tx);
-        let rx = SequencedReceiver::new(state_rx.state.sequence(), rx);
-
-        let mut inner = self.inner.take().panic("missing inner");
-        inner.internals = match inner.internals {
-            StateUpdaterInternals::Leader { updater, .. } => {
-                let mut updater = updater.into_follow();
-                updater.reset(state_rx.state);
-
-                StateUpdaterInternals::Follower {
-                    updater,
-                    rx: state_rx.receiver,
-                    tx,
-                    next: None
-                }
-            }
-            StateUpdaterInternals::Follower { mut updater, .. } => {
-                updater.reset(state_rx.state);
-
-                StateUpdaterInternals::Follower {
-                    updater,
-                    rx: state_rx.receiver,
-                    tx,
-                    next: None,
-                }
-            }
-        };
-
-        self.inner = Some(inner);
-        rx
-    }
-
-    pub fn setup_follow<R, F: FnOnce(&mut StatePtr<D>) -> R>(&mut self, action_rx: SequencedReceiver<D::AuthorityAction>, update: F) -> Result<R, u64> {
-        if self.next_sequence() != action_rx.next_seq() {
-            tracing::error!("setup_follow invalid sequence, expected: {} but got: {}", self.next_sequence(), action_rx.next_seq());
-            return Err(self.next_sequence());
-        }
-
-        let mut inner = self.inner.take().panic("missing inner");
-
-        let (mut updater, tx) = match inner.internals {
-            StateUpdaterInternals::Leader { updater, tx, .. } => (updater.into_follow(), tx),
-            StateUpdaterInternals::Follower { updater, tx, .. } => (updater, tx),
-        };
-
-        let result = updater.update_state(update);
-
-        inner.internals = StateUpdaterInternals::Follower {
-            updater,
-            rx: action_rx,
-            tx,
-            next: None,
-        };
-
-        self.inner = Some(inner);
-        Ok(result)
-    }
-
-    pub fn become_leader<F: FnOnce(&mut StatePtr<D>) -> bool>(&mut self, update: F, action_rx: Receiver<D::Action>) -> Option<SequencedReceiver<D::AuthorityAction>> {
-        let mut inner = self.inner.take().panic("missing inner");
-        let mut new_rx = None;
-
-        let (updater, tx) = match inner.internals {
-            StateUpdaterInternals::Leader { updater, tx, .. } => (updater, tx),
-            StateUpdaterInternals::Follower { updater, tx, .. } => {
-                let mut updater = updater.into_lead();
-
-                let seq = updater.next_sequence();
-                let should_update_feed = updater.update_state(update);
-
-                if should_update_feed || seq != updater.next_sequence() {
-                    let (new_tx, rx) = channel(1024);
-                    let seq = updater.next_sequence();
-                    let new_tx = SequencedSender::new(seq, new_tx);
-                    new_rx = Some(SequencedReceiver::new(seq, rx));
-
-                    (updater, new_tx)
-                } else {
-                    (updater, tx)
-                }
-            }
-        };
-
-        inner.internals = StateUpdaterInternals::Leader {
-            updater,
-            rx: action_rx,
-            tx,
-            next: None,
-        };
-
-        self.inner = Some(inner);
-        new_rx
-    }
-
-    pub fn apply(self) {
-    }
-}
+// impl<D: DeterministicState> UpdateInternalsAction<D> {
+//     pub fn next_sequence(&self) -> u64 {
+//         match &self.inner.as_ref().unwrap().internals {
+//             StateUpdaterInternals::Follower { updater, .. } => updater.next_sequence(),
+//             StateUpdaterInternals::Leader { updater, .. } => updater.next_sequence(),
+//         }
+//     }
+// 
+//     pub fn use_state<R, F: Fn(&D) -> R>(&self, visit: F) -> R {
+//         let inner = self.inner.as_ref().unwrap();
+// 
+//         match &inner.internals {
+//             StateUpdaterInternals::Leader { updater, .. } => visit(updater.state()),
+//             StateUpdaterInternals::Follower { updater, .. } => {
+//                 let lock = updater.read_state();
+//                 visit(&*lock)
+//             }
+//         }
+//     }
+// 
+//     pub fn reset_follow(&mut self, state_rx: StateAndReceiver<D>) -> SequencedReceiver<D::AuthorityAction> {
+//         let (tx, rx) = channel(1024);
+//         let tx = SequencedSender::new(state_rx.state.sequence(), tx);
+//         let rx = SequencedReceiver::new(state_rx.state.sequence(), rx);
+// 
+//         let mut inner = self.inner.take().panic("missing inner");
+//         inner.internals = match inner.internals {
+//             StateUpdaterInternals::Leader { updater, .. } => {
+//                 let mut flushed = updater.into_flushed();
+//                 flushed.reset_state(state_rx.state);
+// 
+//                 StateUpdaterInternals::Follower {
+//                     updater: flushed.into_follow(),
+//                     rx: state_rx.receiver,
+//                     tx,
+//                     next: None
+//                 }
+//             }
+//             StateUpdaterInternals::Follower { updater, .. } => {
+//                 let mut flushed = updater.into_flushed();
+//                 flushed.reset_state(state_rx.state);
+// 
+//                 StateUpdaterInternals::Follower {
+//                     updater: flushed.into_follow(),
+//                     rx: state_rx.receiver,
+//                     tx,
+//                     next: None,
+//                 }
+//             }
+//         };
+// 
+//         self.inner = Some(inner);
+//         rx
+//     }
+// 
+//     pub fn setup_follow<R, F: FnOnce(&mut StatePtr<D>) -> R>(&mut self, action_rx: SequencedReceiver<D::AuthorityAction>, update: F) -> Result<R, u64> {
+//         if self.next_sequence() != action_rx.next_seq() {
+//             tracing::error!("setup_follow invalid sequence, expected: {} but got: {}", self.next_sequence(), action_rx.next_seq());
+//             return Err(self.next_sequence());
+//         }
+// 
+//         let mut inner = self.inner.take().panic("missing inner");
+// 
+//         let (mut updater, tx) = match inner.internals {
+//             StateUpdaterInternals::Leader { updater, tx, .. } => (updater.into_follow(), tx),
+//             StateUpdaterInternals::Follower { updater, tx, .. } => (updater, tx),
+//         };
+// 
+//         let result = updater.update_state(update);
+// 
+//         inner.internals = StateUpdaterInternals::Follower {
+//             updater,
+//             rx: action_rx,
+//             tx,
+//             next: None,
+//         };
+// 
+//         self.inner = Some(inner);
+//         Ok(result)
+//     }
+// 
+//     pub fn become_leader<F: FnOnce(&mut StatePtr<D>) -> bool>(&mut self, update: F, action_rx: Receiver<D::Action>) -> Option<SequencedReceiver<D::AuthorityAction>> {
+//         let mut inner = self.inner.take().panic("missing inner");
+//         let mut new_rx = None;
+// 
+//         let (updater, tx) = match inner.internals {
+//             StateUpdaterInternals::Leader { updater, tx, .. } => (updater, tx),
+//             StateUpdaterInternals::Follower { updater, tx, .. } => {
+//                 let mut updater = updater.into_lead();
+// 
+//                 let seq = updater.next_sequence();
+//                 let should_update_feed = updater.update_state(update);
+// 
+//                 if should_update_feed || seq != updater.next_sequence() {
+//                     let (new_tx, rx) = channel(1024);
+//                     let seq = updater.next_sequence();
+//                     let new_tx = SequencedSender::new(seq, new_tx);
+//                     new_rx = Some(SequencedReceiver::new(seq, rx));
+// 
+//                     (updater, new_tx)
+//                 } else {
+//                     (updater, tx)
+//                 }
+//             }
+//         };
+// 
+//         inner.internals = StateUpdaterInternals::Leader {
+//             updater,
+//             rx: action_rx,
+//             tx,
+//             next: None,
+//         };
+// 
+//         self.inner = Some(inner);
+//         new_rx
+//     }
+// 
+//     pub fn apply(self) {
+//     }
+// }
 
 impl<D: DeterministicState> Drop for UpdateInternalsAction<D> {
     fn drop(&mut self) {

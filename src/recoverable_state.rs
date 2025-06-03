@@ -1,12 +1,27 @@
-use std::collections::VecDeque;
-use message_encoding::{m_opt_sum, m_static, MessageEncoding};
+use std::{collections::VecDeque, fmt::Debug, marker::PhantomData};
+use message_encoding::{m_opt_sum, MessageEncoding};
 use crate::{message_io::unknown_id_err, state::DeterministicState};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecoverableState<D: DeterministicState> {
-    generations_updated_till_seq: u64,
+pub trait SourceId: Debug + Clone + Copy + Send + Sync + PartialEq + Eq + 'static {
+}
+
+impl<T: Debug + Clone + Copy + Send + Sync + PartialEq + Eq + 'static> SourceId for T {}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RecoverableState<I: SourceId, D: DeterministicState> {
     details: RecoverableStateDetails,
     state: D,
+    _phantom: PhantomData<I>,
+}
+
+impl<I: SourceId, D: DeterministicState + Clone> Clone for RecoverableState<I, D> {
+    fn clone(&self) -> Self {
+        RecoverableState {
+            details: self.details.clone(),
+            state: self.state.clone(),
+            _phantom: PhantomData,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +50,7 @@ impl RecoverableStateDetails {
             return false;
         }
 
+        /* if in same generation, follow cannot be ahead of leader */
         if self.generation == follower.generation {
             return follower.state_sequence <= self.state_sequence;
         }
@@ -54,47 +70,34 @@ impl RecoverableStateDetails {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RecoverableStateAction<A> {
-    StateAction(A),
+pub enum RecoverableStateAction<I, A> {
+    StateAction { source: I, action: A },
     BumpGeneration,
 }
 
-impl<A> From<A> for RecoverableStateAction<A> {
-    fn from(value: A) -> Self {
-        RecoverableStateAction::StateAction(value)
-    }
-}
-
-impl<A: MessageEncoding> MessageEncoding for RecoverableStateAction<A> {
-    const STATIC_SIZE: Option<usize> = m_opt_sum(&[
-        u16::STATIC_SIZE,
-        A::STATIC_SIZE,
-    ]);
-
-    const MAX_SIZE: Option<usize> = m_opt_sum(&[
-        u16::MAX_SIZE,
-        A::MAX_SIZE,
-    ]);
-
+impl<I: SourceId + MessageEncoding, A: MessageEncoding> MessageEncoding for RecoverableStateAction<I, A> {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         match self {
-            Self::StateAction(a) => Ok(1u16.write_to(out)? + a.write_to(out)?),
+            Self::StateAction { source, action } => Ok(1u16.write_to(out)? + source.write_to(out)? + action.write_to(out)?),
             Self::BumpGeneration => 2u16.write_to(out),
         }
     }
 
     fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
         match u16::read_from(read)? {
-            1 => Ok(RecoverableStateAction::StateAction(MessageEncoding::read_from(read)?)),
+            1 => Ok(RecoverableStateAction::StateAction {
+                source: MessageEncoding::read_from(read)?,
+                action: MessageEncoding::read_from(read)?,
+            }),
             2 => Ok(RecoverableStateAction::BumpGeneration),
             other => Err(unknown_id_err(other, "RecoverableStateAction")),
         }
     }
 }
 
-impl<D: DeterministicState> DeterministicState for RecoverableState<D> {
-    type Action = RecoverableStateAction<D::Action>;
-    type AuthorityAction = RecoverableStateAction<D::AuthorityAction>;
+impl<I: SourceId, D: DeterministicState> DeterministicState for RecoverableState<I, D> {
+    type Action = RecoverableStateAction<I, D::Action>;
+    type AuthorityAction = RecoverableStateAction<I, D::AuthorityAction>;
 
     fn sequence(&self) -> u64 {
         self.details.sequence
@@ -102,34 +105,27 @@ impl<D: DeterministicState> DeterministicState for RecoverableState<D> {
 
     fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
         match action {
-            RecoverableStateAction::StateAction(a) => RecoverableStateAction::StateAction(self.state.authority(a)),
+            RecoverableStateAction::StateAction { source, action } => RecoverableStateAction::StateAction { source, action: self.state.authority(action) },
             RecoverableStateAction::BumpGeneration => RecoverableStateAction::BumpGeneration,
         }
     }
 
     fn update(&mut self, action: &Self::AuthorityAction) {
         self.details.sequence += 1;
-        if self.generations_updated_till_seq == self.details.sequence {
-            self.generations_updated_till_seq = 0;
-        }
 
         match action {
-            RecoverableStateAction::StateAction(a) => {
+            RecoverableStateAction::StateAction { source: _, action } => {
                 let seq = self.state.sequence();
                 assert_eq!(self.details.state_sequence, seq);
 
-                self.state.update(a);
+                self.state.update(action);
 
                 assert_eq!(seq + 1, self.state.sequence());
                 self.details.state_sequence = seq + 1;
             }
             RecoverableStateAction::BumpGeneration => {
-                if self.details.sequence < self.generations_updated_till_seq {
-                    return;
-                }
-
                 if 2048 <= self.details.history.len() {
-                    let _ = self.details.history.pop_back();
+                    let _ = self.details.history.pop_front();
                 }
 
                 self.details.history.push_back(RecovGenerationEnd {
@@ -143,10 +139,9 @@ impl<D: DeterministicState> DeterministicState for RecoverableState<D> {
     }
 }
 
-impl<D: DeterministicState> RecoverableState<D> {
+impl<I: SourceId, D: DeterministicState> RecoverableState<I, D> {
     pub fn new(id: u64, state: D) -> Self {
         RecoverableState {
-            generations_updated_till_seq: 0,
             details: RecoverableStateDetails {
                 sequence: 1,
                 id,
@@ -155,22 +150,12 @@ impl<D: DeterministicState> RecoverableState<D> {
                 history: VecDeque::new(),
             },
             state,
+            _phantom: PhantomData,
         }
     }
 
     pub fn details(&self) -> &RecoverableStateDetails {
         &self.details
-    }
-
-    pub fn upgrade(&mut self, leader: &RecoverableStateDetails) -> bool {
-        if !leader.can_recover_follower(&self.details) {
-            return false;
-        }
-
-        self.generations_updated_till_seq = leader.sequence;
-        self.details.generation = leader.generation;
-        self.details.history = leader.history.clone();
-        true
     }
 
     pub fn state(&self) -> &D {
@@ -233,17 +218,9 @@ impl MessageEncoding for RecoverableStateDetails {
     }
 }
 
-impl<D: MessageEncoding + DeterministicState> MessageEncoding for RecoverableState<D> {
-    const MAX_SIZE: Option<usize> = m_opt_sum(&[
-        u64::MAX_SIZE,
-        u64::MAX_SIZE,
-        Some(m_static::<u64>() * 2 * 2048),
-        D::MAX_SIZE,
-    ]);
-
+impl<I: SourceId, D: MessageEncoding + DeterministicState> MessageEncoding for RecoverableState<I, D> {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
-        sum += self.generations_updated_till_seq.write_to(out)?;
         sum += self.details.write_to(out)?;
         sum += self.state.write_to(out)?;
         Ok(sum)
@@ -251,9 +228,9 @@ impl<D: MessageEncoding + DeterministicState> MessageEncoding for RecoverableSta
 
     fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
         Ok(RecoverableState {
-            generations_updated_till_seq: MessageEncoding::read_from(read)?,
             details: MessageEncoding::read_from(read)?,
             state: MessageEncoding::read_from(read)?,
+            _phantom: PhantomData,
         })
     }
 }
@@ -300,24 +277,23 @@ mod test {
 
     #[test]
     fn state_recovery_check_test() {
-        let mut state1 = RecoverableState::new(101, MockState(12));
+        let mut state1 = RecoverableState::<u64, _>::new(101, MockState(12));
         let mut state2 = state1.clone();
 
-        state1.update(&RecoverableStateAction::StateAction(()));
-        state2.update(&RecoverableStateAction::StateAction(()));
-        state1.update(&RecoverableStateAction::StateAction(()));
-        state2.update(&RecoverableStateAction::StateAction(()));
+        state1.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
+        state2.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
+        state1.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
+        state2.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
 
         state1.update(&RecoverableStateAction::BumpGeneration);
-        state1.update(&RecoverableStateAction::StateAction(()));
-        state1.update(&RecoverableStateAction::StateAction(()));
+        state1.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
+        state1.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
 
         assert!(state1.details.can_recover_follower(&state2.details));
-        state2.upgrade(&state1.details);
 
         state2.update(&RecoverableStateAction::BumpGeneration);
-        state2.update(&RecoverableStateAction::StateAction(()));
-        state2.update(&RecoverableStateAction::StateAction(()));
+        state2.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
+        state2.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
 
         assert_eq!(state1, state2);
     }
@@ -325,7 +301,6 @@ mod test {
     #[test]
     fn recoverable_state_encoding_test() {
         test_assert_valid_encoding(RecoverableState {
-            generations_updated_till_seq: 10,
             details: RecoverableStateDetails {
                 id: 32145342,
                 generation: 2,
@@ -343,6 +318,7 @@ mod test {
                 ].into(),
             },
             state: MockState(300),
+            _phantom: PhantomData::<u64>,
         });
     }
 }
