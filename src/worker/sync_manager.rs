@@ -371,7 +371,10 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
             let event = self.next_event().await;
             let shutdown = matches!(event, Event::Shutdown);
 
-            tracing::info!("Next Event: {:?}", event);
+            
+            if !matches!(event, Event::LeaderMessage(SyncResponse::AuthorityAction(..)) | Event::ClientMessage(ClientMessage { msg: SyncRequest::Action { .. }, .. })) {
+                tracing::info!("Next Event: {:?}", event);
+            }
 
             self.handle_event(event).await;
             if shutdown {
@@ -462,12 +465,20 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                         break 'find self.leader;
                     }
 
-                    let best_option = self.peers.iter().filter(|(addr, _)| !self.local.eq(addr)).min_by(|(_, a), (_, b)| {
+                    let best_option = self.peers.iter().filter(|(addr, _)| !self.local.eq(addr)).min_by(|(a_addr, a), (b_addr, b)| {
                         opt_count += 1;
 
                         let now = now_ms();
-                        let since_a_fail = (now.max(a.last_peer_failure_epoch) - a.last_peer_failure_epoch).max(300_000);
-                        let since_b_fail = (now.max(b.last_peer_failure_epoch) - b.last_peer_failure_epoch).max(300_000);
+                        let mut since_a_fail = (now.max(a.last_peer_failure_epoch) - a.last_peer_failure_epoch).max(300_000);
+                        let mut since_b_fail = (now.max(b.last_peer_failure_epoch) - b.last_peer_failure_epoch).max(300_000);
+
+                        /* if leader, make fail distance 4x to give priority */
+                        if self.leader.eq(a_addr) {
+                            since_a_fail <<= 2;
+                        }
+                        if self.leader.eq(b_addr) {
+                            since_b_fail <<= 2;
+                        }
 
                         /* both failed over 1m ago */
                         if 60_000 < since_a_fail && 60_000 < since_b_fail {
@@ -668,6 +679,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                         if state.leader_path.is_empty() || state.leader_path[0] != self.leader || state.leader_path.contains(&self.local) {
                             tracing::error!(
                                 path = ?state.leader_path,
+                                peer = ?state.remote,
                                 leader = ?self.leader,
                                 local = ?self.local,
                                 "peer we're following has invalid leader path"
@@ -830,6 +842,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                             true
                         };
 
+                        follow.leader_path = path;
 
                         if is_valid {
                             self.timers.get(Timer::SendVerifyLeader).set_earlier(Duration::from_secs(10));

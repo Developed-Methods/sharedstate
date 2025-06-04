@@ -6,7 +6,7 @@ pub mod test_sync_io;
 pub mod state_tests;
 
 mod message_io_tests;
-// mod fuzzy_test;
+mod fuzzy_test;
 
 pub fn setup_logging() {
     let _ = tracing_subscriber::fmt()
