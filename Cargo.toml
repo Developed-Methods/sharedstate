@@ -17,6 +17,7 @@ tracing = "0.1.40"
 slab = "0.4.9"
 rand_chacha = "0.3.1"
 parking_lot = "0.12.3"
+arc-metrics = "0.1"
 
 [dev-dependencies]
 tracing-subscriber = "0.3.18"

@@ -62,7 +62,7 @@ impl RecoverableStateDetails {
         assert_eq!(hist.generation, follower.generation);
 
         /* follower should not have advanced past upgrade in historic generation */
-        self.id == follower.id && follower.sequence <= hist.next_sequence
+        hist.old_id == follower.id && follower.sequence <= hist.next_sequence
     }
 }
 

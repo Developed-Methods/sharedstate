@@ -350,6 +350,7 @@ dependencies = [
 name = "sharedstate"
 version = "0.3.9"
 dependencies = [
+ "arc-metrics",
  "assert_matches",
  "futures-util",
  "message-encoding",
