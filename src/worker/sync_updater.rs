@@ -1,10 +1,10 @@
-use std::{hash::{Hash, Hasher, SipHasher}, time::{SystemTime, UNIX_EPOCH}};
+use std::{hash::{Hash, Hasher, SipHasher}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
-use sequenced_broadcast::{SequencedBroadcast, SequencedBroadcastSettings, SequencedReceiver, SequencedSender};
+use sequenced_broadcast::{NewClientError, SequencedBroadcast, SequencedBroadcastSettings, SequencedReceiver, SequencedSender};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
-use crate::{recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails, SourceId}, state::{DeterministicState, FlushedUpdater, SharedState}, utils::PanicHelper};
+use crate::{recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails, SourceId}, state::{DeterministicState, FlushedUpdater, SharedState}, utils::{LogHelper, PanicHelper}};
 
 use super::{follow_worker::{FollowWorker, SequencedRxAndUpdater}, lead_worker::LeadWorker, task_and_cancel::TaskAndCancel};
 
@@ -184,7 +184,7 @@ impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D> where D::AuthorityAct
             details.clone()
         };
 
-        let recv = self.broadcast.add_client(recovery_details.sequence, true).await.ok()?;
+        let recv = self.broadcast.add_client(recovery_details.recover_accept_seq, true).await.ok()?;
 
         Some(FollowTarget {
             authority_rx: recv,
@@ -202,7 +202,15 @@ impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D> where D::AuthorityAct
             read.clone()
         };
 
-        let sub = self.broadcast.add_client(state.sequence(), true).await.ok()?;
+        let sub = match self.broadcast.add_client(state.accept_seq(), true).await {
+            Err(NewClientError::SequenceTooFarAhead { .. }) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                self.broadcast.add_client(state.accept_seq(), true).await
+            }
+            other => other,
+        };
+
+        let sub = sub.err_log("failed to add fresh client").ok()?;
         Some(ValidNewFollowState(NewFollowState {
             state,
             authority_rx: sub
@@ -252,7 +260,7 @@ impl<I: SourceId, D: DeterministicState> LeadMode<I, D> {
         let flushed_updater = self.updater_task.cancel().await.panic("updater task failed").into_flushed();
         let authority_tx = self.authority_to_broadcast_task.cancel().await.panic("authority broadcast failed").broadcast_tx;
 
-        assert_eq!(flushed_updater.next_sequence(), authority_tx.seq());
+        assert_eq!(flushed_updater.accept_seq(), authority_tx.seq());
 
         OfflineMode {
             local_id: self.local_id,
@@ -278,7 +286,7 @@ impl<I: SourceId, D: DeterministicState> OfflineMode<I, D> where D::AuthorityAct
     }
 
     pub fn next_sequence(&self) -> u64 {
-        self.flushed_updater.next_sequence()
+        self.flushed_updater.accept_seq()
     }
 
     pub fn with_state<R, F: FnOnce(&RecoverableState<I, D>) -> R>(&self, update: F) -> R {
@@ -351,7 +359,7 @@ pub struct NewFollowState<D: DeterministicState> {
 
 impl<D: DeterministicState> NewFollowState<D> {
     pub fn try_into_valid(self) -> Result<ValidNewFollowState<D>, NewFollowState<D>> {
-        if self.state.sequence() != self.authority_rx.next_seq() {
+        if self.state.accept_seq() != self.authority_rx.next_seq() {
             return Err(self);
         }
 
@@ -369,7 +377,7 @@ impl<D: DeterministicState> ValidNewFollowState<D> where D::AuthorityAction: Clo
     }
 
     fn with_new_broadcast(self, settings: SequencedBroadcastSettings) -> (ValidNewFollowStateWithBroadcast<D>, SequencedBroadcast<D::AuthorityAction>) {
-        let (broadcast, tx) = SequencedBroadcast::new(self.0.state.sequence(), settings);
+        let (broadcast, tx) = SequencedBroadcast::new(self.0.state.accept_seq(), settings);
 
         (
             ValidNewFollowStateWithBroadcast(self.0, tx),
@@ -391,7 +399,7 @@ impl<I: SourceId, D: DeterministicState> FollowMode<I, D> where D::AuthorityActi
         let flushed_updater = self.updater_task.cancel().await.panic("updater task failed").into_flushed();
         let authority_tx = self.broadcast_task.cancel().await.panic("authority broadcast failed").broadcast_tx;
 
-        assert_eq!(flushed_updater.next_sequence(), authority_tx.seq());
+        assert_eq!(flushed_updater.accept_seq(), authority_tx.seq());
 
         OfflineMode {
             local_id: self.local_id,
@@ -536,10 +544,10 @@ mod test {
         a.local_action_tx.send(TestStateAction::Set { slot: 3, value: 11 }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(a.state().read().sequence(), 4);
-        assert_eq!(b.state().read().sequence(), 4);
-        assert_eq!(c.state().read().sequence(), 4);
-        assert_eq!(d.state().read().sequence(), 4);
+        assert_eq!(a.state().read().accept_seq(), 4);
+        assert_eq!(b.state().read().accept_seq(), 4);
+        assert_eq!(c.state().read().accept_seq(), 4);
+        assert_eq!(d.state().read().accept_seq(), 4);
 
         /* FORK: C lead followed by D */
         c.lead().await;
@@ -565,10 +573,10 @@ mod test {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(a.state().read().sequence(), 8);
-        assert_eq!(b.state().read().sequence(), 8);
-        assert_eq!(c.state().read().sequence(), 8);
-        assert_eq!(d.state().read().sequence(), 8);
+        assert_eq!(a.state().read().accept_seq(), 8);
+        assert_eq!(b.state().read().accept_seq(), 8);
+        assert_eq!(c.state().read().accept_seq(), 8);
+        assert_eq!(d.state().read().accept_seq(), 8);
 
         /* a cannot recover to fork'd state */
         {
@@ -623,10 +631,10 @@ mod test {
         a.local_action_tx.send(TestStateAction::Set { slot: 3, value: 11 }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(a.state().read().sequence(), 4);
-        assert_eq!(b.state().read().sequence(), 4);
-        assert_eq!(c.state().read().sequence(), 4);
-        assert_eq!(d.state().read().sequence(), 4);
+        assert_eq!(a.state().read().accept_seq(), 4);
+        assert_eq!(b.state().read().accept_seq(), 4);
+        assert_eq!(c.state().read().accept_seq(), 4);
+        assert_eq!(d.state().read().accept_seq(), 4);
 
         /* FORK: c lead and d follow c */
         c.lead().await;
@@ -641,10 +649,10 @@ mod test {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(a.state().read().sequence(), 7);
-        assert_eq!(b.state().read().sequence(), 7);
-        assert_eq!(c.state().read().sequence(), 8);
-        assert_eq!(d.state().read().sequence(), 8);
+        assert_eq!(a.state().read().accept_seq(), 7);
+        assert_eq!(b.state().read().accept_seq(), 7);
+        assert_eq!(c.state().read().accept_seq(), 8);
+        assert_eq!(d.state().read().accept_seq(), 8);
 
         /* a cannot recover to fork'd state */
         {
@@ -697,10 +705,10 @@ mod test {
         a.local_action_tx.send(TestStateAction::Set { slot: 3, value: 11 }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(a.state().read().sequence(), 4);
-        assert_eq!(b.state().read().sequence(), 4);
-        assert_eq!(c.state().read().sequence(), 4);
-        assert_eq!(d.state().read().sequence(), 4);
+        assert_eq!(a.state().read().accept_seq(), 4);
+        assert_eq!(b.state().read().accept_seq(), 4);
+        assert_eq!(c.state().read().accept_seq(), 4);
+        assert_eq!(d.state().read().accept_seq(), 4);
 
         /* d goes offline so we can recover later */
         d.go_offline().await;
@@ -738,10 +746,10 @@ mod test {
         a.local_action_tx.send(TestStateAction::Add { slot: 3, value: 100 }).await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(a.state().read().sequence(), 12);
-        assert_eq!(b.state().read().sequence(), 12);
-        assert_eq!(c.state().read().sequence(), 12);
-        assert_eq!(d.state().read().sequence(), 4);
+        assert_eq!(a.state().read().accept_seq(), 12);
+        assert_eq!(b.state().read().accept_seq(), 12);
+        assert_eq!(c.state().read().accept_seq(), 12);
+        assert_eq!(d.state().read().accept_seq(), 4);
 
         /* have D recover from A */
         {
@@ -754,10 +762,10 @@ mod test {
         }
 
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(a.state().read().sequence(), 12);
-        assert_eq!(b.state().read().sequence(), 12);
-        assert_eq!(c.state().read().sequence(), 12);
-        assert_eq!(d.state().read().sequence(), 12);
+        assert_eq!(a.state().read().accept_seq(), 12);
+        assert_eq!(b.state().read().accept_seq(), 12);
+        assert_eq!(c.state().read().accept_seq(), 12);
+        assert_eq!(d.state().read().accept_seq(), 12);
 
         let a_state = a.state.read().clone();
         let b_state = b.state.read().clone();

@@ -11,6 +11,15 @@ pub struct NetIoSettings {
     pub message_timeout: Duration,
 }
 
+impl Default for NetIoSettings {
+    fn default() -> Self {
+        Self {
+            process_timeout: Duration::from_secs(2),
+            message_timeout: Duration::from_secs(12),
+        }
+    }
+}
+
 pub struct ReadChannel<I: SyncIO, M: MessageEncoding> {
     pub input: I::Read,
     pub output: Sender<M>,

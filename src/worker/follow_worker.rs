@@ -24,7 +24,7 @@ pub struct ValidSequencedRxAndUpdater<D: DeterministicState>(SequencedRxAndUpdat
 
 impl<D: DeterministicState> SequencedRxAndUpdater<D> {
     pub fn is_valid_pair(&self) -> bool {
-        self.rx.next_seq() == self.updater.next_sequence()
+        self.rx.next_seq() == self.updater.accept_seq()
     }
     
     pub fn try_into_valid(self) -> Result<ValidSequencedRxAndUpdater<D>, SequencedRxAndUpdater<D>> {
@@ -40,7 +40,7 @@ impl<D: DeterministicState> FollowWorker<D> where D::AuthorityAction: Clone {
     pub fn new(rx_and_updater: ValidSequencedRxAndUpdater<D>) -> (Self, SequencedReceiver<D::AuthorityAction>) {
         let (ch_tx, ch_rx) = channel(2048);
 
-        let seq = rx_and_updater.0.updater.next_sequence();
+        let seq = rx_and_updater.0.updater.accept_seq();
         let seq_tx = SequencedSender::new(seq, ch_tx);
         let seq_rx = SequencedReceiver::new(seq, ch_rx);
 

@@ -26,10 +26,10 @@ impl<I: SourceId, D: DeterministicState + Clone> Clone for RecoverableState<I, D
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecoverableStateDetails {
-    pub sequence: u64,
     pub id: u64,
     pub generation: u64,
-    pub state_sequence: u64,
+    pub recover_accept_seq: u64,
+    pub state_accept_seq: u64,
     pub history: VecDeque<RecovGenerationEnd>,
 }
 
@@ -49,7 +49,7 @@ impl RecoverableStateDetails {
 
         /* if in same generation, follow cannot be ahead of leader */
         if self.generation == follower.generation {
-            return self.id == follower.id && follower.state_sequence <= self.state_sequence;
+            return self.id == follower.id && follower.state_accept_seq <= self.state_accept_seq;
         }
 
         let depth = (self.generation - follower.generation) as usize;
@@ -62,7 +62,7 @@ impl RecoverableStateDetails {
         assert_eq!(hist.generation, follower.generation);
 
         /* follower should not have advanced past upgrade in historic generation */
-        hist.old_id == follower.id && follower.sequence <= hist.next_sequence
+        hist.old_id == follower.id && follower.recover_accept_seq <= hist.next_sequence
     }
 }
 
@@ -96,8 +96,8 @@ impl<I: SourceId, D: DeterministicState> DeterministicState for RecoverableState
     type Action = RecoverableStateAction<I, D::Action>;
     type AuthorityAction = RecoverableStateAction<I, D::AuthorityAction>;
 
-    fn sequence(&self) -> u64 {
-        self.details.sequence
+    fn accept_seq(&self) -> u64 {
+        self.details.recover_accept_seq
     }
 
     fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
@@ -108,17 +108,17 @@ impl<I: SourceId, D: DeterministicState> DeterministicState for RecoverableState
     }
 
     fn update(&mut self, action: &Self::AuthorityAction) {
-        self.details.sequence += 1;
+        self.details.recover_accept_seq += 1;
 
         match action {
             RecoverableStateAction::StateAction { source: _, action } => {
-                let seq = self.state.sequence();
-                assert_eq!(self.details.state_sequence, seq);
+                let seq = self.state.accept_seq();
+                assert_eq!(self.details.state_accept_seq, seq);
 
                 self.state.update(action);
 
-                assert_eq!(seq + 1, self.state.sequence());
-                self.details.state_sequence = seq + 1;
+                assert_eq!(seq + 1, self.state.accept_seq());
+                self.details.state_accept_seq = seq + 1;
             }
             RecoverableStateAction::BumpGeneration { new_id } => {
                 if 2048 <= self.details.history.len() {
@@ -128,7 +128,7 @@ impl<I: SourceId, D: DeterministicState> DeterministicState for RecoverableState
                 self.details.history.push_back(RecovGenerationEnd {
                     old_id: self.details.id,
                     generation: self.details.generation,
-                    next_sequence: self.details.sequence,
+                    next_sequence: self.details.recover_accept_seq,
                 });
 
                 self.details.generation += 1;
@@ -142,10 +142,10 @@ impl<I: SourceId, D: DeterministicState> RecoverableState<I, D> {
     pub fn new(id: u64, state: D) -> Self {
         RecoverableState {
             details: RecoverableStateDetails {
-                sequence: 1,
+                recover_accept_seq: 1,
                 id,
                 generation: 1,
-                state_sequence: state.sequence(),
+                state_accept_seq: state.accept_seq(),
                 history: VecDeque::new(),
             },
             state,
@@ -188,10 +188,10 @@ impl MessageEncoding for RecovGenerationEnd {
 impl MessageEncoding for RecoverableStateDetails {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
-        sum += self.sequence.write_to(out)?;
+        sum += self.recover_accept_seq.write_to(out)?;
         sum += self.id.write_to(out)?;
         sum += self.generation.write_to(out)?;
-        sum += self.state_sequence.write_to(out)?;
+        sum += self.state_accept_seq.write_to(out)?;
         sum += (self.history.len() as u64).write_to(out)?;
         for item in &self.history {
             sum += item.write_to(out)?;
@@ -201,10 +201,10 @@ impl MessageEncoding for RecoverableStateDetails {
 
     fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
         Ok(RecoverableStateDetails {
-            sequence: MessageEncoding::read_from(read)?,
+            recover_accept_seq: MessageEncoding::read_from(read)?,
             id: MessageEncoding::read_from(read)?,
             generation: MessageEncoding::read_from(read)?,
-            state_sequence: MessageEncoding::read_from(read)?,
+            state_accept_seq: MessageEncoding::read_from(read)?,
             history: {
                 let len = u64::read_from(read)? as usize;
                 let mut history = VecDeque::with_capacity(len);
@@ -255,7 +255,7 @@ mod test {
             action
         }
 
-        fn sequence(&self) -> u64 {
+        fn accept_seq(&self) -> u64 {
             self.0
         }
 
@@ -305,8 +305,8 @@ mod test {
             details: RecoverableStateDetails {
                 id: 32145342,
                 generation: 2,
-                sequence: 3213,
-                state_sequence: 321,
+                recover_accept_seq: 3213,
+                state_accept_seq: 321,
                 history: vec![
                     RecovGenerationEnd {
                         old_id: 1241,

@@ -7,7 +7,7 @@ pub trait DeterministicState: Sized + Send + Sync + Clone + 'static {
     type Action: Sized + Send + Sync + 'static;
     type AuthorityAction: Sized + Send + Sync + 'static;
 
-    fn sequence(&self) -> u64;
+    fn accept_seq(&self) -> u64;
 
     fn authority(&self, action: Self::Action) -> Self::AuthorityAction;
 
@@ -20,7 +20,7 @@ pub struct SharedState<D: DeterministicState> {
 
 impl<D: DeterministicState + Clone> SharedState<D> {
     pub fn new(state: D) -> (Self, FlushedUpdater<D>) {
-        let sequence = state.sequence();
+        let accept_seq = state.accept_seq();
 
         let inner = Arc::new(StateInner {
             read_pos: AtomicUsize::new(0),
@@ -38,7 +38,7 @@ impl<D: DeterministicState + Clone> SharedState<D> {
             inner,
             queue: VecDeque::new(),
             queue_offset: [0, 0],
-            queue_next_sequence: sequence,
+            queue_accept_seq: accept_seq,
         };
 
         (
@@ -57,8 +57,8 @@ pub struct FlushedUpdater<D: DeterministicState> {
 }
 
 impl<D: DeterministicState> FlushedUpdater<D> {
-    pub fn next_sequence(&self) -> u64 {
-        self.updater.queue_next_sequence
+    pub fn accept_seq(&self) -> u64 {
+        self.updater.queue_accept_seq
     }
 
     pub fn reset_state(&mut self, state: D) {
@@ -163,7 +163,7 @@ impl<D: DeterministicState> LeadUpdater<D> {
     pub fn queue(&mut self, action: D::Action) -> (u64, &D::AuthorityAction) {
         let authority = self.state.authority(action);
 
-        let seq = self.state.sequence();
+        let seq = self.state.accept_seq();
         self.state.update(&authority);
         self.updater.queue_sequenced(seq, authority).panic("invalid sequence")
     }
@@ -184,8 +184,8 @@ impl<D: DeterministicState> LeadUpdater<D> {
         &self.state
     }
 
-    pub fn next_sequence(&self) -> u64 {
-        self.updater.queue_next_sequence
+    pub fn accept_seq(&self) -> u64 {
+        self.updater.queue_accept_seq
     }
 
     pub fn into_follow(self) -> FollowUpdater<D> {
@@ -198,8 +198,8 @@ impl<D: DeterministicState> LeadUpdater<D> {
         {
             let state0 = self.updater.inner.states[0].read();
             let state1 = self.updater.inner.states[1].read();
-            assert_eq!(state0.sequence(), state1.sequence());
-            assert_eq!(state0.sequence(), self.state.sequence());
+            assert_eq!(state0.accept_seq(), state1.accept_seq());
+            assert_eq!(state0.accept_seq(), self.state.accept_seq());
         }
 
         FlushedUpdater {
@@ -267,8 +267,8 @@ impl<D: DeterministicState> FollowUpdater<D> {
         self.updater.inner.states[0].read()
     }
 
-    pub fn next_sequence(&self) -> u64 {
-        self.updater.queue_next_sequence
+    pub fn accept_seq(&self) -> u64 {
+        self.updater.queue_accept_seq
     }
 
     pub fn into_flushed(mut self) -> FlushedUpdater<D> {
@@ -277,7 +277,7 @@ impl<D: DeterministicState> FollowUpdater<D> {
         {
             let state0 = self.updater.inner.states[0].read();
             let state1 = self.updater.inner.states[1].read();
-            assert_eq!(state0.sequence(), state1.sequence());
+            assert_eq!(state0.accept_seq(), state1.accept_seq());
         }
 
         FlushedUpdater {
@@ -292,7 +292,7 @@ impl<D: DeterministicState> FollowUpdater<D> {
         let state = {
             let state0 = self.updater.inner.states[0].read();
             let state1 = self.updater.inner.states[1].read();
-            assert_eq!(state0.sequence(), state1.sequence());
+            assert_eq!(state0.accept_seq(), state1.accept_seq());
             state0.clone()
         };
 
@@ -306,7 +306,7 @@ impl<D: DeterministicState> FollowUpdater<D> {
 pub struct StateUpdater<D: DeterministicState> {
     inner: Arc<StateInner<D>>,
     queue: VecDeque<(u64, D::AuthorityAction)>,
-    queue_next_sequence: u64,
+    queue_accept_seq: u64,
     queue_offset: [usize; 2],
 }
 
@@ -328,7 +328,7 @@ impl<D: DeterministicState> StateUpdater<D> {
         let write_pos = read_pos.overflowing_add(1).0;
         let write_idx = write_pos & 0x1;
 
-        let state_sequence = state.sequence();
+        let state_sequence = state.accept_seq();
 
         {
             let mut state_lock = self.inner.states[write_idx].write();
@@ -344,24 +344,24 @@ impl<D: DeterministicState> StateUpdater<D> {
 
         self.queue.clear();
         self.queue_offset = [0, 0];
-        self.queue_next_sequence = state_sequence;
+        self.queue_accept_seq = state_sequence;
     }
 
     pub fn queue_sequenced(&mut self, seq: u64, item: D::AuthorityAction) -> Result<(u64, &D::AuthorityAction), D::AuthorityAction> {
-        if self.queue_next_sequence != seq {
+        if self.queue_accept_seq != seq {
             return Err(item);
         }
         Ok((seq, self.queue(item)))
     }
 
     pub fn queue(&mut self, item: D::AuthorityAction) -> &D::AuthorityAction {
-        self.queue.push_back((self.queue_next_sequence, item));
-        self.queue_next_sequence += 1;
+        self.queue.push_back((self.queue_accept_seq, item));
+        self.queue_accept_seq += 1;
         &self.queue.back().unwrap().1
     }
 
     pub fn next_queued_sequence(&self) -> u64 {
-        self.queue_next_sequence
+        self.queue_accept_seq
     }
 
     pub fn update_ready(&self) -> bool {
@@ -400,16 +400,16 @@ impl<D: DeterministicState> StateUpdater<D> {
             let mut state = self.inner.states[write_idx].write();
             let mut offset = self.queue_offset[write_idx];
 
-            let mut next_seq = state.sequence() + 1;
+            let mut next_seq = state.accept_seq() + 1;
             while offset < self.queue.len() {
                 let (target_seq, action) = &self.queue[offset];
-                assert_eq!(state.sequence(), *target_seq);
+                assert_eq!(state.accept_seq(), *target_seq);
                 offset += 1;
 
                 had_update = true;
                 state.update(action);
 
-                assert_eq!(state.sequence(), next_seq, "state::update(action) did not increment sequence");
+                assert_eq!(state.accept_seq(), next_seq, "state::update(action) did not increment sequence");
                 next_seq += 1;
             }
 
@@ -445,7 +445,7 @@ mod test {
 
     #[derive(Clone, Debug, Default)]
     struct TestState {
-        sequence: u64,
+        accept_seq: u64,
         time: u64,
         numbers: Vec<u64>,
     }
@@ -461,12 +461,12 @@ mod test {
             )
         }
 
-        fn sequence(&self) -> u64 {
-            self.sequence
+        fn accept_seq(&self) -> u64 {
+            self.accept_seq
         }
 
         fn update(&mut self, action: &Self::AuthorityAction) {
-            self.sequence += 1;
+            self.accept_seq += 1;
 
             self.time = action.0;
             self.numbers.push(action.1);
@@ -478,8 +478,8 @@ mod test {
         let (state, updater) = SharedState::new(TestState::default());
         let mut updater = updater.into_lead();
 
-        assert_eq!(state.read().sequence, 0);
-        assert_eq!(updater.next_sequence(), 0);
+        assert_eq!(state.read().accept_seq, 0);
+        assert_eq!(updater.accept_seq(), 0);
 
         for i in 0..20 {
             updater.queue(i);
@@ -488,7 +488,7 @@ mod test {
         updater.flush();
 
         {
-            assert_eq!(updater.next_sequence(), 20);
+            assert_eq!(updater.accept_seq(), 20);
             let read = state.read();
             assert_eq!(read.numbers.len(), 20);
         }
@@ -497,11 +497,11 @@ mod test {
         updater.mutate_state(|state| {
             state.numbers.clear();
             state.numbers.push(1);
-            state.sequence = 1000;
+            state.accept_seq = 1000;
         });
 
         {
-            assert_eq!(updater.next_sequence(), 1000);
+            assert_eq!(updater.accept_seq(), 1000);
             let read = state.read();
             assert_eq!(read.numbers.len(), 1);
         }
