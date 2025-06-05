@@ -83,6 +83,8 @@ struct SyncManagerWorker<I: SyncIO, D: DeterministicState> {
     connect_timeout: Duration,
     receive_state_timeout: Duration,
     net_settings: NetIoSettings,
+
+    waiting_for_connection_update: bool,
 }
 
 #[repr(usize)]
@@ -93,9 +95,6 @@ pub enum Timer {
 
     RejectPeer,
     ConnectToPeer,
-
-    SendPing,
-    RequirePong,
 
     RequireState,
     BroadcastPeers,
@@ -296,6 +295,68 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
             connect_timeout: settings.connect_timeout,
             receive_state_timeout: settings.receive_state_timeout,
             net_settings: settings.net_io,
+            waiting_for_connection_update: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn assert_valid_state(&self) {
+        if self.follow_state.is_some() {
+            assert_ne!(self.leader, self.local);
+            assert!(self.updater.is_following() || self.updater.is_offline());
+        } else if self.updater.is_leading() {
+            assert_eq!(self.leader, self.local);
+        } else {
+            assert!(self.updater.is_offline());
+        }
+
+        if self.updater.is_following() {
+            assert!(self.follow_state.is_some());
+        }
+
+        if self.local == self.leader {
+            assert!(self.updater.is_leading());
+        }
+
+        let active_timers = self.timers.active();
+
+        if self.updater.is_following() {
+            assert!(active_timers.contains(&Timer::SendVerifyLeader));
+            assert!(active_timers.contains(&Timer::RequireVerifyLeader));
+        }
+
+        if self.updater.is_offline() {
+            if self.follow_state.is_some() {
+                /* TODO: assert fails :( */
+                assert!(active_timers.contains(&Timer::RequireState));
+
+                assert!(active_timers.contains(&Timer::SendVerifyLeader));
+                assert!(active_timers.contains(&Timer::RequireVerifyLeader));
+            } else {
+                assert!(!active_timers.contains(&Timer::RequireState));
+                assert!(!active_timers.contains(&Timer::SendVerifyLeader));
+                assert!(!active_timers.contains(&Timer::RequireVerifyLeader));
+
+                if self.waiting_for_connection_update {
+                    assert!(!active_timers.contains(&Timer::ConnectToPeer));
+                } else {
+                    assert!(active_timers.contains(&Timer::ConnectToPeer));
+                }
+            }
+        }
+
+        if self.updater.is_leading() {
+            assert!(!active_timers.contains(&Timer::SendVerifyLeader));
+            assert!(!active_timers.contains(&Timer::RequireVerifyLeader));
+        }
+
+        if self.updater.is_following() || self.updater.is_leading() {
+            assert!(!active_timers.contains(&Timer::ConnectToPeer));
+            assert!(!active_timers.contains(&Timer::RequireState));
+        }
+
+        if self.waiting_for_connection_update {
+            assert!(self.updater.is_offline());
         }
     }
 
@@ -318,6 +379,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                 Event::ClientMessage(msg_opt.panic("client msg channel closed"))
             }
             conn_opt = self.conn_rx.recv() => {
+                self.waiting_for_connection_update = false;
                 Event::ConnectionUpdate(conn_opt.panic("conn channel closed"))
             }
             control_opt = self.control_rx.recv() => {
@@ -370,6 +432,9 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
         loop {
             tokio::task::yield_now().await;
 
+            #[cfg(test)]
+            self.assert_valid_state();
+
             let event = self.next_event().await;
             let shutdown = matches!(event, Event::Shutdown);
             
@@ -403,7 +468,10 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                 tracing::info!("Broadcasted {} peers to {} peers", peers.len(), count);
                 self.timers.get(Timer::BroadcastPeers).set_earlier(Duration::from_secs(30));
             }
-            Event::Timer(Timer::RejectPeer | Timer::RequireVerifyLeader | Timer::RequirePong | Timer::RequireState) => {
+            Event::Timer(Timer::RejectPeer | Timer::RequireVerifyLeader | Timer::RequireState) => {
+                self.timers.get(Timer::SendVerifyLeader).clear();
+                self.timers.get(Timer::RequireVerifyLeader).clear();
+
                 if let Some(follow) = self.follow_state.take() {
                     follow.cancel.cancel();
 
@@ -425,6 +493,8 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                 if self.leader != self.local {
                     self.updater.go_offline().await;
                     self.timers.get(Timer::ConnectToPeer).set_earlier(Duration::from_secs(1));
+                } else {
+                    assert!(self.updater.is_leading());
                 }
             }
             Event::Timer(Timer::SendVerifyLeader) => {
@@ -434,18 +504,8 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                     self.metrics.error_failed_to_ask_leader.inc();
                     self.timers.get(Timer::RequireVerifyLeader).extend(Duration::from_secs(2), Duration::from_secs(30));
                 }
-            }
-            Event::Timer(Timer::SendPing) => {
-                if let Some(follow) = &self.follow_state {
-                    if follow.to_leader.try_send(SyncRequest::Ping(now_ms())).is_err() {
-                        self.metrics.error_failed_to_ping_leader.inc();
-                        self.timers.get(Timer::SendPing).set_earlier(Duration::from_secs(1));
-                    } else {
-                        self.timers.get(Timer::SendPing).set_earlier(Duration::from_secs(15));
-                    }
 
-                    self.timers.get(Timer::RequirePong).extend(Duration::from_secs(5), Duration::from_secs(30));
-                }
+                self.timers.get(Timer::SendVerifyLeader).set_earlier(Duration::from_secs(30));
             }
             Event::Timer(Timer::ConnectToPeer) => {
                 if self.leader == self.local {
@@ -515,6 +575,8 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                 let conn_tx = self.conn_tx.clone();
                 let conn_timeout = self.connect_timeout;
                 let net_settings = self.net_settings.clone();
+
+                self.waiting_for_connection_update = true;
 
                 tokio::spawn(async move {
                     let cancel = CancellationToken::new();
@@ -674,6 +736,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                         if self.leader == self.local {
                             let removed = self.follow_state.take().unwrap();
                             removed.cancel.cancel();
+                            assert!(self.updater.is_leading());
                             return;
                         }
 
@@ -727,9 +790,6 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                                 o.into_mut().latency.replace(latency);
                             }
                         }
-
-                        self.timers.get(Timer::SendPing).set(Duration::from_secs(5));
-                        self.timers.get(Timer::RequirePong).set(Duration::from_secs(120));
                     }
                     SyncResponse::FreshState(state) => {
                         if follow.feed_updater.is_some() {
@@ -892,6 +952,8 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                     self.timers.get(Timer::SendVerifyLeader).set_earlier(Duration::from_secs(2));
                     self.timers.get(Timer::RequireVerifyLeader).set(Duration::from_secs(10));
                 } else {
+                    self.updater.go_offline().await;
+
                     tracing::info!("need leader connection");
                     self.timers.get(Timer::ConnectToPeer).now();
                 }
