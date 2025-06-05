@@ -63,6 +63,8 @@ impl<D: DeterministicState> FollowWorker<D> where D::AuthorityAction: Clone {
 
     pub async fn run_till_canceled(&mut self, cancel: CancellationToken) {
         loop {
+            tokio::task::yield_now().await;
+
             let (seq, action) = tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
                     if self.updater.update_ready() {

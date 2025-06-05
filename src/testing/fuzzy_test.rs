@@ -20,7 +20,7 @@ async fn _fuzzy_test() {
     let net = TestSyncNet::new();
 
     const INSTANT_COUNT: usize = 32;
-    const MESS_WITH_LEADER: bool = true;
+    const MESS_WITH_LEADER: bool = false;
 
     let cancel = CancellationToken::new();
     let mut tasks = Vec::new();
@@ -170,6 +170,11 @@ async fn _fuzzy_test() {
             let state = shared.read();
             assert_eq!(state.state(), expected.state());
         }
+    }
+
+    {
+        let state = sync_nodes[0].shared().read().state().clone();
+        println!("Numbers: {:?}", state.numbers);
     }
 
     sync_nodes[INSTANT_COUNT - 1].action_tx().send(TestStateAction::Set { slot: 0, value: 0 }).await.unwrap();

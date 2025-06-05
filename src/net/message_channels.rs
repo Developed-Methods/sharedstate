@@ -37,6 +37,8 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> ReadChannel<I, M> {
         let mut buffer = vec![0u8; 2048];
 
         loop {
+            tokio::task::yield_now().await;
+
             let read_opt_res = tokio::select! {
                 read_opt_res = read_message_opt::<M, _>(
                     &mut buffer,
@@ -75,6 +77,8 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
         let zero_msg_timeout = self.settings.process_timeout / 3;
 
         loop {
+            tokio::task::yield_now().await;
+
             let msg = tokio::select! {
                 msg_opt = self.input.recv() => {
                     match msg_opt {

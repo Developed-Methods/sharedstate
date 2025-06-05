@@ -92,6 +92,8 @@ impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D> where D::AuthorityAct
 
         tokio::spawn(async move {
             while let Some((source, action)) = action_rx.recv().await {
+                tokio::task::yield_now().await;
+
                 /* prevent loops */
                 if source == local_id {
                     continue;
@@ -426,6 +428,7 @@ impl<D: DeterministicState> AuthorityToBroadcast<D> where D::AuthorityAction: Cl
 
     async fn run(&mut self, cancel: CancellationToken) {
         while let Some(Some((seq, authority))) = cancel.run_until_cancelled(self.authority_rx.recv()).await {
+            tokio::task::yield_now().await;
             self.broadcast_tx.safe_send(seq, authority).await.panic("invalid sequence");
         }
 
@@ -452,6 +455,7 @@ impl<I: SourceId, D: DeterministicState> ActionPipe<I, D> {
     async fn run(&mut self, cancel: CancellationToken) {
         cancel.run_until_cancelled_owned(async {
             while let Some(action) = self.action_rx.recv().await {
+                tokio::task::yield_now().await;
                 if self.action_tx.send(action).await.is_err() {
                     break;
                 }
@@ -476,6 +480,7 @@ impl<I: SourceId, D: DeterministicState> ActionToLocalLead<I, D> {
     async fn run(&mut self, cancel: CancellationToken) {
         cancel.run_until_cancelled_owned(async {
             while let Some((source, action)) = self.action_rx.recv().await {
+                tokio::task::yield_now().await;
                 self.lead_tx.send(RecoverableStateAction::StateAction { source, action }).await.panic("failed to send action to local lead");
             }
         }).await;

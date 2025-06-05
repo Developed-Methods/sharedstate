@@ -368,9 +368,10 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
 
     async fn start(mut self) {
         loop {
+            tokio::task::yield_now().await;
+
             let event = self.next_event().await;
             let shutdown = matches!(event, Event::Shutdown);
-
             
             if !matches!(event, Event::LeaderMessage(SyncResponse::AuthorityAction(..)) | Event::ClientMessage(ClientMessage { msg: SyncRequest::Action { .. }, .. })) {
                 tracing::info!("Next Event: {:?}", event);
@@ -753,6 +754,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                             let to_leader = follow.to_leader.clone();
                             tokio::spawn(follow.cancel.clone().run_until_cancelled_owned(async move {
                                 while let Some((source, action)) = action_rx.recv().await {
+                                    tokio::task::yield_now().await;
                                     if to_leader.send(SyncRequest::Action { source, action }).await.is_err() {
                                         break;
                                     }
@@ -794,6 +796,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                             let to_leader = follow.to_leader.clone();
                             tokio::spawn(follow.cancel.clone().run_until_cancelled_owned(async move {
                                 while let Some((source, action)) = action_rx.recv().await {
+                                    tokio::task::yield_now().await;
                                     if to_leader.send(SyncRequest::Action { source, action }).await.is_err() {
                                         break;
                                     }
@@ -1019,6 +1022,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                             }
 
                             while let Some(msg) = follow_target.authority_rx.recv().await {
+                                tokio::task::yield_now().await;
                                 if send.send(SyncResponse::AuthorityAction(msg.0, msg.1)).await.is_err() {
                                     break;
                                 }
@@ -1059,6 +1063,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                             }
 
                             while let Some(msg) = authority_rx.recv().await {
+                                tokio::task::yield_now().await;
                                 if send.send(SyncResponse::AuthorityAction(msg.0, msg.1)).await.is_err() {
                                     break;
                                 }
@@ -1085,6 +1090,8 @@ struct ClientAcceptor<I: SyncIO, D: DeterministicState> {
 impl<I: SyncIO, D: DeterministicState> ClientAcceptor<I, D> where D: MessageEncoding, D::AuthorityAction: MessageEncoding + Clone, D::Action: MessageEncoding {
     pub async fn start(self) {
         loop {
+            tokio::task::yield_now().await;
+
             let client = tokio::select! {
                 _ = self.msg_tx.closed() => {
                     tracing::info!("client message receiver closed, stopping client acceptor");
@@ -1150,6 +1157,7 @@ impl<I: SyncIO, D: DeterministicState> ClientAcceptor<I, D> where D: MessageEnco
 
             state.cancel.clone().run_until_cancelled_owned(async move {
                 while let Some(msg) = from_client.recv().await {
+                    tokio::task::yield_now().await;
                     if event_tx.send(ClientMessage { client: state.clone(), msg, send: to_client.clone() }).await.is_err() {
                         tracing::warn!("SyncManager worker closed, stopping read from client");
                         break;
