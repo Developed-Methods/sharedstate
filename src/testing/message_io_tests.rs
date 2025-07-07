@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tokio::io::{duplex, AsyncWriteExt};
 
-use crate::message_io::{read_message, send_message, MessageSizeHeader};
+use crate::net::message_io::{read_message, send_message, MessageSizeHeader};
 
 const PROGRES_TIMEOUT: Duration = Duration::from_millis(100);
 

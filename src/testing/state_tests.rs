@@ -2,19 +2,19 @@ use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant,
 
 use message_encoding::{test_assert_valid_encoding, MessageEncoding};
 
-use crate::{state::{DeterministicState, SharedState}, message_io::unknown_id_err};
+use crate::{state::{DeterministicState, SharedState}, net::message_io::unknown_id_err};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TestState {
     pub sequence: u64,
-    pub numbers: [i64; 6],
+    pub numbers: [i64; 32],
 }
 
 impl DeterministicState for TestState {
     type Action = TestStateAction;
     type AuthorityAction = (u64, TestStateAction);
 
-    fn sequence(&self) -> u64 {
+    fn accept_seq(&self) -> u64 {
         self.sequence
     }
 
@@ -29,7 +29,9 @@ impl DeterministicState for TestState {
         self.sequence += 1;
 
         match action {
-            TestStateAction::Add { slot, value } => self.numbers[*slot] += *value,
+            TestStateAction::Add { slot, value } => {
+                self.numbers[*slot] = self.numbers[*slot].overflowing_add(*value).0;
+            },
             TestStateAction::Set { slot, value } => self.numbers[*slot] = *value,
         }
     }
@@ -55,6 +57,32 @@ impl MessageEncoding for TestState {
         Ok(TestState {
             sequence: MessageEncoding::read_from(read)?,
             numbers: [
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
+                u64::read_from(read)? as i64,
                 u64::read_from(read)? as i64,
                 u64::read_from(read)? as i64,
                 u64::read_from(read)? as i64,
@@ -122,7 +150,7 @@ fn test_state_action_encoding_test() {
 fn slow_state_deadlock_test() {
     super::setup_logging();
 
-    let (state, updater) = SharedState::new(TestState { sequence: 0, numbers: [0i64; 6] });
+    let (state, updater) = SharedState::new(TestState { sequence: 0, numbers: [0i64; 32] });
     let mut updater = updater.into_lead();
 
     let run = Arc::new(AtomicBool::new(true));

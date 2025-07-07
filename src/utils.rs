@@ -1,4 +1,4 @@
-use std::{fmt::Debug, panic::Location, time::Duration, future::Future};
+use std::{fmt::Debug, future::Future, panic::Location, time::{Duration, UNIX_EPOCH}};
 
 pub trait LogHelper {
     fn log(self) -> Self;
@@ -67,6 +67,22 @@ impl<R, E> PanicHelper for Result<R, E> {
         match self {
             Ok(v) => v,
             Err(_) => {
+                let caller = Location::caller();
+                tracing::error!("Panic({}:{}), {} ", caller.file(), caller.line(), msg);
+                panic!("Panic({}:{}), {} ", caller.file(), caller.line(), msg);
+            }
+        }
+    }
+}
+
+impl PanicHelper for bool {
+    type Success = ();
+
+    #[track_caller]
+    fn panic(self, msg: &str) {
+        match self {
+            true => (),
+            false => {
                 let caller = Location::caller();
                 tracing::error!("Panic({}:{}), {} ", caller.file(), caller.line(), msg);
                 panic!("Panic({}:{}), {} ", caller.file(), caller.line(), msg);
@@ -153,3 +169,6 @@ impl<F: Future> TimeoutPanicHelper for F {
     }
 }
 
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+}

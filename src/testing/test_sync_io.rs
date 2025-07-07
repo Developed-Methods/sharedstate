@@ -1,6 +1,6 @@
 use std::{collections::{hash_map::{self, Entry}, HashMap, HashSet}, future::Future, pin::Pin, sync::{atomic::{AtomicU64, Ordering}, Arc}, task::{Context, Poll}};
 use tokio::{io::{duplex, split, AsyncRead, AsyncWrite, DuplexStream, ReadHalf, WriteHalf}, sync::{mpsc::{channel, Receiver, Sender}, oneshot, Mutex, RwLock}};
-use crate::io::{SyncConnection, SyncIO};
+use crate::net::io::{SyncConnection, SyncIO};
 
 use super::blocking_rw_lock;
 
@@ -33,15 +33,20 @@ impl TestSyncNet {
         }
     }
 
+    pub async fn unblock_all(&self) {
+        let mut lock = self.0.write().await;
+        lock.block_connections.clear();
+    }
+
     pub async fn kill_connection(&self, from: u64, to: u64, mode: TestIOKillMode) -> u64 {
         let mut lock = self.0.write().await;
         let Some(conns) = lock.connections.get_mut(&(from, to)) else { return 0 };
 
         let mut count = 0;
-        for (_, send) in conns {
-            if let Some(send) = send.take() {
+        for ConnManage { kill, .. } in conns {
+            if let Some(kill) = kill.take() {
                 count += 1;
-                let _ = send.send(mode);
+                let _ = kill.send(mode);
             }
         }
 
@@ -85,17 +90,23 @@ pub struct TestSyncIO {
 struct NetInner {
     listeners: HashMap<u64, Sender<(u64, DuplexStream)>>,
     block_connections: HashSet<(u64, u64)>,
-    connections: HashMap<(u64, u64), Vec<(u64, Option<oneshot::Sender<TestIOKillMode>>)>>,
+    connections: HashMap<(u64, u64), Vec<ConnManage>>,
+}
+
+struct ConnManage {
+    id: u64,
+    kill: Option<oneshot::Sender<TestIOKillMode>>,
+    rate_limit_bps: Arc<AtomicU64>,
 }
 
 impl NetInner {
-    fn add_conn(&mut self, id: (u64, u64, u64), tx: oneshot::Sender<TestIOKillMode>) {
-        let conns = match self.connections.entry((id.0, id.1)) {
+    fn add_conn(&mut self, from: u64, to: u64, conn: ConnManage) {
+        let conns = match self.connections.entry((from, to)) {
             hash_map::Entry::Occupied(o) => o.into_mut(),
             hash_map::Entry::Vacant(v) => v.insert(vec![]),
         };
 
-        conns.push((id.2, Some(tx)));
+        conns.push(conn);
     }
 }
 
@@ -104,7 +115,7 @@ impl SyncIO for TestSyncIO {
     type Read = BreakableIO<ReadHalf<DuplexStream>>;
     type Write = BreakableIO<WriteHalf<DuplexStream>>;
 
-    async fn connect(&self, remote: &Self::Address) -> std::io::Result<crate::io::SyncConnection<Self>> {
+    async fn connect(&self, remote: &Self::Address) -> std::io::Result<crate::net::io::SyncConnection<Self>> {
         let mut lock = self.net.0.write().await;
 
         let Some(tx) = lock.listeners.get(remote) else {
@@ -132,8 +143,8 @@ impl SyncIO for TestSyncIO {
         let (read, read_kill) = BreakableIO::new((*remote, self.listen_addr, conn_id), self.net.clone(), read);
         let (write, write_kill) = BreakableIO::new((self.listen_addr, *remote, conn_id), self.net.clone(), write);
 
-        lock.add_conn((*remote, self.listen_addr, conn_id), read_kill);
-        lock.add_conn((self.listen_addr, *remote, conn_id), write_kill);
+        lock.add_conn(*remote, self.listen_addr, ConnManage { id: conn_id, kill: Some(read_kill), rate_limit_bps: Arc::new(AtomicU64::new(0)) });
+        lock.add_conn(self.listen_addr, *remote, ConnManage { id: conn_id, kill: Some(write_kill), rate_limit_bps: Arc::new(AtomicU64::new(0)) });
 
         Ok(SyncConnection {
             remote: *remote,
@@ -142,7 +153,7 @@ impl SyncIO for TestSyncIO {
         })
     }
 
-    async fn next_client(&self) -> std::io::Result<crate::io::SyncConnection<Self>> {
+    async fn next_client(&self) -> std::io::Result<crate::net::io::SyncConnection<Self>> {
         let (peer_id, client) = {
             let mut lock = self.next.lock().await;
             let Some(recv) = lock.recv().await else {
@@ -158,8 +169,8 @@ impl SyncIO for TestSyncIO {
         let (write, write_kill) = BreakableIO::new((self.listen_addr, peer_id, conn_id), self.net.clone(), write);
 
         let mut lock = self.net.0.write().await;
-        lock.add_conn((peer_id, self.listen_addr, conn_id), read_kill);
-        lock.add_conn((self.listen_addr, peer_id, conn_id), write_kill);
+        lock.add_conn(peer_id, self.listen_addr, ConnManage { id: conn_id, kill: Some(read_kill), rate_limit_bps: Arc::new(AtomicU64::new(0)) });
+        lock.add_conn(self.listen_addr, peer_id, ConnManage { id: conn_id, kill: Some(write_kill), rate_limit_bps: Arc::new(AtomicU64::new(0)) });
 
         Ok(SyncConnection {
             remote: peer_id,
@@ -217,7 +228,7 @@ impl<I> Drop for BreakableIO<I> {
         let key = (self.conn_id.0, self.conn_id.1);
         let conns = lock.connections.get_mut(&key).unwrap();
 
-        let index = conns.iter().position(|c| c.0 == self.conn_id.2).unwrap();
+        let index = conns.iter().position(|c| c.id == self.conn_id.2).unwrap();
         conns.swap_remove(index);
 
         if conns.is_empty() {
