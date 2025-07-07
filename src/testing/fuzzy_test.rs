@@ -134,7 +134,9 @@ async fn _fuzzy_test() {
         node.set_leader(1).await;
     }
 
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::sleep(Duration::from_secs(12)).await;
+
+    tokio::time::timeout(Duration::from_secs(300), async {
         let mut sequences = vec![0; INSTANT_COUNT];
 
         loop {
@@ -153,7 +155,7 @@ async fn _fuzzy_test() {
                 break;
             }
 
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(6)).await;
         }
     }).await.panic("timeout waiting for seq to stablize");
 

@@ -327,11 +327,15 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
 
         if self.updater.is_offline() {
             if self.follow_state.is_some() {
-                /* TODO: assert fails :( */
-                assert!(active_timers.contains(&Timer::RequireState));
-
-                assert!(active_timers.contains(&Timer::SendVerifyLeader));
-                assert!(active_timers.contains(&Timer::RequireVerifyLeader));
+                if !active_timers.contains(&Timer::RejectPeer) {
+                    assert!(active_timers.contains(&Timer::RequireState));
+                    assert!(active_timers.contains(&Timer::SendVerifyLeader));
+                    assert!(active_timers.contains(&Timer::RequireVerifyLeader));
+                } else {
+                    assert!(!active_timers.contains(&Timer::RequireState));
+                    assert!(!active_timers.contains(&Timer::SendVerifyLeader));
+                    assert!(!active_timers.contains(&Timer::RequireVerifyLeader));
+                }
             } else {
                 assert!(!active_timers.contains(&Timer::RequireState));
                 assert!(!active_timers.contains(&Timer::SendVerifyLeader));
@@ -346,8 +350,10 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
         }
 
         if self.updater.is_leading() {
+            assert!(!active_timers.contains(&Timer::RequireState));
             assert!(!active_timers.contains(&Timer::SendVerifyLeader));
             assert!(!active_timers.contains(&Timer::RequireVerifyLeader));
+            assert!(self.follow_state.is_none());
         }
 
         if self.updater.is_following() || self.updater.is_leading() {
@@ -469,8 +475,10 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                 self.timers.get(Timer::BroadcastPeers).set_earlier(Duration::from_secs(30));
             }
             Event::Timer(Timer::RejectPeer | Timer::RequireVerifyLeader | Timer::RequireState) => {
+                self.timers.get(Timer::RejectPeer).clear();
                 self.timers.get(Timer::SendVerifyLeader).clear();
                 self.timers.get(Timer::RequireVerifyLeader).clear();
+                self.timers.get(Timer::RequireState).clear();
 
                 if let Some(follow) = self.follow_state.take() {
                     follow.cancel.cancel();
@@ -905,14 +913,19 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                             true
                         };
 
-                        follow.leader_path = path;
 
                         if is_valid {
+                            follow.leader_path = path;
+
                             self.timers.get(Timer::SendVerifyLeader).set_earlier(Duration::from_secs(10));
                             self.timers.get(Timer::RequireVerifyLeader).set(Duration::from_secs(40));
                         } else {
+                            follow.leader_path = vec![];
+
                             self.timers.get(Timer::SendVerifyLeader).set_earlier(Duration::from_secs(2));
-                            self.timers.get(Timer::RequireVerifyLeader).extend(Duration::from_secs(10), Duration::from_secs(50));
+                            self.timers.get(Timer::RequireVerifyLeader)
+                                .extend(Duration::from_secs(4), Duration::from_secs(20))
+                                .set_earlier(Duration::from_secs(2) + self.connect_timeout);
                         }
                     }
                     SyncResponse::Peers(peers) => {
@@ -1251,7 +1264,7 @@ impl TimerOpt {
         self.trigger = true;
     }
 
-    fn extend(&mut self, wait: Duration, max: Duration) {
+    fn extend(&mut self, wait: Duration, max: Duration) -> &mut Self {
         let now = Instant::now();
         let mut expires_at = now + wait;
 
@@ -1271,6 +1284,8 @@ impl TimerOpt {
             }
             self.expires_at_start = Some(now);
         }
+
+        self
     }
 
     fn set(&mut self, wait: Duration) {
