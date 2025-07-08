@@ -16,6 +16,7 @@ pub struct SyncManager<I: SyncIO, D: DeterministicState> {
     action_tx: Sender<D::Action>,
     shared: SharedState<RecoverableState<I::Address, D>>,
     control_tx: Sender<ControlMessage<I>>,
+    metrics: Arc<SyncManagerMetrics>,
 }
 
 impl<I: SyncIO, D: DeterministicState> SyncManager<I, D> where D: MessageEncoding, D::AuthorityAction: MessageEncoding + Clone, D::Action: MessageEncoding {
@@ -25,9 +26,10 @@ impl<I: SyncIO, D: DeterministicState> SyncManager<I, D> where D: MessageEncodin
 
         let shared = worker.updater.state().clone();
         let action_tx = worker.updater.action_tx();
+        let metrics = worker.metrics.clone();
 
         tokio::spawn(ClientAcceptor {
-            metrics: worker.metrics.clone(),
+            metrics: metrics.clone(),
             msg_tx: worker.client_msg_tx.clone(),
             net_settings: worker.net_settings.clone(),
             io: worker.io.clone(),
@@ -39,7 +41,12 @@ impl<I: SyncIO, D: DeterministicState> SyncManager<I, D> where D: MessageEncodin
             action_tx,
             shared,
             control_tx,
+            metrics,
         }
+    }
+
+    pub fn sync_metrics_ref(&self) -> &Arc<SyncManagerMetrics> {
+        &self.metrics
     }
 
     pub fn shared(&self) -> SharedState<RecoverableState<I::Address, D>> {
