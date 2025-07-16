@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "sharedstate"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "arc-metrics",
  "assert_matches",
