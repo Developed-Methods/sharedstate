@@ -586,6 +586,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
 
                 tracing::info!(option_count = opt_count, peers = self.peers.len(), target = ?connect_target, leader = ?self.leader, "found connect target");
 
+                let local_id = self.local;
                 let io = self.io.clone();
                 let conn_tx = self.conn_tx.clone();
                 let conn_timeout = self.connect_timeout;
@@ -641,6 +642,10 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
 
                             to_server_tx
                         };
+
+                        if to_server.send(SyncRequest::MyAddress(local_id)).await.is_err() {
+                            tracing::error!("failed to send initial MyAddress message to upstream");
+                        }
 
                         {
                             let now = now_ms();
@@ -1006,6 +1011,11 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                 }
 
                 match msg {
+                    SyncRequest::MyAddress(addr) => {
+                        if addr != client.source_id {
+                            tracing::warn!("got MyAddress which doesn't match source id");
+                        }
+                    }
                     SyncRequest::Ping(num) => {
                         self.metrics.client_req_ping.inc();
 
@@ -1197,59 +1207,81 @@ impl<I: SyncIO, D: DeterministicState> ClientAcceptor<I, D> where D: MessageEnco
     }
 
     pub fn add_client(&self, client: SyncConnection<I>) {
-        let state = Arc::new(ClientState {
-            source_id: client.remote,
-            mode: AtomicU64::new(MODE_CONNECTING),
-            cancel: CancellationToken::new(),
-        });
-
-        let mut from_client = {
-            let (from_client_tx, from_client_rx) = channel::<SyncRequest<I, D>>(1024);
-
-            tokio::spawn(state.cancel.clone().run_until_cancelled_owned(
-                ReadChannel::<I, _> {
-                    input: client.read,
-                    output: from_client_tx,
-                    settings: self.net_settings.clone(),
-                }.start().instrument(tracing::info_span!("ReadClient", remote = ?client.remote))
-            ));
-            
-            from_client_rx
-        };
-
-        let to_client = {
-            let (to_client_tx, to_client_rx) = channel::<SyncResponse<I, D>>(1024);
-
-            tokio::spawn(state.cancel.clone().run_until_cancelled_owned(
-                WriteChannel::<I, _> {
-                    input: to_client_rx,
-                    output: client.write,
-                    settings: self.net_settings.clone()
-                }.start().instrument(tracing::info_span!("WriteClient", remote = ?client.remote))
-            ));
-
-            to_client_tx
-        };
-
         let event_tx = self.msg_tx.clone();
         let metrics = self.metrics.clone();
+        let net_settings = self.net_settings.clone();
 
         tokio::spawn(async move {
-            metrics.clients_connected.inc();
+            let cancel = CancellationToken::new();
 
-            state.cancel.clone().run_until_cancelled_owned(async move {
-                while let Some(msg) = from_client.recv().await {
-                    tokio::task::yield_now().await;
-                    if event_tx.send(ClientMessage { client: state.clone(), msg, send: to_client.clone() }).await.is_err() {
-                        tracing::warn!("SyncManager worker closed, stopping read from client");
-                        break;
+            let mut from_client = {
+                let (from_client_tx, from_client_rx) = channel::<SyncRequest<I, D>>(1024);
+
+                tokio::spawn(cancel.clone().run_until_cancelled_owned(
+                    ReadChannel::<I, _> {
+                        input: client.read,
+                        output: from_client_tx,
+                        settings: net_settings.clone(),
+                    }.start().instrument(tracing::info_span!("ReadClient", remote = ?client.remote))
+                ));
+
+                from_client_rx
+            };
+
+            let addr_res = tokio::time::timeout(Duration::from_secs(1), async {
+                'get_addr: {
+                    while let Some(msg) = from_client.recv().await {
+                        let SyncRequest::MyAddress(addr) = msg else { continue };
+                        break 'get_addr Some(addr);
                     }
-                }
 
-                state.cancel.cancel();
+                    None
+                }
             }).await;
 
-            metrics.clients_connected.dec();
+            let Ok(Some(addr)) = addr_res else {
+                tracing::error!("failed to get address from peer");
+                cancel.cancel();
+                return;
+            };
+
+            let state = Arc::new(ClientState {
+                source_id: addr,
+                mode: AtomicU64::new(MODE_CONNECTING),
+                cancel,
+            });
+
+            let to_client = {
+                let (to_client_tx, to_client_rx) = channel::<SyncResponse<I, D>>(1024);
+
+                tokio::spawn(state.cancel.clone().run_until_cancelled_owned(
+                        WriteChannel::<I, _> {
+                            input: to_client_rx,
+                            output: client.write,
+                            settings: net_settings,
+                        }.start().instrument(tracing::info_span!("WriteClient", remote = ?client.remote))
+                ));
+
+                to_client_tx
+            };
+
+            tokio::spawn(async move {
+                metrics.clients_connected.inc();
+
+                state.cancel.clone().run_until_cancelled_owned(async move {
+                    while let Some(msg) = from_client.recv().await {
+                        tokio::task::yield_now().await;
+                        if event_tx.send(ClientMessage { client: state.clone(), msg, send: to_client.clone() }).await.is_err() {
+                            tracing::warn!("SyncManager worker closed, stopping read from client");
+                            break;
+                        }
+                    }
+
+                    state.cancel.cancel();
+                }).await;
+
+                metrics.clients_connected.dec();
+            });
         });
     }
 }

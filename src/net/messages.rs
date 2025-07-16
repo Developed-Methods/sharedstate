@@ -7,6 +7,7 @@ use crate::{recoverable_state::{RecoverableState, RecoverableStateAction, Recove
 use super::{io::SyncIO, message_io::unknown_id_err};
 
 pub enum SyncRequest<I: SyncIO, D: DeterministicState> {
+    MyAddress(I::Address),
     Ping(u64),
     SubscribeFresh,
     ShareLeaderPath,
@@ -19,6 +20,7 @@ pub enum SyncRequest<I: SyncIO, D: DeterministicState> {
 impl<I: SyncIO, D: DeterministicState> Debug for SyncRequest<I, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MyAddress(address) => write!(f, "MyAddress({address:?})"),
             Self::Ping(num) => write!(f, "Ping({})", num),
             Self::SubscribeFresh => write!(f, "SubscribeFresh"),
             Self::ShareLeaderPath => write!(f, "ShareLeaderPath"),
@@ -43,6 +45,10 @@ impl<I: SyncIO, D: DeterministicState> MessageEncoding for SyncRequest<I, D> whe
     fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
         sum += match self {
+            Self::MyAddress(addr) => {
+                sum += 0u16.write_to(out)?;
+                addr.write_to(out)?
+            }
             Self::Ping(num) => {
                 sum += 1u16.write_to(out)?;
                 num.write_to(out)?
@@ -70,6 +76,7 @@ impl<I: SyncIO, D: DeterministicState> MessageEncoding for SyncRequest<I, D> whe
 
     fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
         Ok(match u16::read_from(read)? {
+            0 => Self::MyAddress(MessageEncoding::read_from(read)?),
             1 => Self::Ping(MessageEncoding::read_from(read)?),
             3 => Self::SubscribeFresh,
             4 => Self::ShareLeaderPath,
