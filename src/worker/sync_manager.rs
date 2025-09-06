@@ -72,6 +72,8 @@ struct SyncManagerWorker<I: SyncIO, D: DeterministicState> {
     local: I::Address,
     leader: I::Address,
 
+    last_connect_attempt: Option<I::Address>,
+
     metrics: Arc<SyncManagerMetrics>,
 
     follow_state: Option<FollowState<I, D>>,
@@ -289,6 +291,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
             io,
             local,
             leader: local,
+            last_connect_attempt: None,
             metrics: Arc::new(SyncManagerMetrics::default()),
             follow_state: None,
             control_rx,
@@ -490,6 +493,11 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                 if let Some(follow) = self.follow_state.take() {
                     follow.cancel.cancel();
 
+                    tracing::warn!(
+                        remote = ?follow.remote,
+                        "cancel follow, mark peer as failed"
+                    );
+
                     match self.peers.entry(follow.remote) {
                         hash_map::Entry::Vacant(v) => {
                             v.insert(DiscoveredPeer {
@@ -541,41 +549,33 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                         break 'find self.leader;
                     }
 
-                    let best_option = self.peers.iter().filter(|(addr, _)| !self.local.eq(addr)).min_by(|(a_addr, a), (b_addr, b)| {
+                    let best_option = self.peers.iter().filter(|(addr, _)| !self.local.eq(addr)).min_by_key(|(a_addr, a)| {
                         opt_count += 1;
 
+                        if let Some(last_attempt) = &self.last_connect_attempt {
+                            if last_attempt.eq(a_addr) {
+                                return (u64::MAX, 0);
+                            }
+                        }
+
                         let now = now_ms();
-                        let mut since_a_fail = (now.max(a.last_peer_failure_epoch) - a.last_peer_failure_epoch).max(300_000);
-                        let mut since_b_fail = (now.max(b.last_peer_failure_epoch) - b.last_peer_failure_epoch).max(300_000);
+                        let mut since_fail = (now.max(a.last_peer_failure_epoch) - a.last_peer_failure_epoch).max(300_000);
 
-                        /* if leader, make fail distance 4x to give priority */
+                        /* if leader, make fail distance 2x to give priority */
                         if self.leader.eq(a_addr) {
-                            since_a_fail <<= 2;
-                        }
-                        if self.leader.eq(b_addr) {
-                            since_b_fail <<= 2;
+                            since_fail <<= 1;
                         }
 
-                        /* both failed over 1m ago */
-                        if 60_000 < since_a_fail && 60_000 < since_b_fail {
-                            /* mark larger delta as lower and round to half minute */
-                            match (since_b_fail >> 14).cmp(&(since_a_fail >> 14)) {
-                                Ordering::Equal => {}
-                                other => return other,
-                            }
+                        let since_fail_key = if 60_000 < since_fail {
+                            (since_fail >> 14) << 14
                         } else {
-                            /* mark larger delta as lower and round 4 seconds */
-                            match (since_b_fail >> 12).cmp(&(since_a_fail >> 12)) {
-                                Ordering::Equal => {}
-                                other => return other,
-                            }
-                        }
+                            (since_fail >> 12) << 12
+                        };
 
                         /* round by ~10ms */
-                        let a_latency = a.latency.as_ref().map(|v| v.latency_ms).unwrap_or(300) >> 3;
-                        let b_latency = b.latency.as_ref().map(|v| v.latency_ms).unwrap_or(300) >> 3;
+                        let latency = a.latency.as_ref().map(|v| v.latency_ms).unwrap_or(300) >> 3;
 
-                        a_latency.cmp(&b_latency)
+                        (since_fail_key, latency)
                     });
 
                     match best_option {
@@ -584,7 +584,14 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                     }
                 };
 
-                tracing::info!(option_count = opt_count, peers = self.peers.len(), target = ?connect_target, leader = ?self.leader, "found connect target");
+                tracing::info!(
+                    option_count = opt_count,
+                    peers = self.peers.len(),
+                    target = ?connect_target,
+                    leader = ?self.leader,
+                    last_connect_attempt = ?self.last_connect_attempt,
+                    "found connect target"
+                );
 
                 let local_id = self.local;
                 let io = self.io.clone();
@@ -592,6 +599,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                 let conn_timeout = self.connect_timeout;
                 let net_settings = self.net_settings.clone();
 
+                self.last_connect_attempt = Some(connect_target.clone());
                 self.waiting_for_connection_update = true;
 
                 tokio::spawn(async move {
@@ -847,6 +855,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
 
                         tracing::info!("Connected to leader with FreshState");
                         self.timers.get(Timer::RequireState).clear();
+                        self.last_connect_attempt = None;
                     }
                     SyncResponse::RecoveryAccepted(seq) => {
                         if follow.feed_updater.is_some() {
@@ -889,6 +898,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
 
                         tracing::info!("Connected to leader with Recovery");
                         self.timers.get(Timer::RequireState).clear();
+                        self.last_connect_attempt = None;
                     }
                     SyncResponse::AuthorityAction(seq, action) => {
                         let Some(updater) = follow.feed_updater.as_mut() else {
@@ -1002,7 +1012,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                     }
                     hash_map::Entry::Occupied(o) => {
                         let peer = o.into_mut();
-                        peer.last_peer_failure_epoch = now_ms();
+                        peer.last_client_msg_epoch = now_ms();
 
                         if peer.client_send.as_ref().map(|v| send.same_channel(v)).unwrap_or(true) {
                             peer.client_send = Some(send.clone());
