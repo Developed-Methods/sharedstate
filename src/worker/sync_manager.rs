@@ -1031,16 +1031,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                             return;
                         };
 
-                        let now = now_ms();
-
-                        let peers = self.peers.iter().filter_map(|(key, value)| {
-                            let last_seen = value.latency.as_ref()?.last_pong_epoch;
-                            if now < last_seen || 30_000 < now - last_seen {
-                                return None;
-                            }
-                            Some(*key)
-                        }).collect::<Vec<_>>();
-
+                        let peers = self.peers.keys().cloned().collect::<Vec<_>>();
                         permit.send(SyncResponse::Peers(peers));
                     }
                     SyncRequest::NoticePeers(peers) => {
