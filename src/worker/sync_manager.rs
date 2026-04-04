@@ -44,7 +44,12 @@ where
     D::AuthorityAction: MessageEncoding + Clone,
     D::Action: MessageEncoding,
 {
-    pub fn new(io: Arc<I>, local: I::Address, state: D, settings: SyncMangerSettings) -> Self {
+    pub fn new(
+        io: Arc<I>,
+        local: I::Address,
+        state: D,
+        settings: SyncMangerSettings<I::Address>,
+    ) -> Self {
         let (control_tx, control_rx) = channel(256);
         let worker = SyncManagerWorker::new(io, local, control_rx, state, settings);
 
@@ -323,20 +328,22 @@ struct ClientMessage<I: SyncIO, D: DeterministicState> {
     send: Sender<SyncResponse<I, D>>,
 }
 
-pub struct SyncMangerSettings {
+pub struct SyncMangerSettings<A> {
     pub broadcast: SequencedBroadcastSettings,
     pub net_io: NetIoSettings,
     pub connect_timeout: Duration,
     pub receive_state_timeout: Duration,
+    pub initial_peers: Vec<A>,
 }
 
-impl Default for SyncMangerSettings {
+impl<A> Default for SyncMangerSettings<A> {
     fn default() -> Self {
         Self {
             broadcast: Default::default(),
             net_io: Default::default(),
             connect_timeout: Duration::from_secs(8),
             receive_state_timeout: Duration::from_secs(80),
+            initial_peers: Vec::new(),
         }
     }
 }
@@ -352,10 +359,16 @@ where
         local: I::Address,
         control_rx: Receiver<ControlMessage<I>>,
         state: D,
-        settings: SyncMangerSettings,
+        settings: SyncMangerSettings<I::Address>,
     ) -> Self {
         let (client_msg_tx, client_msg_rx) = channel(2048);
         let (conn_tx, conn_rx) = channel(256);
+        let peers = settings
+            .initial_peers
+            .into_iter()
+            .filter(|addr| addr != &local)
+            .map(|addr| (addr, DiscoveredPeer::new()))
+            .collect();
 
         SyncManagerWorker {
             io,
@@ -369,7 +382,7 @@ where
             client_msg_rx,
             conn_tx,
             conn_rx,
-            peers: HashMap::new(),
+            peers,
             updater: SyncUpdater::new(local, state, settings.broadcast),
             timers: Timers::default(),
             connect_timeout: settings.connect_timeout,
@@ -1652,6 +1665,17 @@ struct DiscoveredPeer<I: SyncIO, D: DeterministicState> {
     client_send: Option<Sender<SyncResponse<I, D>>>,
 }
 
+impl<I: SyncIO, D: DeterministicState> DiscoveredPeer<I, D> {
+    fn new() -> Self {
+        Self {
+            latency: None,
+            last_peer_failure_epoch: 0,
+            last_client_msg_epoch: 0,
+            client_send: None,
+        }
+    }
+}
+
 struct Latency {
     last_pong_epoch: u64,
     latency_ms: u64,
@@ -1780,5 +1804,99 @@ mod test {
         assert_eq!(c_work.shared().read().state().numbers[0], 199);
 
         println!("DONE");
+    }
+
+    #[tokio::test]
+    async fn sync_manager_uses_initial_peers_before_discovery_test() {
+        setup_logging();
+
+        let test_net = TestSyncNet::new();
+
+        let a = test_net.io(1).await;
+        let b = test_net.io(2).await;
+        let c = test_net.io(3).await;
+
+        let a_work = {
+            let _span = tracing::info_span!("A").entered();
+            SyncManager::new(
+                a,
+                1,
+                TestState {
+                    sequence: 99999,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+        };
+        let c_work = {
+            let _span = tracing::info_span!("C").entered();
+            SyncManager::new(c, 3, TestState::default(), Default::default())
+        };
+
+        c_work.set_leader(1).await;
+
+        let tx = a_work.action_tx();
+        tx.send(TestStateAction::Set { slot: 0, value: 99 })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(c_work.shared().read().state().numbers[0], 99);
+
+        test_net.block_connection(1, 2, true).await;
+
+        let b_work = {
+            let _span = tracing::info_span!("B").entered();
+            SyncManager::new(
+                b,
+                2,
+                TestState::default(),
+                SyncMangerSettings {
+                    initial_peers: vec![3],
+                    ..Default::default()
+                },
+            )
+        };
+
+        b_work.set_leader(1).await;
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(b_work.shared().read().state().numbers[0], 99);
+
+        tx.send(TestStateAction::Add {
+            slot: 0,
+            value: 100,
+        })
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(a_work.shared().read().state().numbers[0], 199);
+        assert_eq!(b_work.shared().read().state().numbers[0], 199);
+        assert_eq!(c_work.shared().read().state().numbers[0], 199);
+    }
+
+    #[tokio::test]
+    async fn sync_manager_initial_peers_ignore_local_and_dedup_test() {
+        setup_logging();
+
+        let test_net = TestSyncNet::new();
+        let a = test_net.io(1).await;
+
+        let worker = SyncManagerWorker::<_, TestState>::new(
+            a,
+            1,
+            channel(1).1,
+            TestState::default(),
+            SyncMangerSettings {
+                initial_peers: vec![1, 2, 2, 3, 3],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(worker.peers.len(), 2);
+        assert!(!worker.peers.contains_key(&1));
+        assert!(worker.peers.contains_key(&2));
+        assert!(worker.peers.contains_key(&3));
     }
 }
