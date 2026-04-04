@@ -4,7 +4,10 @@ use sequenced_broadcast::{SequencedReceiver, SequencedSender};
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio_util::sync::CancellationToken;
 
-use crate::{state::{DeterministicState, FlushedUpdater, LeadUpdater}, utils::PanicHelper};
+use crate::{
+    state::{DeterministicState, FlushedUpdater, LeadUpdater},
+    utils::PanicHelper,
+};
 
 use super::task_and_cancel::TaskAndCancel;
 
@@ -14,7 +17,10 @@ pub struct LeadWorker<D: DeterministicState> {
     tx: SequencedSender<D::AuthorityAction>,
 }
 
-impl<D: DeterministicState> LeadWorker<D> where D::AuthorityAction: Clone {
+impl<D: DeterministicState> LeadWorker<D>
+where
+    D::AuthorityAction: Clone,
+{
     pub fn spawn(mut self) -> TaskAndCancel<Self> {
         TaskAndCancel::spawn(|cancel| async move {
             self.run_until_cancelled(cancel).await;
@@ -41,14 +47,18 @@ impl<D: DeterministicState> LeadWorker<D> where D::AuthorityAction: Clone {
             };
 
             let (seq, authority) = self.updater.queue(action);
-            self.tx.safe_send(seq, authority.clone()).await
+            self.tx
+                .safe_send(seq, authority.clone())
+                .await
                 .panic("failed to queue message in broadcast");
 
             let mut remaining = 128;
             while let Ok(action) = self.rx.try_recv() {
                 let (seq, authority) = self.updater.queue(action);
 
-                self.tx.safe_send(seq, authority.clone()).await
+                self.tx
+                    .safe_send(seq, authority.clone())
+                    .await
                     .panic("failed to queue message in broadcast");
 
                 if remaining == 0 {
@@ -74,9 +84,11 @@ impl<D: DeterministicState> LeadWorker<D> where D::AuthorityAction: Clone {
     }
 }
 
-
 impl<D: DeterministicState> LeadWorker<D> {
-    pub fn new(rx: Receiver<D::Action>, updater: FlushedUpdater<D>) -> (Self, SequencedReceiver<D::AuthorityAction>) {
+    pub fn new(
+        rx: Receiver<D::Action>,
+        updater: FlushedUpdater<D>,
+    ) -> (Self, SequencedReceiver<D::AuthorityAction>) {
         let (ch_tx, ch_rx) = channel(2048);
 
         let seq = updater.accept_seq();
@@ -89,7 +101,7 @@ impl<D: DeterministicState> LeadWorker<D> {
                 rx,
                 tx: seq_tx,
             },
-            seq_rx
+            seq_rx,
         )
     }
 
@@ -97,4 +109,3 @@ impl<D: DeterministicState> LeadWorker<D> {
         self.updater.into_flushed()
     }
 }
-

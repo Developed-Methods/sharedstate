@@ -1,14 +1,33 @@
-use std::{cmp::Ordering, collections::{hash_map, HashMap}, fmt::Debug, sync::{atomic::AtomicU64, Arc}, task::Poll, time::Duration};
+use std::{
+    collections::{hash_map, HashMap},
+    fmt::Debug,
+    sync::{atomic::AtomicU64, Arc},
+    task::Poll,
+    time::Duration,
+};
 
 use arc_metrics::{IntCounter, IntGauge};
 use futures_util::future::poll_fn;
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedBroadcastSettings, SequencedReceiver, SequencedSender};
-use tokio::{sync::mpsc::{channel, Receiver, Sender}, time::Instant};
+use tokio::{
+    sync::mpsc::{channel, Receiver, Sender},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use crate::{net::{io::{SyncConnection, SyncIO}, message_channels::{NetIoSettings, ReadChannel, WriteChannel}, messages::{SyncRequest, SyncResponse}}, recoverable_state::{RecoverableState, RecoverableStateAction, SourceId}, state::{DeterministicState, SharedState}, utils::{now_ms, LogHelper, PanicHelper}, worker::sync_updater::FollowTarget};
+use crate::{
+    net::{
+        io::{SyncConnection, SyncIO},
+        message_channels::{NetIoSettings, ReadChannel, WriteChannel},
+        messages::{SyncRequest, SyncResponse},
+    },
+    recoverable_state::{RecoverableState, RecoverableStateAction, SourceId},
+    state::{DeterministicState, SharedState},
+    utils::{now_ms, LogHelper, PanicHelper},
+    worker::sync_updater::FollowTarget,
+};
 
 use super::sync_updater::{NewFollowState, SyncUpdater};
 
@@ -19,7 +38,12 @@ pub struct SyncManager<I: SyncIO, D: DeterministicState> {
     metrics: Arc<SyncManagerMetrics>,
 }
 
-impl<I: SyncIO, D: DeterministicState> SyncManager<I, D> where D: MessageEncoding, D::AuthorityAction: MessageEncoding + Clone, D::Action: MessageEncoding {
+impl<I: SyncIO, D: DeterministicState> SyncManager<I, D>
+where
+    D: MessageEncoding,
+    D::AuthorityAction: MessageEncoding + Clone,
+    D::Action: MessageEncoding,
+{
     pub fn new(io: Arc<I>, local: I::Address, state: D, settings: SyncMangerSettings) -> Self {
         let (control_tx, control_rx) = channel(256);
         let worker = SyncManagerWorker::new(io, local, control_rx, state, settings);
@@ -28,13 +52,17 @@ impl<I: SyncIO, D: DeterministicState> SyncManager<I, D> where D: MessageEncodin
         let action_tx = worker.updater.action_tx();
         let metrics = worker.metrics.clone();
 
-        tokio::spawn(ClientAcceptor {
-            metrics: metrics.clone(),
-            msg_tx: worker.client_msg_tx.clone(),
-            net_settings: worker.net_settings.clone(),
-            io: worker.io.clone(),
-        }.start().instrument(tracing::Span::current()));
-        
+        tokio::spawn(
+            ClientAcceptor {
+                metrics: metrics.clone(),
+                msg_tx: worker.client_msg_tx.clone(),
+                net_settings: worker.net_settings.clone(),
+                io: worker.io.clone(),
+            }
+            .start()
+            .instrument(tracing::Span::current()),
+        );
+
         tokio::spawn(worker.start().instrument(tracing::Span::current()));
 
         SyncManager {
@@ -58,7 +86,10 @@ impl<I: SyncIO, D: DeterministicState> SyncManager<I, D> where D: MessageEncodin
     }
 
     pub async fn set_leader(&self, leader: I::Address) {
-        self.control_tx.send(ControlMessage::SetLeader(leader)).await.panic("worker closed");
+        self.control_tx
+            .send(ControlMessage::SetLeader(leader))
+            .await
+            .panic("worker closed");
     }
 }
 
@@ -153,7 +184,9 @@ impl Timers {
                     break 'triggered pos;
                 }
 
-                let Some(opt) = timer.expires_at else { continue };
+                let Some(opt) = timer.expires_at else {
+                    continue;
+                };
 
                 next = match next {
                     Some((time, pos)) if time < opt => Some((time, pos)),
@@ -165,11 +198,11 @@ impl Timers {
                 None => {
                     poll_fn(|_| Poll::<()>::Pending).await;
                     unreachable!()
-                },
+                }
                 Some((next, pos)) => {
                     tokio::time::sleep_until(next).await;
                     pos
-                },
+                }
             }
         };
 
@@ -236,17 +269,43 @@ enum Event<I: SyncIO, D: DeterministicState> {
 impl<I: SyncIO, D: DeterministicState> Debug for Event<I, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ClientMessage(ClientMessage { client, msg, .. }) => write!(f, "ClientMessage {{ client: {:?}, message: {:?} }}", client.source_id, msg),
-            Self::Control(ControlMessage::SetLeader(leader)) => write!(f, "SetLeader({:?})", leader),
-            Self::ConnectionUpdate(ConnectionUpdate::UpdatedFollow(FollowState { remote, .. })) => write!(f, "ConnectionUpdate::UpdatedFollow {{ remote: {:?} }}", remote),
-            Self::ConnectionUpdate(ConnectionUpdate::ConnectFailed(addr)) => write!(f, "ConnectionUpdate::ConnectFailed({:?})", addr),
+            Self::ClientMessage(ClientMessage { client, msg, .. }) => write!(
+                f,
+                "ClientMessage {{ client: {:?}, message: {:?} }}",
+                client.source_id, msg
+            ),
+            Self::Control(ControlMessage::SetLeader(leader)) => {
+                write!(f, "SetLeader({:?})", leader)
+            }
+            Self::ConnectionUpdate(ConnectionUpdate::UpdatedFollow(FollowState {
+                remote, ..
+            })) => write!(
+                f,
+                "ConnectionUpdate::UpdatedFollow {{ remote: {:?} }}",
+                remote
+            ),
+            Self::ConnectionUpdate(ConnectionUpdate::ConnectFailed(addr)) => {
+                write!(f, "ConnectionUpdate::ConnectFailed({:?})", addr)
+            }
             Self::Timer(timer) => write!(f, "Timer({:?})", timer),
-            Self::LeaderMessage(SyncResponse::LeaderPath(path)) => write!(f, "LeaderMessage::LeaderPath({:?})", path),
-            Self::LeaderMessage(SyncResponse::Pong(num)) => write!(f, "LeaderMessage::Pong({})", num),
-            Self::LeaderMessage(SyncResponse::FreshState(state)) => write!(f, "LeaderMessage::FreshState(seq: {})", state.accept_seq()),
-            Self::LeaderMessage(SyncResponse::RecoveryAccepted(seq)) => write!(f, "LeaderMessage::RecoveryAccepted(seq: {})", seq),
-            Self::LeaderMessage(SyncResponse::Peers(peers)) => write!(f, "LeaderMessage::Peers(count: {})", peers.len()),
-            Self::LeaderMessage(SyncResponse::AuthorityAction(seq, _)) => write!(f, "LeaderMessage::AuthorityAction(seq: {})", seq),
+            Self::LeaderMessage(SyncResponse::LeaderPath(path)) => {
+                write!(f, "LeaderMessage::LeaderPath({:?})", path)
+            }
+            Self::LeaderMessage(SyncResponse::Pong(num)) => {
+                write!(f, "LeaderMessage::Pong({})", num)
+            }
+            Self::LeaderMessage(SyncResponse::FreshState(state)) => {
+                write!(f, "LeaderMessage::FreshState(seq: {})", state.accept_seq())
+            }
+            Self::LeaderMessage(SyncResponse::RecoveryAccepted(seq)) => {
+                write!(f, "LeaderMessage::RecoveryAccepted(seq: {})", seq)
+            }
+            Self::LeaderMessage(SyncResponse::Peers(peers)) => {
+                write!(f, "LeaderMessage::Peers(count: {})", peers.len())
+            }
+            Self::LeaderMessage(SyncResponse::AuthorityAction(seq, _)) => {
+                write!(f, "LeaderMessage::AuthorityAction(seq: {})", seq)
+            }
             Self::Shutdown => write!(f, "Shutdown"),
             // _ => write!(f, "TODO"),
         }
@@ -282,8 +341,19 @@ impl Default for SyncMangerSettings {
     }
 }
 
-impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageEncoding, D::AuthorityAction: MessageEncoding + Clone, D::Action: MessageEncoding {
-    fn new(io: Arc<I>, local: I::Address, control_rx: Receiver<ControlMessage<I>>, state: D, settings: SyncMangerSettings) -> Self {
+impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D>
+where
+    D: MessageEncoding,
+    D::AuthorityAction: MessageEncoding + Clone,
+    D::Action: MessageEncoding,
+{
+    fn new(
+        io: Arc<I>,
+        local: I::Address,
+        control_rx: Receiver<ControlMessage<I>>,
+        state: D,
+        settings: SyncMangerSettings,
+    ) -> Self {
         let (client_msg_tx, client_msg_rx) = channel(2048);
         let (conn_tx, conn_rx) = channel(256);
 
@@ -453,8 +523,15 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
 
             let event = self.next_event().await;
             let shutdown = matches!(event, Event::Shutdown);
-            
-            if !matches!(event, Event::LeaderMessage(SyncResponse::AuthorityAction(..)) | Event::ClientMessage(ClientMessage { msg: SyncRequest::Action { .. }, .. })) {
+
+            if !matches!(
+                event,
+                Event::LeaderMessage(SyncResponse::AuthorityAction(..))
+                    | Event::ClientMessage(ClientMessage {
+                        msg: SyncRequest::Action { .. },
+                        ..
+                    })
+            ) {
                 tracing::info!("Next Event: {:?}", event);
             }
 
@@ -482,7 +559,9 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                 }
 
                 tracing::info!("Broadcasted {} peers to {} peers", peers.len(), count);
-                self.timers.get(Timer::BroadcastPeers).set_earlier(Duration::from_secs(30));
+                self.timers
+                    .get(Timer::BroadcastPeers)
+                    .set_earlier(Duration::from_secs(30));
             }
             Event::Timer(Timer::RejectPeer | Timer::RequireVerifyLeader | Timer::RequireState) => {
                 self.timers.get(Timer::RejectPeer).clear();
@@ -504,7 +583,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                                 latency: None,
                                 last_peer_failure_epoch: now_ms(),
                                 last_client_msg_epoch: 0,
-                                client_send: None
+                                client_send: None,
                             });
                         }
                         hash_map::Entry::Occupied(o) => {
@@ -515,20 +594,32 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
 
                 if self.leader != self.local {
                     self.updater.go_offline().await;
-                    self.timers.get(Timer::ConnectToPeer).set_earlier(Duration::from_secs(1));
+                    self.timers
+                        .get(Timer::ConnectToPeer)
+                        .set_earlier(Duration::from_secs(1));
                 } else {
                     assert!(self.updater.is_leading());
                 }
             }
             Event::Timer(Timer::SendVerifyLeader) => {
-                let Some(follow) = &self.follow_state else { return };
+                let Some(follow) = &self.follow_state else {
+                    return;
+                };
 
-                if follow.to_leader.try_send(SyncRequest::ShareLeaderPath).is_err() {
+                if follow
+                    .to_leader
+                    .try_send(SyncRequest::ShareLeaderPath)
+                    .is_err()
+                {
                     self.metrics.error_failed_to_ask_leader.inc();
-                    self.timers.get(Timer::RequireVerifyLeader).extend(Duration::from_secs(2), Duration::from_secs(30));
+                    self.timers
+                        .get(Timer::RequireVerifyLeader)
+                        .extend(Duration::from_secs(2), Duration::from_secs(30));
                 }
 
-                self.timers.get(Timer::SendVerifyLeader).set_earlier(Duration::from_secs(30));
+                self.timers
+                    .get(Timer::SendVerifyLeader)
+                    .set_earlier(Duration::from_secs(30));
             }
             Event::Timer(Timer::ConnectToPeer) => {
                 if self.leader == self.local {
@@ -549,38 +640,45 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                         break 'find self.leader;
                     }
 
-                    let best_option = self.peers.iter().filter(|(addr, _)| !self.local.eq(addr)).min_by_key(|(a_addr, a)| {
-                        opt_count += 1;
+                    let best_option = self
+                        .peers
+                        .iter()
+                        .filter(|(addr, _)| !self.local.eq(addr))
+                        .min_by_key(|(a_addr, a)| {
+                            opt_count += 1;
 
-                        if let Some(last_attempt) = &self.last_connect_attempt {
-                            if last_attempt.eq(a_addr) {
-                                return (u64::MAX, 0);
+                            if let Some(last_attempt) = &self.last_connect_attempt {
+                                if last_attempt.eq(a_addr) {
+                                    return (u64::MAX, 0);
+                                }
                             }
-                        }
 
-                        let now = now_ms();
-                        let mut since_fail = (now.max(a.last_peer_failure_epoch) - a.last_peer_failure_epoch).max(300_000);
+                            let now = now_ms();
+                            let mut since_fail = (now.max(a.last_peer_failure_epoch)
+                                - a.last_peer_failure_epoch)
+                                .max(300_000);
 
-                        /* if leader, make fail distance 2x to give priority */
-                        if self.leader.eq(a_addr) {
-                            since_fail <<= 1;
-                        }
+                            /* if leader, make fail distance 2x to give priority */
+                            if self.leader.eq(a_addr) {
+                                since_fail <<= 1;
+                            }
 
-                        let since_fail_key = if 60_000 < since_fail {
-                            (since_fail >> 14) << 14
-                        } else {
-                            (since_fail >> 12) << 12
-                        };
+                            let since_fail_key = if 60_000 < since_fail {
+                                (since_fail >> 14) << 14
+                            } else {
+                                (since_fail >> 12) << 12
+                            };
 
-                        /* round by ~10ms */
-                        let latency = a.latency.as_ref().map(|v| v.latency_ms).unwrap_or(300) >> 3;
+                            /* round by ~10ms */
+                            let latency =
+                                a.latency.as_ref().map(|v| v.latency_ms).unwrap_or(300) >> 3;
 
-                        (since_fail_key, latency)
-                    });
+                            (since_fail_key, latency)
+                        });
 
                     match best_option {
                         Some((addr, _)) => *addr,
-                        None => self.leader
+                        None => self.leader,
                     }
                 };
 
@@ -602,198 +700,268 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                 self.last_connect_attempt = Some(connect_target.clone());
                 self.waiting_for_connection_update = true;
 
-                tokio::spawn(async move {
-                    let cancel = CancellationToken::new();
+                tokio::spawn(
+                    async move {
+                        let cancel = CancellationToken::new();
 
-                    let conn_update = 'connect: {
-                        let conn_res = tokio::time::timeout(conn_timeout, io.connect(&connect_target)).await;
+                        let conn_update = 'connect: {
+                            let conn_res =
+                                tokio::time::timeout(conn_timeout, io.connect(&connect_target))
+                                    .await;
 
-                        let conn = match conn_res {
-                            Ok(Ok(conn)) => {
-                                tracing::info!("connected to target");
-                                conn
-                            },
-                            Err(_) => {
-                                tracing::error!("timeout connecting to peer");
-                                break 'connect ConnectionUpdate::ConnectFailed(connect_target);
-                            }
-                            Ok(Err(error)) => {
-                                tracing::error!(?error, "io error connecting to peer");
-                                break 'connect ConnectionUpdate::ConnectFailed(connect_target);
-                            }
-                        };
-
-                        let mut from_server = {
-                            let (from_server_tx, from_server_rx) = channel::<SyncResponse<I, D>>(1024);
-
-                            tokio::spawn(cancel.clone().run_until_cancelled_owned(
-                                ReadChannel::<I, _> {
-                                    input: conn.read,
-                                    output: from_server_tx,
-                                    settings: net_settings.clone(),
-                                }.start().instrument(tracing::info_span!("ReadPeer", remote = ?conn.remote))
-                            ));
-
-                            from_server_rx
-                        };
-
-                        let to_server = {
-                            let (to_server_tx, to_server_rx) = channel::<SyncRequest<I, D>>(1024);
-
-                            tokio::spawn(cancel.clone().run_until_cancelled_owned(
-                                WriteChannel::<I, _> {
-                                    input: to_server_rx,
-                                    output: conn.write,
-                                    settings: net_settings,
-                                }.start().instrument(tracing::info_span!("WritePeer", remote = ?conn.remote))
-                            ));
-
-                            to_server_tx
-                        };
-
-                        if to_server.send(SyncRequest::MyAddress(local_id)).await.is_err() {
-                            tracing::error!("failed to send initial MyAddress message to upstream");
-                        }
-
-                        {
-                            let now = now_ms();
-                            if to_server.send(SyncRequest::Ping(now)).await.err_log("new send channel is closed").is_err() {
-                                break 'connect ConnectionUpdate::ConnectFailed(connect_target);
-                            }
-
-                            tracing::info!("send ping to peer, waiting for pong");
-
-                            let pong_res = tokio::time::timeout(Duration::from_secs(5), from_server.recv()).await;
-                            let latency = match pong_res {
+                            let conn = match conn_res {
+                                Ok(Ok(conn)) => {
+                                    tracing::info!("connected to target");
+                                    conn
+                                }
                                 Err(_) => {
-                                    tracing::error!("timeout waiting for pong from peer");
+                                    tracing::error!("timeout connecting to peer");
                                     break 'connect ConnectionUpdate::ConnectFailed(connect_target);
                                 }
-                                Ok(None) => {
-                                    tracing::error!("channel closed waiting for pong");
-                                    break 'connect ConnectionUpdate::ConnectFailed(connect_target);
-                                }
-                                Ok(Some(SyncResponse::Pong(pong))) if pong == now => {
-                                    now_ms() - pong
-                                }
-                                Ok(Some(_)) => {
-                                    tracing::error!("got unexpected ping response");
+                                Ok(Err(error)) => {
+                                    tracing::error!(?error, "io error connecting to peer");
                                     break 'connect ConnectionUpdate::ConnectFailed(connect_target);
                                 }
                             };
 
-                            tracing::info!(latency, "got pong from peer");
-                        }
+                            let mut from_server = {
+                                let (from_server_tx, from_server_rx) =
+                                    channel::<SyncResponse<I, D>>(1024);
 
-                        let leader_path = {
-                            if to_server.send(SyncRequest::ShareLeaderPath).await.err_log("new send channel is closed").is_err() {
-                                break 'connect ConnectionUpdate::ConnectFailed(connect_target);
+                                tokio::spawn(
+                                    cancel.clone().run_until_cancelled_owned(
+                                        ReadChannel::<I, _> {
+                                            input: conn.read,
+                                            output: from_server_tx,
+                                            settings: net_settings.clone(),
+                                        }
+                                        .start()
+                                        .instrument(
+                                            tracing::info_span!("ReadPeer", remote = ?conn.remote),
+                                        ),
+                                    ),
+                                );
+
+                                from_server_rx
+                            };
+
+                            let to_server = {
+                                let (to_server_tx, to_server_rx) =
+                                    channel::<SyncRequest<I, D>>(1024);
+
+                                tokio::spawn(
+                                    cancel.clone().run_until_cancelled_owned(
+                                        WriteChannel::<I, _> {
+                                            input: to_server_rx,
+                                            output: conn.write,
+                                            settings: net_settings,
+                                        }
+                                        .start()
+                                        .instrument(
+                                            tracing::info_span!("WritePeer", remote = ?conn.remote),
+                                        ),
+                                    ),
+                                );
+
+                                to_server_tx
+                            };
+
+                            if to_server
+                                .send(SyncRequest::MyAddress(local_id))
+                                .await
+                                .is_err()
+                            {
+                                tracing::error!(
+                                    "failed to send initial MyAddress message to upstream"
+                                );
                             }
 
-                            tracing::info!("request leader path from peer");
+                            {
+                                let now = now_ms();
+                                if to_server
+                                    .send(SyncRequest::Ping(now))
+                                    .await
+                                    .err_log("new send channel is closed")
+                                    .is_err()
+                                {
+                                    break 'connect ConnectionUpdate::ConnectFailed(connect_target);
+                                }
 
-                            let peer_res = tokio::time::timeout(Duration::from_secs(5), from_server.recv()).await;
-                            match peer_res {
-                                Err(_) => {
-                                    tracing::error!("timeout waiting for path to leader");
-                                    break 'connect ConnectionUpdate::ConnectFailed(connect_target);
-                                }
-                                Ok(None) => {
-                                    tracing::error!("channel closed waiting for leader path");
-                                    break 'connect ConnectionUpdate::ConnectFailed(connect_target);
-                                }
-                                Ok(Some(SyncResponse::LeaderPath(path))) => {
-                                    path
-                                }
-                                Ok(Some(_)) => {
-                                    tracing::error!("got unexpected leader path response");
-                                    break 'connect ConnectionUpdate::ConnectFailed(connect_target);
-                                }
+                                tracing::info!("send ping to peer, waiting for pong");
+
+                                let pong_res = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    from_server.recv(),
+                                )
+                                .await;
+                                let latency = match pong_res {
+                                    Err(_) => {
+                                        tracing::error!("timeout waiting for pong from peer");
+                                        break 'connect ConnectionUpdate::ConnectFailed(
+                                            connect_target,
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        tracing::error!("channel closed waiting for pong");
+                                        break 'connect ConnectionUpdate::ConnectFailed(
+                                            connect_target,
+                                        );
+                                    }
+                                    Ok(Some(SyncResponse::Pong(pong))) if pong == now => {
+                                        now_ms() - pong
+                                    }
+                                    Ok(Some(_)) => {
+                                        tracing::error!("got unexpected ping response");
+                                        break 'connect ConnectionUpdate::ConnectFailed(
+                                            connect_target,
+                                        );
+                                    }
+                                };
+
+                                tracing::info!(latency, "got pong from peer");
                             }
+
+                            let leader_path = {
+                                if to_server
+                                    .send(SyncRequest::ShareLeaderPath)
+                                    .await
+                                    .err_log("new send channel is closed")
+                                    .is_err()
+                                {
+                                    break 'connect ConnectionUpdate::ConnectFailed(connect_target);
+                                }
+
+                                tracing::info!("request leader path from peer");
+
+                                let peer_res = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    from_server.recv(),
+                                )
+                                .await;
+                                match peer_res {
+                                    Err(_) => {
+                                        tracing::error!("timeout waiting for path to leader");
+                                        break 'connect ConnectionUpdate::ConnectFailed(
+                                            connect_target,
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        tracing::error!("channel closed waiting for leader path");
+                                        break 'connect ConnectionUpdate::ConnectFailed(
+                                            connect_target,
+                                        );
+                                    }
+                                    Ok(Some(SyncResponse::LeaderPath(path))) => path,
+                                    Ok(Some(_)) => {
+                                        tracing::error!("got unexpected leader path response");
+                                        break 'connect ConnectionUpdate::ConnectFailed(
+                                            connect_target,
+                                        );
+                                    }
+                                }
+                            };
+
+                            let _ = to_server.try_send(SyncRequest::SendMePeers);
+
+                            ConnectionUpdate::UpdatedFollow(FollowState {
+                                remote: conn.remote,
+                                leader_path,
+                                to_leader: to_server,
+                                from_leader: from_server,
+                                cancel: cancel.clone(),
+                                feed_updater: None,
+                            })
                         };
 
-                        let _ = to_server.try_send(SyncRequest::SendMePeers);
+                        if matches!(conn_update, ConnectionUpdate::ConnectFailed(_)) {
+                            cancel.cancel();
+                        }
 
-                        ConnectionUpdate::UpdatedFollow(FollowState {
-                            remote: conn.remote,
-                            leader_path,
-                            to_leader: to_server,
-                            from_leader: from_server,
-                            cancel: cancel.clone(),
-                            feed_updater: None,
-                        })
-                    };
-
-                    if matches!(conn_update, ConnectionUpdate::ConnectFailed(_)) {
-                        cancel.cancel();
+                        let _ = conn_tx
+                            .send(conn_update)
+                            .await
+                            .err_log("failed to queue connection update");
                     }
-
-                    let _ = conn_tx.send(conn_update).await
-                        .err_log("failed to queue connection update");
-                }.instrument(tracing::info_span!("connect", target = ?connect_target)));
+                    .instrument(tracing::info_span!("connect", target = ?connect_target)),
+                );
             }
-            Event::ConnectionUpdate(update) => {
-                match update {
-                    ConnectionUpdate::ConnectFailed(address) => {
-                        match self.peers.entry(address) {
-                            hash_map::Entry::Vacant(v) => {
-                                v.insert(DiscoveredPeer {
-                                    latency: None,
-                                    last_peer_failure_epoch: now_ms(),
-                                    last_client_msg_epoch: 0,
-                                    client_send: None,
-                                });
-                            },
-                            hash_map::Entry::Occupied(o) => {
-                                o.into_mut().last_peer_failure_epoch = now_ms();
-                            }
+            Event::ConnectionUpdate(update) => match update {
+                ConnectionUpdate::ConnectFailed(address) => {
+                    match self.peers.entry(address) {
+                        hash_map::Entry::Vacant(v) => {
+                            v.insert(DiscoveredPeer {
+                                latency: None,
+                                last_peer_failure_epoch: now_ms(),
+                                last_client_msg_epoch: 0,
+                                client_send: None,
+                            });
                         }
-
-                        self.timers.get(Timer::ConnectToPeer).set_earlier(Duration::from_secs(1));
+                        hash_map::Entry::Occupied(o) => {
+                            o.into_mut().last_peer_failure_epoch = now_ms();
+                        }
                     }
-                    ConnectionUpdate::UpdatedFollow(follow) => {
-                        if let Some(existing) = self.follow_state.replace(follow) {
-                            existing.cancel.cancel();
-                        }
 
-                        let state = self.follow_state.as_ref()
-                            .panic("just set follow, should not be missing");
-
-                        self.timers.get(Timer::ConnectToPeer).clear();
-
-                        if self.leader == self.local {
-                            let removed = self.follow_state.take().unwrap();
-                            removed.cancel.cancel();
-                            assert!(self.updater.is_leading());
-                            return;
-                        }
-
-                        if state.leader_path.is_empty() || state.leader_path[0] != self.leader || state.leader_path.contains(&self.local) {
-                            tracing::error!(
-                                path = ?state.leader_path,
-                                peer = ?state.remote,
-                                leader = ?self.leader,
-                                local = ?self.local,
-                                "peer we're following has invalid leader path"
-                            );
-                            self.timers.get(Timer::RejectPeer).now();
-                            return;
-                        }
-
-                        let details = self.updater.go_offline().await.recovery_details();
-
-                        if state.to_leader.try_send(SyncRequest::SubscribeRecovery(details)).is_err() {
-                            tracing::error!("failed to send recovery request to peer");
-                            self.timers.get(Timer::RejectPeer).now();
-                            return;
-                        }
-
-                        self.timers.get(Timer::SendVerifyLeader).set(Duration::from_secs(10));
-                        self.timers.get(Timer::RequireVerifyLeader).set(Duration::from_secs(30));
-                        self.timers.get(Timer::RequireState).set(self.receive_state_timeout);
-                    }
+                    self.timers
+                        .get(Timer::ConnectToPeer)
+                        .set_earlier(Duration::from_secs(1));
                 }
-            }
+                ConnectionUpdate::UpdatedFollow(follow) => {
+                    if let Some(existing) = self.follow_state.replace(follow) {
+                        existing.cancel.cancel();
+                    }
+
+                    let state = self
+                        .follow_state
+                        .as_ref()
+                        .panic("just set follow, should not be missing");
+
+                    self.timers.get(Timer::ConnectToPeer).clear();
+
+                    if self.leader == self.local {
+                        let removed = self.follow_state.take().unwrap();
+                        removed.cancel.cancel();
+                        assert!(self.updater.is_leading());
+                        return;
+                    }
+
+                    if state.leader_path.is_empty()
+                        || state.leader_path[0] != self.leader
+                        || state.leader_path.contains(&self.local)
+                    {
+                        tracing::error!(
+                            path = ?state.leader_path,
+                            peer = ?state.remote,
+                            leader = ?self.leader,
+                            local = ?self.local,
+                            "peer we're following has invalid leader path"
+                        );
+                        self.timers.get(Timer::RejectPeer).now();
+                        return;
+                    }
+
+                    let details = self.updater.go_offline().await.recovery_details();
+
+                    if state
+                        .to_leader
+                        .try_send(SyncRequest::SubscribeRecovery(details))
+                        .is_err()
+                    {
+                        tracing::error!("failed to send recovery request to peer");
+                        self.timers.get(Timer::RejectPeer).now();
+                        return;
+                    }
+
+                    self.timers
+                        .get(Timer::SendVerifyLeader)
+                        .set(Duration::from_secs(10));
+                    self.timers
+                        .get(Timer::RequireVerifyLeader)
+                        .set(Duration::from_secs(30));
+                    self.timers
+                        .get(Timer::RequireState)
+                        .set(self.receive_state_timeout);
+                }
+            },
             Event::LeaderMessage(msg) => {
                 let follow = self.follow_state.as_mut().panic("follow_state missing");
 
@@ -813,7 +981,7 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                                     last_client_msg_epoch: 0,
                                     client_send: None,
                                 });
-                            },
+                            }
                             hash_map::Entry::Occupied(o) => {
                                 o.into_mut().latency.replace(latency);
                             }
@@ -830,27 +998,42 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                         let (authority_tx, authority_rx) = channel(1024);
                         let seq = state.accept_seq();
 
-                        self.updater.follow(action_tx, NewFollowState {
-                            state,
-                            authority_rx: SequencedReceiver::new(seq, authority_rx),
-                        }.try_into_valid().panic("could not create valid follow state")).await;
+                        self.updater
+                            .follow(
+                                action_tx,
+                                NewFollowState {
+                                    state,
+                                    authority_rx: SequencedReceiver::new(seq, authority_rx),
+                                }
+                                .try_into_valid()
+                                .panic("could not create valid follow state"),
+                            )
+                            .await;
 
                         follow.feed_updater = Some(SequencedSender::new(seq, authority_tx));
 
                         /* forward actions to leader */
                         {
                             let to_leader = follow.to_leader.clone();
-                            tokio::spawn(follow.cancel.clone().run_until_cancelled_owned(async move {
-                                while let Some((source, action)) = action_rx.recv().await {
-                                    tokio::task::yield_now().await;
-                                    if to_leader.send(SyncRequest::Action { source, action }).await.is_err() {
-                                        break;
+                            tokio::spawn(follow.cancel.clone().run_until_cancelled_owned(
+                                async move {
+                                    while let Some((source, action)) = action_rx.recv().await {
+                                        tokio::task::yield_now().await;
+                                        if to_leader
+                                            .send(SyncRequest::Action { source, action })
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
-                                }
 
-                                tokio::task::yield_now().await;
-                                tracing::error!("forwarding action to leader task stopped without cancel");
-                            }));
+                                    tokio::task::yield_now().await;
+                                    tracing::error!(
+                                        "forwarding action to leader task stopped without cancel"
+                                    );
+                                },
+                            ));
                         }
 
                         tracing::info!("Connected to leader with FreshState");
@@ -867,10 +1050,16 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                         let (action_tx, mut action_rx) = channel(1024);
                         let (authority_tx, authority_rx) = channel(1024);
 
-                        let success = self.updater.try_follow(action_tx, FollowTarget {
-                            leader_state_check: None,
-                            authority_rx: SequencedReceiver::new(seq, authority_rx),
-                        }).await;
+                        let success = self
+                            .updater
+                            .try_follow(
+                                action_tx,
+                                FollowTarget {
+                                    leader_state_check: None,
+                                    authority_rx: SequencedReceiver::new(seq, authority_rx),
+                                },
+                            )
+                            .await;
 
                         if !success {
                             tracing::error!("failed to recover connection from leader");
@@ -883,17 +1072,25 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                         /* forward actions to leader */
                         {
                             let to_leader = follow.to_leader.clone();
-                            tokio::spawn(follow.cancel.clone().run_until_cancelled_owned(async move {
-                                while let Some((source, action)) = action_rx.recv().await {
-                                    tokio::task::yield_now().await;
-                                    if to_leader.send(SyncRequest::Action { source, action }).await.is_err() {
-                                        break;
+                            tokio::spawn(follow.cancel.clone().run_until_cancelled_owned(
+                                async move {
+                                    while let Some((source, action)) = action_rx.recv().await {
+                                        tokio::task::yield_now().await;
+                                        if to_leader
+                                            .send(SyncRequest::Action { source, action })
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
                                     }
-                                }
 
-                                tokio::task::yield_now().await;
-                                tracing::error!("forwarding action to leader task stopped without cancel");
-                            }));
+                                    tokio::task::yield_now().await;
+                                    tracing::error!(
+                                        "forwarding action to leader task stopped without cancel"
+                                    );
+                                },
+                            ));
                         }
 
                         tracing::info!("Connected to leader with Recovery");
@@ -935,17 +1132,23 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                             true
                         };
 
-
                         if is_valid {
                             follow.leader_path = path;
 
-                            self.timers.get(Timer::SendVerifyLeader).set_earlier(Duration::from_secs(10));
-                            self.timers.get(Timer::RequireVerifyLeader).set(Duration::from_secs(40));
+                            self.timers
+                                .get(Timer::SendVerifyLeader)
+                                .set_earlier(Duration::from_secs(10));
+                            self.timers
+                                .get(Timer::RequireVerifyLeader)
+                                .set(Duration::from_secs(40));
                         } else {
                             follow.leader_path = vec![];
 
-                            self.timers.get(Timer::SendVerifyLeader).set_earlier(Duration::from_secs(2));
-                            self.timers.get(Timer::RequireVerifyLeader)
+                            self.timers
+                                .get(Timer::SendVerifyLeader)
+                                .set_earlier(Duration::from_secs(2));
+                            self.timers
+                                .get(Timer::RequireVerifyLeader)
                                 .extend(Duration::from_secs(4), Duration::from_secs(20))
                                 .set_earlier(Duration::from_secs(2) + self.connect_timeout);
                         }
@@ -982,10 +1185,16 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                     tracing::info!("self set as leader");
                     self.updater.lead().await;
                 } else if self.follow_state.is_some() {
-                    tracing::info!("leader changed but connected to peer already, queue confirm request");
+                    tracing::info!(
+                        "leader changed but connected to peer already, queue confirm request"
+                    );
 
-                    self.timers.get(Timer::SendVerifyLeader).set_earlier(Duration::from_secs(2));
-                    self.timers.get(Timer::RequireVerifyLeader).set(Duration::from_secs(10));
+                    self.timers
+                        .get(Timer::SendVerifyLeader)
+                        .set_earlier(Duration::from_secs(2));
+                    self.timers
+                        .get(Timer::RequireVerifyLeader)
+                        .set(Duration::from_secs(10));
                 } else {
                     self.updater.go_offline().await;
 
@@ -1001,7 +1210,9 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                 match self.peers.entry(client.source_id) {
                     hash_map::Entry::Vacant(v) => {
                         tracing::info!(client_id = ?client.source_id, "Discovered Peer");
-                        self.timers.get(Timer::BroadcastPeers).extend(Duration::from_secs(1), Duration::from_secs(5));
+                        self.timers
+                            .get(Timer::BroadcastPeers)
+                            .extend(Duration::from_secs(1), Duration::from_secs(5));
 
                         v.insert(DiscoveredPeer {
                             latency: None,
@@ -1014,7 +1225,12 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                         let peer = o.into_mut();
                         peer.last_client_msg_epoch = now_ms();
 
-                        if peer.client_send.as_ref().map(|v| send.same_channel(v)).unwrap_or(true) {
+                        if peer
+                            .client_send
+                            .as_ref()
+                            .map(|v| send.same_channel(v))
+                            .unwrap_or(true)
+                        {
                             peer.client_send = Some(send.clone());
                         }
                     }
@@ -1073,7 +1289,10 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                             vec![]
                         };
 
-                        if send.try_send(SyncResponse::LeaderPath(leader_path)).is_err() {
+                        if send
+                            .try_send(SyncResponse::LeaderPath(leader_path))
+                            .is_err()
+                        {
                             self.metrics.client_send_dropped.inc();
                         }
                     }
@@ -1087,10 +1306,19 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                     SyncRequest::SubscribeRecovery(recovery) => {
                         self.metrics.client_req_recover.inc();
 
-                        let Some(mut follow_target) = self.updater.add_subscriber(recovery).await else {
+                        let Some(mut follow_target) = self.updater.add_subscriber(recovery).await
+                        else {
                             self.metrics.client_recovery_fails.inc();
 
-                            if self.client_msg_tx.try_send(ClientMessage { client: client.clone(), msg: SyncRequest::SubscribeFresh, send }).is_err() {
+                            if self
+                                .client_msg_tx
+                                .try_send(ClientMessage {
+                                    client: client.clone(),
+                                    msg: SyncRequest::SubscribeFresh,
+                                    send,
+                                })
+                                .is_err()
+                            {
                                 self.metrics.event_queue_fail.inc();
                                 client.cancel.cancel();
                             }
@@ -1098,10 +1326,15 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                             return;
                         };
 
-                        let exclusive = client.mode.compare_exchange(
-                            MODE_CONNECTING, MODE_CONNECTED,
-                            std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst
-                        ).is_ok();
+                        let exclusive = client
+                            .mode
+                            .compare_exchange(
+                                MODE_CONNECTING,
+                                MODE_CONNECTED,
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                            )
+                            .is_ok();
 
                         if !exclusive {
                             self.metrics.client_dual_connect_error.inc();
@@ -1109,14 +1342,24 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                         }
 
                         tokio::spawn(client.cancel.clone().run_until_cancelled_owned(async move {
-                            if send.send(SyncResponse::RecoveryAccepted(follow_target.authority_rx.next_seq())).await.is_err() {
+                            if send
+                                .send(SyncResponse::RecoveryAccepted(
+                                    follow_target.authority_rx.next_seq(),
+                                ))
+                                .await
+                                .is_err()
+                            {
                                 client.cancel.cancel();
                                 return;
                             }
 
                             while let Some(msg) = follow_target.authority_rx.recv().await {
                                 tokio::task::yield_now().await;
-                                if send.send(SyncResponse::AuthorityAction(msg.0, msg.1)).await.is_err() {
+                                if send
+                                    .send(SyncResponse::AuthorityAction(msg.0, msg.1))
+                                    .await
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
@@ -1127,10 +1370,15 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
                     SyncRequest::SubscribeFresh => {
                         self.metrics.client_req_fresh.inc();
 
-                        let exclusive = client.mode.compare_exchange(
-                            MODE_CONNECTING, MODE_CONNECTED,
-                            std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst
-                        ).is_ok();
+                        let exclusive = client
+                            .mode
+                            .compare_exchange(
+                                MODE_CONNECTING,
+                                MODE_CONNECTED,
+                                std::sync::atomic::Ordering::SeqCst,
+                                std::sync::atomic::Ordering::SeqCst,
+                            )
+                            .is_ok();
 
                         if !exclusive {
                             self.metrics.client_dual_connect_error.inc();
@@ -1157,7 +1405,11 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
 
                             while let Some(msg) = authority_rx.recv().await {
                                 tokio::task::yield_now().await;
-                                if send.send(SyncResponse::AuthorityAction(msg.0, msg.1)).await.is_err() {
+                                if send
+                                    .send(SyncResponse::AuthorityAction(msg.0, msg.1))
+                                    .await
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
@@ -1169,8 +1421,6 @@ impl<I: SyncIO, D: DeterministicState> SyncManagerWorker<I, D> where D: MessageE
             }
         }
     }
-
-
 }
 
 struct ClientAcceptor<I: SyncIO, D: DeterministicState> {
@@ -1180,7 +1430,12 @@ struct ClientAcceptor<I: SyncIO, D: DeterministicState> {
     metrics: Arc<SyncManagerMetrics>,
 }
 
-impl<I: SyncIO, D: DeterministicState> ClientAcceptor<I, D> where D: MessageEncoding, D::AuthorityAction: MessageEncoding + Clone, D::Action: MessageEncoding {
+impl<I: SyncIO, D: DeterministicState> ClientAcceptor<I, D>
+where
+    D: MessageEncoding,
+    D::AuthorityAction: MessageEncoding + Clone,
+    D::Action: MessageEncoding,
+{
     pub async fn start(self) {
         loop {
             tokio::task::yield_now().await;
@@ -1218,13 +1473,17 @@ impl<I: SyncIO, D: DeterministicState> ClientAcceptor<I, D> where D: MessageEnco
             let mut from_client = {
                 let (from_client_tx, from_client_rx) = channel::<SyncRequest<I, D>>(1024);
 
-                tokio::spawn(cancel.clone().run_until_cancelled_owned(
-                    ReadChannel::<I, _> {
-                        input: client.read,
-                        output: from_client_tx,
-                        settings: net_settings.clone(),
-                    }.start().instrument(tracing::info_span!("ReadClient", remote = ?client.remote))
-                ));
+                tokio::spawn(
+                    cancel.clone().run_until_cancelled_owned(
+                        ReadChannel::<I, _> {
+                            input: client.read,
+                            output: from_client_tx,
+                            settings: net_settings.clone(),
+                        }
+                        .start()
+                        .instrument(tracing::info_span!("ReadClient", remote = ?client.remote)),
+                    ),
+                );
 
                 from_client_rx
             };
@@ -1232,13 +1491,16 @@ impl<I: SyncIO, D: DeterministicState> ClientAcceptor<I, D> where D: MessageEnco
             let addr_res = tokio::time::timeout(Duration::from_secs(1), async {
                 'get_addr: {
                     while let Some(msg) = from_client.recv().await {
-                        let SyncRequest::MyAddress(addr) = msg else { continue };
+                        let SyncRequest::MyAddress(addr) = msg else {
+                            continue;
+                        };
                         break 'get_addr Some(addr);
                     }
 
                     None
                 }
-            }).await;
+            })
+            .await;
 
             let Ok(Some(addr)) = addr_res else {
                 tracing::error!("failed to get address from peer");
@@ -1255,13 +1517,17 @@ impl<I: SyncIO, D: DeterministicState> ClientAcceptor<I, D> where D: MessageEnco
             let to_client = {
                 let (to_client_tx, to_client_rx) = channel::<SyncResponse<I, D>>(1024);
 
-                tokio::spawn(state.cancel.clone().run_until_cancelled_owned(
+                tokio::spawn(
+                    state.cancel.clone().run_until_cancelled_owned(
                         WriteChannel::<I, _> {
                             input: to_client_rx,
                             output: client.write,
                             settings: net_settings,
-                        }.start().instrument(tracing::info_span!("WriteClient", remote = ?client.remote))
-                ));
+                        }
+                        .start()
+                        .instrument(tracing::info_span!("WriteClient", remote = ?client.remote)),
+                    ),
+                );
 
                 to_client_tx
             };
@@ -1269,17 +1535,31 @@ impl<I: SyncIO, D: DeterministicState> ClientAcceptor<I, D> where D: MessageEnco
             tokio::spawn(async move {
                 metrics.clients_connected.inc();
 
-                state.cancel.clone().run_until_cancelled_owned(async move {
-                    while let Some(msg) = from_client.recv().await {
-                        tokio::task::yield_now().await;
-                        if event_tx.send(ClientMessage { client: state.clone(), msg, send: to_client.clone() }).await.is_err() {
-                            tracing::warn!("SyncManager worker closed, stopping read from client");
-                            break;
+                state
+                    .cancel
+                    .clone()
+                    .run_until_cancelled_owned(async move {
+                        while let Some(msg) = from_client.recv().await {
+                            tokio::task::yield_now().await;
+                            if event_tx
+                                .send(ClientMessage {
+                                    client: state.clone(),
+                                    msg,
+                                    send: to_client.clone(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "SyncManager worker closed, stopping read from client"
+                                );
+                                break;
+                            }
                         }
-                    }
 
-                    state.cancel.cancel();
-                }).await;
+                        state.cancel.cancel();
+                    })
+                    .await;
 
                 metrics.clients_connected.dec();
             });
@@ -1369,7 +1649,7 @@ struct DiscoveredPeer<I: SyncIO, D: DeterministicState> {
     latency: Option<Latency>,
     last_peer_failure_epoch: u64,
     last_client_msg_epoch: u64,
-    client_send: Option<Sender<SyncResponse<I, D>>>
+    client_send: Option<Sender<SyncResponse<I, D>>>,
 }
 
 struct Latency {
@@ -1379,7 +1659,11 @@ struct Latency {
 
 #[cfg(test)]
 mod test {
-    use crate::testing::{setup_logging, state_tests::{TestState, TestStateAction}, test_sync_io::{TestIOKillMode, TestSyncNet}};
+    use crate::testing::{
+        setup_logging,
+        state_tests::{TestState, TestStateAction},
+        test_sync_io::{TestIOKillMode, TestSyncNet},
+    };
 
     use super::*;
 
@@ -1393,15 +1677,34 @@ mod test {
         let b = test_net.io(2).await;
         let c = test_net.io(3).await;
 
-        let a_work = { let _span = tracing::info_span!("A").entered(); SyncManager::new(a, 1, TestState { sequence: 99999, ..Default::default() }, Default::default()) };
-        let b_work = { let _span = tracing::info_span!("B").entered(); SyncManager::new(b, 2, TestState::default(), Default::default()) };
-        let c_work = { let _span = tracing::info_span!("C").entered(); SyncManager::new(c, 3, TestState::default(), Default::default()) };
+        let a_work = {
+            let _span = tracing::info_span!("A").entered();
+            SyncManager::new(
+                a,
+                1,
+                TestState {
+                    sequence: 99999,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+        };
+        let b_work = {
+            let _span = tracing::info_span!("B").entered();
+            SyncManager::new(b, 2, TestState::default(), Default::default())
+        };
+        let c_work = {
+            let _span = tracing::info_span!("C").entered();
+            SyncManager::new(c, 3, TestState::default(), Default::default())
+        };
 
         b_work.set_leader(1).await;
         c_work.set_leader(2).await;
 
         let tx = a_work.action_tx();
-        tx.send(TestStateAction::Set { slot: 0, value: 99 }).await.unwrap();
+        tx.send(TestStateAction::Set { slot: 0, value: 99 })
+            .await
+            .unwrap();
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(a_work.shared().read().state().numbers[0], 99);
@@ -1421,9 +1724,26 @@ mod test {
         let b = test_net.io(2).await;
         let c = test_net.io(3).await;
 
-        let a_work = { let _span = tracing::info_span!("A").entered(); SyncManager::new(a, 1, TestState { sequence: 99999, ..Default::default() }, Default::default()) };
-        let b_work = { let _span = tracing::info_span!("B").entered(); SyncManager::new(b, 2, TestState::default(), Default::default()) };
-        let c_work = { let _span = tracing::info_span!("C").entered(); SyncManager::new(c, 3, TestState::default(), Default::default()) };
+        let a_work = {
+            let _span = tracing::info_span!("A").entered();
+            SyncManager::new(
+                a,
+                1,
+                TestState {
+                    sequence: 99999,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+        };
+        let b_work = {
+            let _span = tracing::info_span!("B").entered();
+            SyncManager::new(b, 2, TestState::default(), Default::default())
+        };
+        let c_work = {
+            let _span = tracing::info_span!("C").entered();
+            SyncManager::new(c, 3, TestState::default(), Default::default())
+        };
 
         b_work.set_leader(1).await;
         c_work.set_leader(1).await;
@@ -1431,7 +1751,9 @@ mod test {
         // tokio::time::sleep(Duration::from_millis(200)).await;
 
         let tx = a_work.action_tx();
-        tx.send(TestStateAction::Set { slot: 0, value: 99 }).await.unwrap();
+        tx.send(TestStateAction::Set { slot: 0, value: 99 })
+            .await
+            .unwrap();
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(a_work.shared().read().state().numbers[0], 99);
@@ -1441,9 +1763,16 @@ mod test {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         test_net.block_connection(1, 2, true).await;
-        test_net.kill_connection(1, 2, TestIOKillMode::Shutdown).await;
+        test_net
+            .kill_connection(1, 2, TestIOKillMode::Shutdown)
+            .await;
 
-        tx.send(TestStateAction::Add { slot: 0, value: 100 }).await.unwrap();
+        tx.send(TestStateAction::Add {
+            slot: 0,
+            value: 100,
+        })
+        .await
+        .unwrap();
 
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert_eq!(a_work.shared().read().state().numbers[0], 199);

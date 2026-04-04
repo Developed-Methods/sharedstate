@@ -1,13 +1,23 @@
-use std::{sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use rand_chacha::rand_core::{RngCore, SeedableRng};
 use tokio::sync::mpsc::channel;
 use tokio_util::sync::CancellationToken;
 
-use crate::{state::DeterministicState, testing::{state_tests::TestStateAction, test_sync_io::TestIOKillMode}, utils::PanicHelper, worker::sync_manager::SyncManager};
+use crate::{
+    state::DeterministicState,
+    testing::{state_tests::TestStateAction, test_sync_io::TestIOKillMode},
+    utils::PanicHelper,
+    worker::sync_manager::SyncManager,
+};
 
 use super::{setup_logging, state_tests::TestState, test_sync_io::TestSyncNet};
-
 
 #[tokio::test]
 async fn fuzzy_test() {
@@ -45,27 +55,34 @@ async fn _fuzzy_test() {
         let t = tokio::spawn(async move {
             let tx = sync.action_tx();
 
-            cancel.run_until_cancelled(async {
-                let mut leader = 1;
+            cancel
+                .run_until_cancelled(async {
+                    let mut leader = 1;
 
-                loop {
-                    let next = leader_num.load(Ordering::SeqCst);
-                    if leader != next {
-                        /* high chance we apply change first try */
-                        if rng.next_u64() % 32 != 0 {
-                            sync.set_leader(leader).await;
-                            leader = next;
+                    loop {
+                        let next = leader_num.load(Ordering::SeqCst);
+                        if leader != next {
+                            /* high chance we apply change first try */
+                            if rng.next_u64() % 32 != 0 {
+                                sync.set_leader(leader).await;
+                                leader = next;
+                            }
+                            /* low chance we ignore change */
+                            else if rng.next_u64() % 10 == 0 {
+                                leader = next;
+                            }
                         }
-                        /* low chance we ignore change */
-                        else if rng.next_u64() % 10 == 0 {
-                            leader = next;
-                        }
+
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        tx.send(TestStateAction::Add {
+                            slot: i % 32,
+                            value: 1,
+                        })
+                        .await
+                        .panic("failed to send");
                     }
-
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                    tx.send(TestStateAction::Add { slot: i % 32, value: 1 }).await.panic("failed to send");
-                }
-            }).await;
+                })
+                .await;
 
             tokio::time::sleep(Duration::from_secs(10)).await;
 
@@ -109,13 +126,12 @@ async fn _fuzzy_test() {
         if rng.next_u64() % 4 == 0 {
             blocks.push((a, b));
             net.block_connection(a, b, true).await;
-        }
-        else if rng.next_u64() % 3 == 0 {
+        } else if rng.next_u64() % 3 == 0 {
             net.kill_connection(a, b, TestIOKillMode::Shutdown).await;
         } else if rng.next_u64() % 2 == 0 {
             net.kill_connection(a, b, TestIOKillMode::Timeout).await;
         }
-        
+
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -146,7 +162,12 @@ async fn _fuzzy_test() {
                 let sequence = node.shared().read().state().accept_seq();
                 if sequences[pos] != sequence {
                     has_change = true;
-                    tracing::info!("node{} sequence updated: {} => {}", pos, sequences[pos], sequence);
+                    tracing::info!(
+                        "node{} sequence updated: {} => {}",
+                        pos,
+                        sequences[pos],
+                        sequence
+                    );
                     sequences[pos] = sequence;
                 }
             }
@@ -157,11 +178,13 @@ async fn _fuzzy_test() {
 
             tokio::time::sleep(Duration::from_secs(6)).await;
         }
-    }).await.panic("timeout waiting for seq to stablize");
+    })
+    .await
+    .panic("timeout waiting for seq to stablize");
 
     tracing::info!("leader sequence stable");
     tokio::time::sleep(Duration::from_secs(2)).await;
-    
+
     {
         let mut iter = sync_nodes.iter();
         let expected = iter.next().unwrap().shared().read().clone();
@@ -179,7 +202,11 @@ async fn _fuzzy_test() {
         println!("Numbers: {:?}", state.numbers);
     }
 
-    sync_nodes[INSTANT_COUNT - 1].action_tx().send(TestStateAction::Set { slot: 0, value: 0 }).await.unwrap();
+    sync_nodes[INSTANT_COUNT - 1]
+        .action_tx()
+        .send(TestStateAction::Set { slot: 0, value: 0 })
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     {

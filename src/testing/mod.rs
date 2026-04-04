@@ -2,11 +2,11 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{RwLock, RwLockWriteGuard};
 
-pub mod test_sync_io;
 pub mod state_tests;
+pub mod test_sync_io;
 
-mod message_io_tests;
 mod fuzzy_test;
+mod message_io_tests;
 
 pub fn setup_logging() {
     let _ = tracing_subscriber::fmt()
@@ -31,4 +31,3 @@ pub fn blocking_rw_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
         std::thread::yield_now();
     }
 }
-

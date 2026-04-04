@@ -1,4 +1,9 @@
-use std::{fmt::Debug, future::Future, panic::Location, time::{Duration, UNIX_EPOCH}};
+use std::{
+    fmt::Debug,
+    future::Future,
+    panic::Location,
+    time::{Duration, UNIX_EPOCH},
+};
 
 pub trait LogHelper {
     fn log(self) -> Self;
@@ -13,7 +18,13 @@ impl<R, E: Debug> LogHelper for Result<R, E> {
         match self {
             Err(error) => {
                 let caller = Location::caller();
-                tracing::error!(?error, "Error({}:{}), {} ", caller.file(), caller.line(), msg);
+                tracing::error!(
+                    ?error,
+                    "Error({}:{}), {} ",
+                    caller.file(),
+                    caller.line(),
+                    msg
+                );
                 Err(error)
             }
             ok => ok,
@@ -25,7 +36,13 @@ impl<R, E: Debug> LogHelper for Result<R, E> {
         match self {
             Err(error) => {
                 let caller = Location::caller();
-                tracing::error!(?error, "Error({}:{}), {} ", caller.file(), caller.line(), msg);
+                tracing::error!(
+                    ?error,
+                    "Error({}:{}), {} ",
+                    caller.file(),
+                    caller.line(),
+                    msg
+                );
                 Err(error)
             }
             ok => ok,
@@ -125,7 +142,12 @@ pub trait TimeoutPanicHelper: Sized {
         }
     }
 
-    fn _timeout(self, caller: &'static Location<'static>, time: Duration, msg: &str) -> impl Future<Output = Result<Self::Success, String>>;
+    fn _timeout(
+        self,
+        caller: &'static Location<'static>,
+        time: Duration,
+        msg: &str,
+    ) -> impl Future<Output = Result<Self::Success, String>>;
 
     #[cfg(test)]
     #[track_caller]
@@ -133,7 +155,10 @@ pub trait TimeoutPanicHelper: Sized {
         let caller = Location::caller();
 
         async move {
-            match self._timeout(caller, Duration::from_millis(100), "test").await {
+            match self
+                ._timeout(caller, Duration::from_millis(100), "test")
+                .await
+            {
                 Ok(v) => v,
                 Err(msg) => {
                     tracing::error!("{}", msg);
@@ -149,8 +174,16 @@ pub trait TimeoutPanicHelper: Sized {
         let caller = Location::caller();
 
         async move {
-            if self._timeout(caller, Duration::from_millis(100), "").await.is_ok() {
-                let msg = format!("did not get expected timeout at 100ms, {}:{}", caller.file(), caller.line());
+            if self
+                ._timeout(caller, Duration::from_millis(100), "")
+                .await
+                .is_ok()
+            {
+                let msg = format!(
+                    "did not get expected timeout at 100ms, {}:{}",
+                    caller.file(),
+                    caller.line()
+                );
                 tracing::error!("{}", msg);
                 panic!("{}", msg);
             }
@@ -161,14 +194,28 @@ pub trait TimeoutPanicHelper: Sized {
 impl<F: Future> TimeoutPanicHelper for F {
     type Success = F::Output;
 
-    async fn _timeout(self, caller: &'static Location<'static>, time: Duration, msg: &str) -> Result<Self::Success, String> {
+    async fn _timeout(
+        self,
+        caller: &'static Location<'static>,
+        time: Duration,
+        msg: &str,
+    ) -> Result<Self::Success, String> {
         match tokio::time::timeout(time, self).await {
             Ok(r) => Ok(r),
-            Err(_) => Err(format!("Timeout({:?}) Panic({}:{}), {} ", time, caller.file(), caller.line(), msg)),
+            Err(_) => Err(format!(
+                "Timeout({:?}) Panic({}:{}), {} ",
+                time,
+                caller.file(),
+                caller.line(),
+                msg
+            )),
         }
     }
 }
 
 pub fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }

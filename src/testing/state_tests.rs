@@ -1,8 +1,17 @@
-use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use message_encoding::{test_assert_valid_encoding, MessageEncoding};
 
-use crate::{state::{DeterministicState, SharedState}, net::message_io::unknown_id_err};
+use crate::{
+    net::message_io::unknown_id_err,
+    state::{DeterministicState, SharedState},
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TestState {
@@ -20,8 +29,11 @@ impl DeterministicState for TestState {
 
     fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
         (
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
-            action
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            action,
         )
     }
 
@@ -31,7 +43,7 @@ impl DeterministicState for TestState {
         match action {
             TestStateAction::Add { slot, value } => {
                 self.numbers[*slot] = self.numbers[*slot].overflowing_add(*value).0;
-            },
+            }
             TestStateAction::Set { slot, value } => self.numbers[*slot] = *value,
         }
     }
@@ -132,10 +144,18 @@ fn test_state_action_encoding_test() {
     test_assert_valid_encoding(TestStateAction::Add { slot: 1, value: 2 });
     test_assert_valid_encoding(TestStateAction::Set { slot: 3, value: 4 });
 
-    test_assert_valid_encoding(TestStateAction::Add { slot: 0, value: 123 });
+    test_assert_valid_encoding(TestStateAction::Add {
+        slot: 0,
+        value: 123,
+    });
 
     let mut out = Vec::new();
-    TestStateAction::Add { slot: 0, value: 123 }.write_to(&mut out).unwrap();
+    TestStateAction::Add {
+        slot: 0,
+        value: 123,
+    }
+    .write_to(&mut out)
+    .unwrap();
 
     println!("Data: {:?}", out);
 
@@ -150,7 +170,10 @@ fn test_state_action_encoding_test() {
 fn slow_state_deadlock_test() {
     super::setup_logging();
 
-    let (state, updater) = SharedState::new(TestState { sequence: 0, numbers: [0i64; 32] });
+    let (state, updater) = SharedState::new(TestState {
+        sequence: 0,
+        numbers: [0i64; 32],
+    });
     let mut updater = updater.into_lead();
 
     let run = Arc::new(AtomicBool::new(true));
@@ -200,7 +223,7 @@ fn slow_state_deadlock_test() {
 
         let now = Instant::now();
         let elapsed = now - last_update;
-        if Duration::from_millis(50) < elapsed  {
+        if Duration::from_millis(50) < elapsed {
             updater.queue(TestStateAction::Add { slot: 3, value: 1 });
             last_update = now;
         }

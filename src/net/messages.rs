@@ -2,7 +2,10 @@ use std::fmt::Debug;
 
 use message_encoding::MessageEncoding;
 
-use crate::{recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails}, state::DeterministicState};
+use crate::{
+    recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
+    state::DeterministicState,
+};
 
 use super::{io::SyncIO, message_io::unknown_id_err};
 
@@ -14,7 +17,10 @@ pub enum SyncRequest<I: SyncIO, D: DeterministicState> {
     SendMePeers,
     NoticePeers(Vec<I::Address>),
     SubscribeRecovery(RecoverableStateDetails),
-    Action { source: I::Address, action: D::Action },
+    Action {
+        source: I::Address,
+        action: D::Action,
+    },
 }
 
 impl<I: SyncIO, D: DeterministicState> Debug for SyncRequest<I, D> {
@@ -41,7 +47,11 @@ pub enum SyncResponse<I: SyncIO, D: DeterministicState> {
     Peers(Vec<I::Address>),
 }
 
-impl<I: SyncIO, D: DeterministicState> MessageEncoding for SyncRequest<I, D> where I::Address: MessageEncoding, D::Action: MessageEncoding {
+impl<I: SyncIO, D: DeterministicState> MessageEncoding for SyncRequest<I, D>
+where
+    I::Address: MessageEncoding,
+    D::Action: MessageEncoding,
+{
     fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
         sum += match self {
@@ -59,7 +69,7 @@ impl<I: SyncIO, D: DeterministicState> MessageEncoding for SyncRequest<I, D> whe
             Self::NoticePeers(peers) => {
                 sum += 6u16.write_to(out)?;
                 write_vec(peers, out)?
-            },
+            }
             Self::SubscribeRecovery(details) => {
                 sum += 7u16.write_to(out)?;
                 details.write_to(out)?
@@ -92,7 +102,12 @@ impl<I: SyncIO, D: DeterministicState> MessageEncoding for SyncRequest<I, D> whe
     }
 }
 
-impl<I: SyncIO, D: DeterministicState> MessageEncoding for SyncResponse<I, D> where I::Address: MessageEncoding, D::AuthorityAction: MessageEncoding, D: MessageEncoding {
+impl<I: SyncIO, D: DeterministicState> MessageEncoding for SyncResponse<I, D>
+where
+    I::Address: MessageEncoding,
+    D::AuthorityAction: MessageEncoding,
+    D: MessageEncoding,
+{
     fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
         sum += match self {
@@ -131,7 +146,10 @@ impl<I: SyncIO, D: DeterministicState> MessageEncoding for SyncResponse<I, D> wh
             1 => Self::Pong(MessageEncoding::read_from(read)?),
             2 => Self::RecoveryAccepted(MessageEncoding::read_from(read)?),
             3 => Self::FreshState(MessageEncoding::read_from(read)?),
-            4 => Self::AuthorityAction(MessageEncoding::read_from(read)?, MessageEncoding::read_from(read)?),
+            4 => Self::AuthorityAction(
+                MessageEncoding::read_from(read)?,
+                MessageEncoding::read_from(read)?,
+            ),
             5 => Self::LeaderPath(read_vec(read)?),
             6 => Self::Peers(read_vec(read)?),
             other => return Err(unknown_id_err(other, "SyncResponse")),
@@ -139,7 +157,10 @@ impl<I: SyncIO, D: DeterministicState> MessageEncoding for SyncResponse<I, D> wh
     }
 }
 
-fn write_vec<T: MessageEncoding, W: std::io::Write>(v: &[T], out: &mut W) -> std::io::Result<usize> {
+fn write_vec<T: MessageEncoding, W: std::io::Write>(
+    v: &[T],
+    out: &mut W,
+) -> std::io::Result<usize> {
     let mut sum = (v.len() as u64).write_to(out)?;
     for i in v {
         sum += i.write_to(out)?;

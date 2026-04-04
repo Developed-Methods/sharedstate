@@ -1,12 +1,28 @@
-use std::{hash::{Hash, Hasher, SipHasher}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    hash::{Hash, Hasher, SipHasher},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use sequenced_broadcast::{NewClientError, SequencedBroadcast, SequencedBroadcastSettings, SequencedReceiver, SequencedSender};
+use sequenced_broadcast::{
+    NewClientError, SequencedBroadcast, SequencedBroadcastSettings, SequencedReceiver,
+    SequencedSender,
+};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
-use crate::{recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails, SourceId}, state::{DeterministicState, FlushedUpdater, SharedState}, utils::{LogHelper, PanicHelper}};
+use crate::{
+    recoverable_state::{
+        RecoverableState, RecoverableStateAction, RecoverableStateDetails, SourceId,
+    },
+    state::{DeterministicState, FlushedUpdater, SharedState},
+    utils::{LogHelper, PanicHelper},
+};
 
-use super::{follow_worker::{FollowWorker, SequencedRxAndUpdater}, lead_worker::LeadWorker, task_and_cancel::TaskAndCancel};
+use super::{
+    follow_worker::{FollowWorker, SequencedRxAndUpdater},
+    lead_worker::LeadWorker,
+    task_and_cancel::TaskAndCancel,
+};
 
 pub struct SyncUpdater<I: SourceId, D: DeterministicState> {
     local_id: I,
@@ -28,7 +44,10 @@ enum Mode<I: SourceId, D: DeterministicState> {
     Dead,
 }
 
-impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D> where D::AuthorityAction: Clone {
+impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D>
+where
+    D::AuthorityAction: Clone,
+{
     pub fn new(local_id: I, state: D, broadcast_settings: SequencedBroadcastSettings) -> Self {
         let (state, updater) = SharedState::new(RecoverableState::new(rnd_id(local_id), state));
 
@@ -37,18 +56,20 @@ impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D> where D::AuthorityAct
         let (lead_tx, lead_rx) = channel(2048);
 
         let (worker, authority_rx) = LeadWorker::new(lead_rx, updater);
-        let (broadcast, broadcast_tx) = SequencedBroadcast::new(authority_rx.next_seq(), broadcast_settings.clone());
+        let (broadcast, broadcast_tx) =
+            SequencedBroadcast::new(authority_rx.next_seq(), broadcast_settings.clone());
 
         assert_eq!(authority_rx.next_seq(), broadcast_tx.seq());
 
         let mode = Mode::Lead(LeadMode {
             local_id,
-            action_tx_task: ActionToLocalLead {
-                action_rx,
-                lead_tx,
-            }.spawn(),
+            action_tx_task: ActionToLocalLead { action_rx, lead_tx }.spawn(),
             updater_task: worker.spawn(),
-            authority_to_broadcast_task: AuthorityToBroadcast { authority_rx, broadcast_tx }.spawn(),
+            authority_to_broadcast_task: AuthorityToBroadcast {
+                authority_rx,
+                broadcast_tx,
+            }
+            .spawn(),
         });
 
         {
@@ -131,7 +152,11 @@ impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D> where D::AuthorityAct
         };
     }
 
-    pub async fn follow(&mut self, action_tx: Sender<(I, D::Action)>, state: ValidNewFollowState<RecoverableState<I, D>>) {
+    pub async fn follow(
+        &mut self,
+        action_tx: Sender<(I, D::Action)>,
+        state: ValidNewFollowState<RecoverableState<I, D>>,
+    ) {
         let offline = match std::mem::replace(&mut self.mode, Mode::Dead) {
             Mode::Dead => unreachable!("dead state"),
             Mode::Offline(offline) => offline,
@@ -145,7 +170,11 @@ impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D> where D::AuthorityAct
         self.mode = Mode::Follow(offline.into_follow(action_tx, state));
     }
 
-    pub async fn try_follow(&mut self, action_tx: Sender<(I, D::Action)>, target: FollowTarget<I, D>) -> bool {
+    pub async fn try_follow(
+        &mut self,
+        action_tx: Sender<(I, D::Action)>,
+        target: FollowTarget<I, D>,
+    ) -> bool {
         let offline = match std::mem::replace(&mut self.mode, Mode::Dead) {
             Mode::Dead => unreachable!("dead state"),
             Mode::Offline(offline) => offline,
@@ -154,9 +183,8 @@ impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D> where D::AuthorityAct
         };
 
         if let Some(leader_check) = target.leader_state_check {
-            let can_follow = offline.with_state(|state| {
-                leader_check.can_recover_follower(state.details())
-            });
+            let can_follow =
+                offline.with_state(|state| leader_check.can_recover_follower(state.details()));
 
             if !can_follow {
                 self.mode = Mode::Offline(offline);
@@ -172,7 +200,10 @@ impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D> where D::AuthorityAct
         self.is_following()
     }
 
-    pub async fn add_subscriber(&mut self, recovery_details: RecoverableStateDetails) -> Option<FollowTarget<I, D>> {
+    pub async fn add_subscriber(
+        &mut self,
+        recovery_details: RecoverableStateDetails,
+    ) -> Option<FollowTarget<I, D>> {
         if self.is_offline() {
             return None;
         }
@@ -186,7 +217,11 @@ impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D> where D::AuthorityAct
             details.clone()
         };
 
-        let recv = self.broadcast.add_client(recovery_details.recover_accept_seq, true).await.ok()?;
+        let recv = self
+            .broadcast
+            .add_client(recovery_details.recover_accept_seq, true)
+            .await
+            .ok()?;
 
         Some(FollowTarget {
             authority_rx: recv,
@@ -194,7 +229,9 @@ impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D> where D::AuthorityAct
         })
     }
 
-    pub async fn add_fresh_subscriber(&mut self) -> Option<ValidNewFollowState<RecoverableState<I, D>>> {
+    pub async fn add_fresh_subscriber(
+        &mut self,
+    ) -> Option<ValidNewFollowState<RecoverableState<I, D>>> {
         if self.is_offline() {
             return None;
         }
@@ -215,7 +252,7 @@ impl<I: SourceId, D: DeterministicState> SyncUpdater<I, D> where D::AuthorityAct
         let sub = sub.err_log("failed to add fresh client").ok()?;
         Some(ValidNewFollowState(NewFollowState {
             state,
-            authority_rx: sub
+            authority_rx: sub,
         }))
     }
 
@@ -258,9 +295,24 @@ struct LeadMode<I: SourceId, D: DeterministicState> {
 
 impl<I: SourceId, D: DeterministicState> LeadMode<I, D> {
     async fn into_offline_mode(self) -> OfflineMode<I, D> {
-        let action_rx = self.action_tx_task.cancel().await.panic("action to leader failed").action_rx;
-        let flushed_updater = self.updater_task.cancel().await.panic("updater task failed").into_flushed();
-        let authority_tx = self.authority_to_broadcast_task.cancel().await.panic("authority broadcast failed").broadcast_tx;
+        let action_rx = self
+            .action_tx_task
+            .cancel()
+            .await
+            .panic("action to leader failed")
+            .action_rx;
+        let flushed_updater = self
+            .updater_task
+            .cancel()
+            .await
+            .panic("updater task failed")
+            .into_flushed();
+        let authority_tx = self
+            .authority_to_broadcast_task
+            .cancel()
+            .await
+            .panic("authority broadcast failed")
+            .broadcast_tx;
 
         assert_eq!(flushed_updater.accept_seq(), authority_tx.seq());
 
@@ -282,7 +334,10 @@ pub struct OfflineMode<I: SourceId, D: DeterministicState> {
     was_leading: bool,
 }
 
-impl<I: SourceId, D: DeterministicState> OfflineMode<I, D> where D::AuthorityAction: Clone {
+impl<I: SourceId, D: DeterministicState> OfflineMode<I, D>
+where
+    D::AuthorityAction: Clone,
+{
     pub fn recovery_details(&self) -> RecoverableStateDetails {
         self.with_state(|s| s.details().clone())
     }
@@ -300,42 +355,72 @@ impl<I: SourceId, D: DeterministicState> OfflineMode<I, D> where D::AuthorityAct
         let (worker, authority_rx) = LeadWorker::new(lead_rx, self.flushed_updater);
 
         if !self.was_leading {
-            lead_tx.try_send(RecoverableStateAction::BumpGeneration {
-                new_id: rnd_id(self.local_id),
-            }).unwrap();
+            lead_tx
+                .try_send(RecoverableStateAction::BumpGeneration {
+                    new_id: rnd_id(self.local_id),
+                })
+                .unwrap();
         }
 
         LeadMode {
             local_id: self.local_id,
-            action_tx_task: ActionToLocalLead { action_rx: self.action_rx, lead_tx }.spawn(),
+            action_tx_task: ActionToLocalLead {
+                action_rx: self.action_rx,
+                lead_tx,
+            }
+            .spawn(),
             updater_task: worker.spawn(),
-            authority_to_broadcast_task: AuthorityToBroadcast { authority_rx, broadcast_tx: self.broadcast_tx }.spawn(),
+            authority_to_broadcast_task: AuthorityToBroadcast {
+                authority_rx,
+                broadcast_tx: self.broadcast_tx,
+            }
+            .spawn(),
         }
     }
 
-    fn into_follow(mut self, action_tx: Sender<(I, D::Action)>, state: ValidNewFollowStateWithBroadcast<RecoverableState<I, D>>) -> FollowMode<I, D> {
+    fn into_follow(
+        mut self,
+        action_tx: Sender<(I, D::Action)>,
+        state: ValidNewFollowStateWithBroadcast<RecoverableState<I, D>>,
+    ) -> FollowMode<I, D> {
         self.flushed_updater.reset_state(state.0.state);
 
         let pair = SequencedRxAndUpdater {
             rx: state.0.authority_rx,
             updater: self.flushed_updater,
-        }.try_into_valid().panic("state sequences do not match after reset");
+        }
+        .try_into_valid()
+        .panic("state sequences do not match after reset");
 
         let (worker, authority_rx) = FollowWorker::new(pair);
 
         FollowMode {
             local_id: self.local_id,
-            action_task: ActionPipe { action_rx: self.action_rx, action_tx }.spawn(),
+            action_task: ActionPipe {
+                action_rx: self.action_rx,
+                action_tx,
+            }
+            .spawn(),
             updater_task: worker.spawn(),
-            broadcast_task: AuthorityToBroadcast { authority_rx, broadcast_tx: state.1 }.spawn(),
+            broadcast_task: AuthorityToBroadcast {
+                authority_rx,
+                broadcast_tx: state.1,
+            }
+            .spawn(),
         }
     }
 
-    fn try_follow(mut self, action_tx: Sender<(I, D::Action)>, authority_rx: SequencedReceiver<RecoverableStateAction<I, D::AuthorityAction>>) -> Result<FollowMode<I, D>, Self> {
+    fn try_follow(
+        mut self,
+        action_tx: Sender<(I, D::Action)>,
+        authority_rx: SequencedReceiver<RecoverableStateAction<I, D::AuthorityAction>>,
+    ) -> Result<FollowMode<I, D>, Self> {
         let pair = match (SequencedRxAndUpdater {
             rx: authority_rx,
             updater: self.flushed_updater,
-        }).try_into_valid() {
+        })
+        .try_into_valid()
+        {
             Ok(v) => v,
             Err(pair) => {
                 self.flushed_updater = pair.updater;
@@ -347,9 +432,17 @@ impl<I: SourceId, D: DeterministicState> OfflineMode<I, D> where D::AuthorityAct
 
         Ok(FollowMode {
             local_id: self.local_id,
-            action_task: ActionPipe { action_rx: self.action_rx, action_tx }.spawn(),
+            action_task: ActionPipe {
+                action_rx: self.action_rx,
+                action_tx,
+            }
+            .spawn(),
             updater_task: worker.spawn(),
-            broadcast_task: AuthorityToBroadcast { authority_rx, broadcast_tx: self.broadcast_tx }.spawn(),
+            broadcast_task: AuthorityToBroadcast {
+                authority_rx,
+                broadcast_tx: self.broadcast_tx,
+            }
+            .spawn(),
         })
     }
 }
@@ -365,26 +458,34 @@ impl<D: DeterministicState> NewFollowState<D> {
             return Err(self);
         }
 
-
         Ok(ValidNewFollowState(self))
     }
 }
 
 pub struct ValidNewFollowState<D: DeterministicState>(NewFollowState<D>);
-pub struct ValidNewFollowStateWithBroadcast<D: DeterministicState>(NewFollowState<D>, SequencedSender<D::AuthorityAction>);
+pub struct ValidNewFollowStateWithBroadcast<D: DeterministicState>(
+    NewFollowState<D>,
+    SequencedSender<D::AuthorityAction>,
+);
 
-impl<D: DeterministicState> ValidNewFollowState<D> where D::AuthorityAction: Clone {
+impl<D: DeterministicState> ValidNewFollowState<D>
+where
+    D::AuthorityAction: Clone,
+{
     pub fn into_inner(self) -> NewFollowState<D> {
         self.0
     }
 
-    fn with_new_broadcast(self, settings: SequencedBroadcastSettings) -> (ValidNewFollowStateWithBroadcast<D>, SequencedBroadcast<D::AuthorityAction>) {
+    fn with_new_broadcast(
+        self,
+        settings: SequencedBroadcastSettings,
+    ) -> (
+        ValidNewFollowStateWithBroadcast<D>,
+        SequencedBroadcast<D::AuthorityAction>,
+    ) {
         let (broadcast, tx) = SequencedBroadcast::new(self.0.state.accept_seq(), settings);
 
-        (
-            ValidNewFollowStateWithBroadcast(self.0, tx),
-            broadcast
-        )
+        (ValidNewFollowStateWithBroadcast(self.0, tx), broadcast)
     }
 }
 
@@ -395,11 +496,29 @@ struct FollowMode<I: SourceId, D: DeterministicState> {
     broadcast_task: TaskAndCancel<AuthorityToBroadcast<RecoverableState<I, D>>>,
 }
 
-impl<I: SourceId, D: DeterministicState> FollowMode<I, D> where D::AuthorityAction: Clone {
+impl<I: SourceId, D: DeterministicState> FollowMode<I, D>
+where
+    D::AuthorityAction: Clone,
+{
     pub async fn into_offline_mode(self) -> OfflineMode<I, D> {
-        let action_rx = self.action_task.cancel().await.panic("action to leader failed").action_rx;
-        let flushed_updater = self.updater_task.cancel().await.panic("updater task failed").into_flushed();
-        let authority_tx = self.broadcast_task.cancel().await.panic("authority broadcast failed").broadcast_tx;
+        let action_rx = self
+            .action_task
+            .cancel()
+            .await
+            .panic("action to leader failed")
+            .action_rx;
+        let flushed_updater = self
+            .updater_task
+            .cancel()
+            .await
+            .panic("updater task failed")
+            .into_flushed();
+        let authority_tx = self
+            .broadcast_task
+            .cancel()
+            .await
+            .panic("authority broadcast failed")
+            .broadcast_tx;
 
         assert_eq!(flushed_updater.accept_seq(), authority_tx.seq());
 
@@ -418,7 +537,10 @@ struct AuthorityToBroadcast<D: DeterministicState> {
     broadcast_tx: SequencedSender<D::AuthorityAction>,
 }
 
-impl<D: DeterministicState> AuthorityToBroadcast<D> where D::AuthorityAction: Clone {
+impl<D: DeterministicState> AuthorityToBroadcast<D>
+where
+    D::AuthorityAction: Clone,
+{
     fn spawn(mut self) -> TaskAndCancel<Self> {
         TaskAndCancel::spawn(|cancel| async move {
             self.run(cancel).await;
@@ -427,14 +549,22 @@ impl<D: DeterministicState> AuthorityToBroadcast<D> where D::AuthorityAction: Cl
     }
 
     async fn run(&mut self, cancel: CancellationToken) {
-        while let Some(Some((seq, authority))) = cancel.run_until_cancelled(self.authority_rx.recv()).await {
+        while let Some(Some((seq, authority))) =
+            cancel.run_until_cancelled(self.authority_rx.recv()).await
+        {
             tokio::task::yield_now().await;
-            self.broadcast_tx.safe_send(seq, authority).await.panic("invalid sequence");
+            self.broadcast_tx
+                .safe_send(seq, authority)
+                .await
+                .panic("invalid sequence");
         }
 
         /* flush remaining messages to client */
         while let Ok((seq, authority)) = self.authority_rx.try_recv() {
-            self.broadcast_tx.safe_send(seq, authority).await.panic("invalid sequence");
+            self.broadcast_tx
+                .safe_send(seq, authority)
+                .await
+                .panic("invalid sequence");
         }
     }
 }
@@ -453,14 +583,16 @@ impl<I: SourceId, D: DeterministicState> ActionPipe<I, D> {
     }
 
     async fn run(&mut self, cancel: CancellationToken) {
-        cancel.run_until_cancelled_owned(async {
-            while let Some(action) = self.action_rx.recv().await {
-                tokio::task::yield_now().await;
-                if self.action_tx.send(action).await.is_err() {
-                    break;
+        cancel
+            .run_until_cancelled_owned(async {
+                while let Some(action) = self.action_rx.recv().await {
+                    tokio::task::yield_now().await;
+                    if self.action_tx.send(action).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        }).await;
+            })
+            .await;
     }
 }
 
@@ -478,18 +610,26 @@ impl<I: SourceId, D: DeterministicState> ActionToLocalLead<I, D> {
     }
 
     async fn run(&mut self, cancel: CancellationToken) {
-        cancel.run_until_cancelled_owned(async {
-            while let Some((source, action)) = self.action_rx.recv().await {
-                tokio::task::yield_now().await;
-                self.lead_tx.send(RecoverableStateAction::StateAction { source, action }).await.panic("failed to send action to local lead");
-            }
-        }).await;
+        cancel
+            .run_until_cancelled_owned(async {
+                while let Some((source, action)) = self.action_rx.recv().await {
+                    tokio::task::yield_now().await;
+                    self.lead_tx
+                        .send(RecoverableStateAction::StateAction { source, action })
+                        .await
+                        .panic("failed to send action to local lead");
+                }
+            })
+            .await;
     }
 }
 
 fn rnd_id<S: SourceId>(local_id: S) -> u64 {
     let mut hash = SipHasher::new();
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().hash(&mut hash);
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .hash(&mut hash);
     local_id.hash(&mut hash);
     hash.finish()
 }
@@ -497,16 +637,27 @@ fn rnd_id<S: SourceId>(local_id: S) -> u64 {
 #[cfg(test)]
 mod test {
     use super::SyncUpdater;
+    use crate::{
+        state::DeterministicState,
+        testing::{
+            setup_logging,
+            state_tests::{TestState, TestStateAction},
+        },
+        utils::PanicHelper,
+        worker::sync_updater::FollowTarget,
+    };
     use std::time::Duration;
     use tokio::sync::mpsc::channel;
-    use crate::{state::DeterministicState, testing::{setup_logging, state_tests::{TestState, TestStateAction}}, utils::PanicHelper, worker::sync_updater::FollowTarget};
 
     #[tokio::test]
     async fn sync_updater_simple_leader_test() {
         setup_logging();
 
         let a = SyncUpdater::<u64, TestState>::new(1, Default::default(), Default::default());
-        a.local_action_tx.send(TestStateAction::Set { slot: 0, value: 33 }).await.unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 0, value: 33 })
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(a.state.read().state().numbers[0], 33);
     }
@@ -544,9 +695,18 @@ mod test {
             c.provide_action_rx(action_rx);
         }
 
-        a.local_action_tx.send(TestStateAction::Set { slot: 1, value: 88 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Set { slot: 2, value: 22 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Set { slot: 3, value: 11 }).await.unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 1, value: 88 })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 2, value: 22 })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 3, value: 11 })
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         assert_eq!(a.state().read().accept_seq(), 4);
@@ -563,18 +723,55 @@ mod test {
             let follow = b.add_subscriber(a_recover).await.unwrap();
 
             let (action_tx, action_rx) = channel(1024);
-            a.try_follow(action_tx, follow).await.panic("failed to follow");
+            a.try_follow(action_tx, follow)
+                .await
+                .panic("failed to follow");
             b.provide_action_rx(action_rx);
         }
 
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 1,
+                value: 100,
+            })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 2,
+                value: 100,
+            })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 3,
+                value: 100,
+            })
+            .await
+            .unwrap();
 
-        a.local_action_tx.send(TestStateAction::Add { slot: 1, value: 100 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Add { slot: 2, value: 100 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Add { slot: 3, value: 100 }).await.unwrap();
-
-        d.local_action_tx.send(TestStateAction::Add { slot: 1, value: 1000 }).await.unwrap();
-        d.local_action_tx.send(TestStateAction::Add { slot: 2, value: 1000 }).await.unwrap();
-        d.local_action_tx.send(TestStateAction::Add { slot: 3, value: 1000 }).await.unwrap();
+        d.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 1,
+                value: 1000,
+            })
+            .await
+            .unwrap();
+        d.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 2,
+                value: 1000,
+            })
+            .await
+            .unwrap();
+        d.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 3,
+                value: 1000,
+            })
+            .await
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -631,9 +828,18 @@ mod test {
             c.provide_action_rx(action_rx);
         }
 
-        a.local_action_tx.send(TestStateAction::Set { slot: 1, value: 88 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Set { slot: 2, value: 22 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Set { slot: 3, value: 11 }).await.unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 1, value: 88 })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 2, value: 22 })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 3, value: 11 })
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         assert_eq!(a.state().read().accept_seq(), 4);
@@ -644,13 +850,49 @@ mod test {
         /* FORK: c lead and d follow c */
         c.lead().await;
 
-        a.local_action_tx.send(TestStateAction::Add { slot: 1, value: 100 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Add { slot: 2, value: 100 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Add { slot: 3, value: 100 }).await.unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 1,
+                value: 100,
+            })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 2,
+                value: 100,
+            })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 3,
+                value: 100,
+            })
+            .await
+            .unwrap();
 
-        d.local_action_tx.send(TestStateAction::Add { slot: 1, value: 1000 }).await.unwrap();
-        d.local_action_tx.send(TestStateAction::Add { slot: 2, value: 1000 }).await.unwrap();
-        d.local_action_tx.send(TestStateAction::Add { slot: 3, value: 1000 }).await.unwrap();
+        d.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 1,
+                value: 1000,
+            })
+            .await
+            .unwrap();
+        d.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 2,
+                value: 1000,
+            })
+            .await
+            .unwrap();
+        d.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 3,
+                value: 1000,
+            })
+            .await
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -705,9 +947,18 @@ mod test {
             a.provide_action_rx(action_rx);
         }
 
-        a.local_action_tx.send(TestStateAction::Set { slot: 1, value: 88 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Set { slot: 2, value: 22 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Set { slot: 3, value: 11 }).await.unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 1, value: 88 })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 2, value: 22 })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 3, value: 11 })
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         assert_eq!(a.state().read().accept_seq(), 4);
@@ -718,7 +969,6 @@ mod test {
         /* d goes offline so we can recover later */
         d.go_offline().await;
 
-
         /* promote B and have A follow */
         b.lead().await;
         {
@@ -726,13 +976,33 @@ mod test {
             let follow = b.add_subscriber(a_recover).await.unwrap();
 
             let (action_tx, action_rx) = channel(1024);
-            a.try_follow(action_tx, follow).await.panic("failed to follow");
+            a.try_follow(action_tx, follow)
+                .await
+                .panic("failed to follow");
             b.provide_action_rx(action_rx);
         }
 
-        a.local_action_tx.send(TestStateAction::Add { slot: 1, value: 100 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Add { slot: 2, value: 100 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Add { slot: 3, value: 100 }).await.unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 1,
+                value: 100,
+            })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 2,
+                value: 100,
+            })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 3,
+                value: 100,
+            })
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         /* promote C and have B follow */
@@ -742,13 +1012,33 @@ mod test {
             let follow = c.add_subscriber(b_recover).await.unwrap();
 
             let (action_tx, action_rx) = channel(1024);
-            b.try_follow(action_tx, follow).await.panic("failed to follow");
+            b.try_follow(action_tx, follow)
+                .await
+                .panic("failed to follow");
             c.provide_action_rx(action_rx);
         }
 
-        a.local_action_tx.send(TestStateAction::Add { slot: 1, value: 100 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Add { slot: 2, value: 100 }).await.unwrap();
-        a.local_action_tx.send(TestStateAction::Add { slot: 3, value: 100 }).await.unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 1,
+                value: 100,
+            })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 2,
+                value: 100,
+            })
+            .await
+            .unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 3,
+                value: 100,
+            })
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         assert_eq!(a.state().read().accept_seq(), 12);
@@ -762,7 +1052,9 @@ mod test {
             let follow = a.add_subscriber(d_recover).await.unwrap();
 
             let (action_tx, action_rx) = channel(1024);
-            d.try_follow(action_tx, follow).await.panic("failed to follow after mutli generation changes");
+            d.try_follow(action_tx, follow)
+                .await
+                .panic("failed to follow after mutli generation changes");
             a.provide_action_rx(action_rx);
         }
 
@@ -809,9 +1101,18 @@ mod test {
             a.provide_action_rx(action_rx);
         }
 
-        a.local_action_tx.send(TestStateAction::Set { slot: 1, value: 88 }).await.unwrap();
-        b.local_action_tx.send(TestStateAction::Set { slot: 2, value: 22 }).await.unwrap();
-        c.local_action_tx.send(TestStateAction::Set { slot: 3, value: 11 }).await.unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 1, value: 88 })
+            .await
+            .unwrap();
+        b.local_action_tx
+            .send(TestStateAction::Set { slot: 2, value: 22 })
+            .await
+            .unwrap();
+        c.local_action_tx
+            .send(TestStateAction::Set { slot: 3, value: 11 })
+            .await
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -831,14 +1132,28 @@ mod test {
             let follow = b.add_subscriber(recover_details).await.unwrap();
 
             let (action_tx, action_rx) = channel(1024);
-            a.try_follow(action_tx, follow).await.panic("failed to follow");
+            a.try_follow(action_tx, follow)
+                .await
+                .panic("failed to follow");
 
             b.provide_action_rx(action_rx);
         }
 
         /* would cause loops */
-        a.local_action_tx.send(TestStateAction::Add { slot: 1, value: 100 }).await.unwrap();
-        b.local_action_tx.send(TestStateAction::Add { slot: 1, value: 100 }).await.unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 1,
+                value: 100,
+            })
+            .await
+            .unwrap();
+        b.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 1,
+                value: 100,
+            })
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let a_state = a.state.read().clone();
@@ -849,7 +1164,13 @@ mod test {
         assert_eq!(a_state.state().numbers[3], 11);
 
         b.lead().await;
-        a.local_action_tx.send(TestStateAction::Add { slot: 1, value: 100 }).await.unwrap();
+        a.local_action_tx
+            .send(TestStateAction::Add {
+                slot: 1,
+                value: 100,
+            })
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let a_state = a.state.read().clone();
@@ -865,4 +1186,3 @@ mod test {
         println!("STATE: {:?}", a_state);
     }
 }
-

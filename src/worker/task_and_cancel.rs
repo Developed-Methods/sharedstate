@@ -10,15 +10,14 @@ pub struct TaskAndCancel<R> {
 }
 
 impl<R: Send + 'static> TaskAndCancel<R> {
-    pub fn spawn<O: Future<Output = R> + Send + 'static, F: FnOnce(CancellationToken) -> O>(fut_builder: F) -> Self {
+    pub fn spawn<O: Future<Output = R> + Send + 'static, F: FnOnce(CancellationToken) -> O>(
+        fut_builder: F,
+    ) -> Self {
         let cancel = CancellationToken::new();
         let handle = tokio::spawn(fut_builder(cancel.clone()));
 
         TaskAndCancel {
-            inner: Some(Inner {
-                handle,
-                cancel,
-            }),
+            inner: Some(Inner { handle, cancel }),
         }
     }
 
@@ -41,4 +40,3 @@ struct Inner<R> {
     handle: JoinHandle<R>,
     cancel: CancellationToken,
 }
-

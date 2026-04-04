@@ -1,9 +1,8 @@
-use std::{collections::VecDeque, fmt::Debug, hash::Hash, marker::PhantomData};
-use message_encoding::{m_opt_sum, MessageEncoding};
 use crate::{net::message_io::unknown_id_err, state::DeterministicState};
+use message_encoding::{m_opt_sum, MessageEncoding};
+use std::{collections::VecDeque, fmt::Debug, hash::Hash, marker::PhantomData};
 
-pub trait SourceId: Debug + Clone + Copy + Send + Sync + PartialEq + Eq + Hash + 'static {
-}
+pub trait SourceId: Debug + Clone + Copy + Send + Sync + PartialEq + Eq + Hash + 'static {}
 
 impl<T: Debug + Clone + Copy + Send + Sync + PartialEq + Eq + Hash + 'static> SourceId for T {}
 
@@ -72,10 +71,14 @@ pub enum RecoverableStateAction<I, A> {
     BumpGeneration { new_id: u64 },
 }
 
-impl<I: SourceId + MessageEncoding, A: MessageEncoding> MessageEncoding for RecoverableStateAction<I, A> {
+impl<I: SourceId + MessageEncoding, A: MessageEncoding> MessageEncoding
+    for RecoverableStateAction<I, A>
+{
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         match self {
-            Self::StateAction { source, action } => Ok(1u16.write_to(out)? + source.write_to(out)? + action.write_to(out)?),
+            Self::StateAction { source, action } => {
+                Ok(1u16.write_to(out)? + source.write_to(out)? + action.write_to(out)?)
+            }
             Self::BumpGeneration { new_id } => Ok(2u16.write_to(out)? + new_id.write_to(out)?),
         }
     }
@@ -86,7 +89,9 @@ impl<I: SourceId + MessageEncoding, A: MessageEncoding> MessageEncoding for Reco
                 source: MessageEncoding::read_from(read)?,
                 action: MessageEncoding::read_from(read)?,
             }),
-            2 => Ok(RecoverableStateAction::BumpGeneration { new_id: MessageEncoding::read_from(read)? }),
+            2 => Ok(RecoverableStateAction::BumpGeneration {
+                new_id: MessageEncoding::read_from(read)?,
+            }),
             other => Err(unknown_id_err(other, "RecoverableStateAction")),
         }
     }
@@ -102,8 +107,15 @@ impl<I: SourceId, D: DeterministicState> DeterministicState for RecoverableState
 
     fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
         match action {
-            RecoverableStateAction::StateAction { source, action } => RecoverableStateAction::StateAction { source, action: self.state.authority(action) },
-            RecoverableStateAction::BumpGeneration { new_id } => RecoverableStateAction::BumpGeneration { new_id },
+            RecoverableStateAction::StateAction { source, action } => {
+                RecoverableStateAction::StateAction {
+                    source,
+                    action: self.state.authority(action),
+                }
+            }
+            RecoverableStateAction::BumpGeneration { new_id } => {
+                RecoverableStateAction::BumpGeneration { new_id }
+            }
         }
     }
 
@@ -163,10 +175,7 @@ impl<I: SourceId, D: DeterministicState> RecoverableState<I, D> {
 }
 
 impl MessageEncoding for RecovGenerationEnd {
-    const STATIC_SIZE: Option<usize> = m_opt_sum(&[
-        u64::STATIC_SIZE,
-        u64::STATIC_SIZE,
-    ]);
+    const STATIC_SIZE: Option<usize> = m_opt_sum(&[u64::STATIC_SIZE, u64::STATIC_SIZE]);
 
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
@@ -214,12 +223,14 @@ impl MessageEncoding for RecoverableStateDetails {
                 }
 
                 history
-            }
+            },
         })
     }
 }
 
-impl<I: SourceId, D: MessageEncoding + DeterministicState> MessageEncoding for RecoverableState<I, D> {
+impl<I: SourceId, D: MessageEncoding + DeterministicState> MessageEncoding
+    for RecoverableState<I, D>
+{
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
         sum += self.details.write_to(out)?;
@@ -281,20 +292,44 @@ mod test {
         let mut state1 = RecoverableState::<u64, _>::new(101, MockState(12));
         let mut state2 = state1.clone();
 
-        state1.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
-        state2.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
-        state1.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
-        state2.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
+        state1.update(&RecoverableStateAction::StateAction {
+            source: 3,
+            action: (),
+        });
+        state2.update(&RecoverableStateAction::StateAction {
+            source: 3,
+            action: (),
+        });
+        state1.update(&RecoverableStateAction::StateAction {
+            source: 3,
+            action: (),
+        });
+        state2.update(&RecoverableStateAction::StateAction {
+            source: 3,
+            action: (),
+        });
 
         state1.update(&RecoverableStateAction::BumpGeneration { new_id: 1234 });
-        state1.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
-        state1.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
+        state1.update(&RecoverableStateAction::StateAction {
+            source: 3,
+            action: (),
+        });
+        state1.update(&RecoverableStateAction::StateAction {
+            source: 3,
+            action: (),
+        });
 
         assert!(state1.details.can_recover_follower(&state2.details));
 
         state2.update(&RecoverableStateAction::BumpGeneration { new_id: 1234 });
-        state2.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
-        state2.update(&RecoverableStateAction::StateAction{ source: 3, action: () });
+        state2.update(&RecoverableStateAction::StateAction {
+            source: 3,
+            action: (),
+        });
+        state2.update(&RecoverableStateAction::StateAction {
+            source: 3,
+            action: (),
+        });
 
         assert_eq!(state1, state2);
     }
@@ -318,7 +353,8 @@ mod test {
                         generation: 9,
                         next_sequence: 280,
                     },
-                ].into(),
+                ]
+                .into(),
             },
             state: MockState(300),
             _phantom: PhantomData::<u64>,

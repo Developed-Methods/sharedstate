@@ -3,7 +3,10 @@ use std::time::Duration;
 use message_encoding::MessageEncoding;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use super::{io::SyncIO, message_io::{read_message_opt, send_message, send_zero_message}};
+use super::{
+    io::SyncIO,
+    message_io::{read_message_opt, send_message, send_zero_message},
+};
 
 #[derive(Clone, Debug)]
 pub struct NetIoSettings {
@@ -96,14 +99,21 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
                 Some(msg) => {
                     tokio::time::timeout(
                         self.settings.process_timeout,
-                        send_message(&mut buffer, &msg, &mut self.output, self.settings.process_timeout)
-                    ).await
+                        send_message(
+                            &mut buffer,
+                            &msg,
+                            &mut self.output,
+                            self.settings.process_timeout,
+                        ),
+                    )
+                    .await
                 }
                 None => {
                     tokio::time::timeout(
                         self.settings.process_timeout,
-                        send_zero_message(&mut self.output)
-                    ).await
+                        send_zero_message(&mut self.output),
+                    )
+                    .await
                 }
             };
 

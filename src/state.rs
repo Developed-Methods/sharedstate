@@ -1,5 +1,12 @@
-use std::{collections::VecDeque, ops::{Deref, DerefMut}, sync::{atomic::{AtomicUsize, Ordering}, Arc}};
 use parking_lot::{RwLock, RwLockReadGuard};
+use std::{
+    collections::VecDeque,
+    ops::{Deref, DerefMut},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use crate::utils::PanicHelper;
 
@@ -24,10 +31,7 @@ impl<D: DeterministicState + Clone> SharedState<D> {
 
         let inner = Arc::new(StateInner {
             read_pos: AtomicUsize::new(0),
-            states: [
-                RwLock::new(state.clone()),
-                RwLock::new(state),
-            ]
+            states: [RwLock::new(state.clone()), RwLock::new(state)],
         });
 
         let shared = SharedState {
@@ -46,7 +50,7 @@ impl<D: DeterministicState + Clone> SharedState<D> {
             FlushedUpdater {
                 updater,
                 state: None,
-            }
+            },
         )
     }
 }
@@ -79,7 +83,7 @@ impl<D: DeterministicState> FlushedUpdater<D> {
         if let Some(state) = &mut self.state {
             let mut ptr = StatePtr {
                 item: state,
-                as_mut: false
+                as_mut: false,
             };
 
             let result = update(&mut ptr);
@@ -94,7 +98,7 @@ impl<D: DeterministicState> FlushedUpdater<D> {
 
             let mut ptr = StatePtr {
                 item: &mut state,
-                as_mut: false
+                as_mut: false,
             };
 
             let result = update(&mut ptr);
@@ -128,18 +132,20 @@ impl<D: DeterministicState> FlushedUpdater<D> {
 
 impl<D: DeterministicState> Clone for SharedState<D> {
     fn clone(&self) -> Self {
-        SharedState { inner: self.inner.clone() }
+        SharedState {
+            inner: self.inner.clone(),
+        }
     }
 }
 
 impl<D: DeterministicState> SharedState<D> {
-    pub fn read(&self) -> RwLockReadGuard<D> {
+    pub fn read(&self) -> RwLockReadGuard<'_, D> {
         self.inner.read()
     }
 }
 
 impl<D: DeterministicState> StateInner<D> {
-    pub fn read(&self) -> RwLockReadGuard<D> {
+    pub fn read(&self) -> RwLockReadGuard<'_, D> {
         for _ in 0..1048576 {
             let pos = self.read_pos.load(Ordering::Acquire);
             let idx = pos & 0x1;
@@ -165,7 +171,9 @@ impl<D: DeterministicState> LeadUpdater<D> {
 
         let seq = self.state.accept_seq();
         self.state.update(&authority);
-        self.updater.queue_sequenced(seq, authority).panic("invalid sequence")
+        self.updater
+            .queue_sequenced(seq, authority)
+            .panic("invalid sequence")
     }
 
     pub fn update_ready(&mut self) -> bool {
@@ -189,7 +197,9 @@ impl<D: DeterministicState> LeadUpdater<D> {
     }
 
     pub fn into_follow(self) -> FollowUpdater<D> {
-        FollowUpdater { updater: self.updater }
+        FollowUpdater {
+            updater: self.updater,
+        }
     }
 
     pub fn into_flushed(mut self) -> FlushedUpdater<D> {
@@ -248,7 +258,10 @@ pub struct FollowUpdater<D: DeterministicState> {
 
 impl<D: DeterministicState> FollowUpdater<D> {
     pub fn queue(&mut self, seq: u64, action: D::AuthorityAction) -> &D::AuthorityAction {
-        self.updater.queue_sequenced(seq, action).panic("invalid sequence").1
+        self.updater
+            .queue_sequenced(seq, action)
+            .panic("invalid sequence")
+            .1
     }
 
     pub fn update_ready(&self) -> bool {
@@ -263,7 +276,7 @@ impl<D: DeterministicState> FollowUpdater<D> {
         self.updater.flush_queue();
     }
 
-    pub fn read_state(&self) -> RwLockReadGuard<D> {
+    pub fn read_state(&self) -> RwLockReadGuard<'_, D> {
         self.updater.inner.states[0].read()
     }
 
@@ -317,7 +330,9 @@ struct StateInner<D: DeterministicState> {
 
 impl<D: DeterministicState> StateUpdater<D> {
     pub fn shared(&self) -> SharedState<D> {
-        SharedState { inner: self.inner.clone() }
+        SharedState {
+            inner: self.inner.clone(),
+        }
     }
 
     pub fn reset(&mut self, state: D) {
@@ -347,7 +362,11 @@ impl<D: DeterministicState> StateUpdater<D> {
         self.queue_accept_seq = state_sequence;
     }
 
-    pub fn queue_sequenced(&mut self, seq: u64, item: D::AuthorityAction) -> Result<(u64, &D::AuthorityAction), D::AuthorityAction> {
+    pub fn queue_sequenced(
+        &mut self,
+        seq: u64,
+        item: D::AuthorityAction,
+    ) -> Result<(u64, &D::AuthorityAction), D::AuthorityAction> {
         if self.queue_accept_seq != seq {
             return Err(item);
         }
@@ -381,7 +400,7 @@ impl<D: DeterministicState> StateUpdater<D> {
         assert_eq!(self.queue.len(), 0);
     }
 
-    pub fn read(&self) -> RwLockReadGuard<D> {
+    pub fn read(&self) -> RwLockReadGuard<'_, D> {
         self.inner.read()
     }
 
@@ -409,7 +428,11 @@ impl<D: DeterministicState> StateUpdater<D> {
                 had_update = true;
                 state.update(action);
 
-                assert_eq!(state.accept_seq(), next_seq, "state::update(action) did not increment sequence");
+                assert_eq!(
+                    state.accept_seq(),
+                    next_seq,
+                    "state::update(action) did not increment sequence"
+                );
                 next_seq += 1;
             }
 
@@ -425,8 +448,7 @@ impl<D: DeterministicState> StateUpdater<D> {
     }
 
     fn trim_queue(&mut self) {
-        let trim_size = self.queue_offset[0]
-            .min(self.queue_offset[1]);
+        let trim_size = self.queue_offset[0].min(self.queue_offset[1]);
 
         for _ in 0..trim_size {
             let _ = self.queue.pop_front();
@@ -456,8 +478,11 @@ mod test {
 
         fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
             (
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
-                action
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+                action,
             )
         }
 

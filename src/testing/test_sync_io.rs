@@ -1,6 +1,24 @@
-use std::{collections::{hash_map::{self, Entry}, HashMap, HashSet}, future::Future, pin::Pin, sync::{atomic::{AtomicU64, Ordering}, Arc}, task::{Context, Poll}};
-use tokio::{io::{duplex, split, AsyncRead, AsyncWrite, DuplexStream, ReadHalf, WriteHalf}, sync::{mpsc::{channel, Receiver, Sender}, oneshot, Mutex, RwLock}};
 use crate::net::io::{SyncConnection, SyncIO};
+use std::{
+    collections::{
+        hash_map::{self, Entry},
+        HashMap, HashSet,
+    },
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+};
+use tokio::{
+    io::{duplex, split, AsyncRead, AsyncWrite, DuplexStream, ReadHalf, WriteHalf},
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        oneshot, Mutex, RwLock,
+    },
+};
 
 use super::blocking_rw_lock;
 
@@ -19,11 +37,7 @@ impl TestSyncNet {
     }
 
     pub async fn block_connection(&self, a: u64, b: u64, block: bool) {
-        let key = if b < a {
-            (b, a)
-        } else {
-            (a, b)
-        };
+        let key = if b < a { (b, a) } else { (a, b) };
 
         let mut lock = self.0.write().await;
         if block {
@@ -40,7 +54,9 @@ impl TestSyncNet {
 
     pub async fn kill_connection(&self, from: u64, to: u64, mode: TestIOKillMode) -> u64 {
         let mut lock = self.0.write().await;
-        let Some(conns) = lock.connections.get_mut(&(from, to)) else { return 0 };
+        let Some(conns) = lock.connections.get_mut(&(from, to)) else {
+            return 0;
+        };
 
         let mut count = 0;
         for ConnManage { kill, .. } in conns {
@@ -60,7 +76,9 @@ impl TestSyncNet {
     pub async fn create(&self, listen: u64) -> Option<TestSyncIO> {
         let rx = {
             let mut lock = self.0.write().await;
-            let Entry::Vacant(entry) = lock.listeners.entry(listen) else { return None };
+            let Entry::Vacant(entry) = lock.listeners.entry(listen) else {
+                return None;
+            };
 
             let (tx, rx) = channel(1024);
             entry.insert(tx);
@@ -115,11 +133,17 @@ impl SyncIO for TestSyncIO {
     type Read = BreakableIO<ReadHalf<DuplexStream>>;
     type Write = BreakableIO<WriteHalf<DuplexStream>>;
 
-    async fn connect(&self, remote: &Self::Address) -> std::io::Result<crate::net::io::SyncConnection<Self>> {
+    async fn connect(
+        &self,
+        remote: &Self::Address,
+    ) -> std::io::Result<crate::net::io::SyncConnection<Self>> {
         let mut lock = self.net.0.write().await;
 
         let Some(tx) = lock.listeners.get(remote) else {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not listener on address"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not listener on address",
+            ));
         };
 
         let key = if self.listen_addr < *remote {
@@ -129,22 +153,49 @@ impl SyncIO for TestSyncIO {
         };
 
         if lock.block_connections.contains(&key) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "connection blocked"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "connection blocked",
+            ));
         }
 
         let (client, server) = duplex(1024);
         if tx.send((self.listen_addr, server)).await.is_err() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not listener on address"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not listener on address",
+            ));
         }
 
         let conn_id = CONN_ID.fetch_add(1, Ordering::SeqCst);
         let (read, write) = split(client);
 
-        let (read, read_kill) = BreakableIO::new((*remote, self.listen_addr, conn_id), self.net.clone(), read);
-        let (write, write_kill) = BreakableIO::new((self.listen_addr, *remote, conn_id), self.net.clone(), write);
+        let (read, read_kill) =
+            BreakableIO::new((*remote, self.listen_addr, conn_id), self.net.clone(), read);
+        let (write, write_kill) = BreakableIO::new(
+            (self.listen_addr, *remote, conn_id),
+            self.net.clone(),
+            write,
+        );
 
-        lock.add_conn(*remote, self.listen_addr, ConnManage { id: conn_id, kill: Some(read_kill), rate_limit_bps: Arc::new(AtomicU64::new(0)) });
-        lock.add_conn(self.listen_addr, *remote, ConnManage { id: conn_id, kill: Some(write_kill), rate_limit_bps: Arc::new(AtomicU64::new(0)) });
+        lock.add_conn(
+            *remote,
+            self.listen_addr,
+            ConnManage {
+                id: conn_id,
+                kill: Some(read_kill),
+                rate_limit_bps: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        lock.add_conn(
+            self.listen_addr,
+            *remote,
+            ConnManage {
+                id: conn_id,
+                kill: Some(write_kill),
+                rate_limit_bps: Arc::new(AtomicU64::new(0)),
+            },
+        );
 
         Ok(SyncConnection {
             remote: *remote,
@@ -157,25 +208,49 @@ impl SyncIO for TestSyncIO {
         let (peer_id, client) = {
             let mut lock = self.next.lock().await;
             let Some(recv) = lock.recv().await else {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "network shutdown"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "network shutdown",
+                ));
             };
             recv
         };
 
         let (read, write) = split(client);
         let conn_id = CONN_ID.fetch_add(1, Ordering::SeqCst);
-        
-        let (read, read_kill) = BreakableIO::new((peer_id, self.listen_addr, conn_id), self.net.clone(), read);
-        let (write, write_kill) = BreakableIO::new((self.listen_addr, peer_id, conn_id), self.net.clone(), write);
+
+        let (read, read_kill) =
+            BreakableIO::new((peer_id, self.listen_addr, conn_id), self.net.clone(), read);
+        let (write, write_kill) = BreakableIO::new(
+            (self.listen_addr, peer_id, conn_id),
+            self.net.clone(),
+            write,
+        );
 
         let mut lock = self.net.0.write().await;
-        lock.add_conn(peer_id, self.listen_addr, ConnManage { id: conn_id, kill: Some(read_kill), rate_limit_bps: Arc::new(AtomicU64::new(0)) });
-        lock.add_conn(self.listen_addr, peer_id, ConnManage { id: conn_id, kill: Some(write_kill), rate_limit_bps: Arc::new(AtomicU64::new(0)) });
+        lock.add_conn(
+            peer_id,
+            self.listen_addr,
+            ConnManage {
+                id: conn_id,
+                kill: Some(read_kill),
+                rate_limit_bps: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        lock.add_conn(
+            self.listen_addr,
+            peer_id,
+            ConnManage {
+                id: conn_id,
+                kill: Some(write_kill),
+                rate_limit_bps: Arc::new(AtomicU64::new(0)),
+            },
+        );
 
         Ok(SyncConnection {
             remote: peer_id,
             read,
-            write
+            write,
         })
     }
 }
@@ -189,7 +264,11 @@ pub struct BreakableIO<I> {
 }
 
 impl<I: Unpin> BreakableIO<I> {
-    fn new(conn_id: (u64, u64, u64), net: TestSyncNet, io: I) -> (Self, oneshot::Sender<TestIOKillMode>) {
+    fn new(
+        conn_id: (u64, u64, u64),
+        net: TestSyncNet,
+        io: I,
+    ) -> (Self, oneshot::Sender<TestIOKillMode>) {
         let (tx, rx) = oneshot::channel();
 
         (
@@ -200,7 +279,7 @@ impl<I: Unpin> BreakableIO<I> {
                 kill: rx,
                 killed: None,
             },
-            tx
+            tx,
         )
     }
 
@@ -215,7 +294,10 @@ impl<I: Unpin> BreakableIO<I> {
 
         match self.killed {
             Some(TestIOKillMode::Timeout) => Some(Poll::Pending),
-            Some(TestIOKillMode::Shutdown) => Some(Poll::Ready(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection shutdown"))),
+            Some(TestIOKillMode::Shutdown) => Some(Poll::Ready(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection shutdown",
+            ))),
             None => None,
         }
     }
@@ -238,7 +320,11 @@ impl<I> Drop for BreakableIO<I> {
 }
 
 impl<I: AsyncRead + Unpin> AsyncRead for BreakableIO<I> {
-    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>,) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         match self.poll_kill(cx) {
             Some(Poll::Pending) => return Poll::Pending,
             Some(Poll::Ready(err)) => return Poll::Ready(Err(err)),
@@ -252,10 +338,10 @@ impl<I: AsyncRead + Unpin> AsyncRead for BreakableIO<I> {
 
 impl<I: AsyncWrite + Unpin> AsyncWrite for BreakableIO<I> {
     fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> Poll<Result<usize, std::io::Error>> {
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
         match self.poll_kill(cx) {
             Some(Poll::Pending) => return Poll::Pending,
             Some(Poll::Ready(err)) => return Poll::Ready(Err(err)),
@@ -266,7 +352,10 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for BreakableIO<I> {
         io.poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), std::io::Error>> {
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
         match self.poll_kill(cx) {
             Some(Poll::Pending) => return Poll::Pending,
             Some(Poll::Ready(err)) => return Poll::Ready(Err(err)),
@@ -277,7 +366,10 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for BreakableIO<I> {
         io.poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), std::io::Error>> {
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
         match self.poll_kill(cx) {
             Some(Poll::Pending) => return Poll::Pending,
             Some(Poll::Ready(err)) => return Poll::Ready(Err(err)),
@@ -295,4 +387,3 @@ impl Drop for TestSyncIO {
         lock.listeners.remove(&self.listen_addr);
     }
 }
-
