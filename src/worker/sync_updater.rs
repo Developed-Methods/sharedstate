@@ -1,5 +1,6 @@
 use std::{
-    hash::{Hash, Hasher, SipHasher},
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -194,7 +195,7 @@ where
 
         self.mode = match offline.try_follow(action_tx, target.authority_rx) {
             Ok(follow) => Mode::Follow(follow),
-            Err(offline) => Mode::Offline(offline),
+            Err(offline) => Mode::Offline(*offline),
         };
 
         self.is_following()
@@ -414,7 +415,7 @@ where
         mut self,
         action_tx: Sender<(I, D::Action)>,
         authority_rx: SequencedReceiver<RecoverableStateAction<I, D::AuthorityAction>>,
-    ) -> Result<FollowMode<I, D>, Self> {
+    ) -> Result<FollowMode<I, D>, Box<Self>> {
         let pair = match (SequencedRxAndUpdater {
             rx: authority_rx,
             updater: self.flushed_updater,
@@ -424,7 +425,7 @@ where
             Ok(v) => v,
             Err(pair) => {
                 self.flushed_updater = pair.updater;
-                return Err(self);
+                return Err(Box::new(self));
             }
         };
 
@@ -625,7 +626,7 @@ impl<I: SourceId, D: DeterministicState> ActionToLocalLead<I, D> {
 }
 
 fn rnd_id<S: SourceId>(local_id: S) -> u64 {
-    let mut hash = SipHasher::new();
+    let mut hash = DefaultHasher::new();
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -644,10 +645,23 @@ mod test {
             state_tests::{TestState, TestStateAction},
         },
         utils::PanicHelper,
-        worker::sync_updater::FollowTarget,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::mpsc::channel;
+
+    async fn wait_for<F: Fn() -> bool>(msg: &str, condition: F) {
+        let start = Instant::now();
+        loop {
+            if condition() {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "{msg}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 
     #[tokio::test]
     async fn sync_updater_simple_leader_test() {
@@ -658,7 +672,10 @@ mod test {
             .send(TestStateAction::Set { slot: 0, value: 33 })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        wait_for("leader did not apply local action", || {
+            a.state.read().state().numbers[0] == 33
+        })
+        .await;
         assert_eq!(a.state.read().state().numbers[0], 33);
     }
 
@@ -707,12 +724,13 @@ mod test {
             .send(TestStateAction::Set { slot: 3, value: 11 })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        assert_eq!(a.state().read().accept_seq(), 4);
-        assert_eq!(b.state().read().accept_seq(), 4);
-        assert_eq!(c.state().read().accept_seq(), 4);
-        assert_eq!(d.state().read().accept_seq(), 4);
+        wait_for("initial fork setup did not converge", || {
+            a.state().read().accept_seq() == 4
+                && b.state().read().accept_seq() == 4
+                && c.state().read().accept_seq() == 4
+                && d.state().read().accept_seq() == 4
+        })
+        .await;
 
         /* FORK: C lead followed by D */
         c.lead().await;
@@ -773,12 +791,13 @@ mod test {
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        assert_eq!(a.state().read().accept_seq(), 8);
-        assert_eq!(b.state().read().accept_seq(), 8);
-        assert_eq!(c.state().read().accept_seq(), 8);
-        assert_eq!(d.state().read().accept_seq(), 8);
+        wait_for("forked recovery state did not converge", || {
+            a.state().read().accept_seq() == 8
+                && b.state().read().accept_seq() == 8
+                && c.state().read().accept_seq() == 8
+                && d.state().read().accept_seq() == 8
+        })
+        .await;
 
         /* a cannot recover to fork'd state */
         {
@@ -840,12 +859,13 @@ mod test {
             .send(TestStateAction::Set { slot: 3, value: 11 })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        assert_eq!(a.state().read().accept_seq(), 4);
-        assert_eq!(b.state().read().accept_seq(), 4);
-        assert_eq!(c.state().read().accept_seq(), 4);
-        assert_eq!(d.state().read().accept_seq(), 4);
+        wait_for("fork reject setup did not converge", || {
+            a.state().read().accept_seq() == 4
+                && b.state().read().accept_seq() == 4
+                && c.state().read().accept_seq() == 4
+                && d.state().read().accept_seq() == 4
+        })
+        .await;
 
         /* FORK: c lead and d follow c */
         c.lead().await;
@@ -894,12 +914,13 @@ mod test {
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        assert_eq!(a.state().read().accept_seq(), 7);
-        assert_eq!(b.state().read().accept_seq(), 7);
-        assert_eq!(c.state().read().accept_seq(), 8);
-        assert_eq!(d.state().read().accept_seq(), 8);
+        wait_for("fork reject sequences did not converge", || {
+            a.state().read().accept_seq() == 7
+                && b.state().read().accept_seq() == 7
+                && c.state().read().accept_seq() == 8
+                && d.state().read().accept_seq() == 8
+        })
+        .await;
 
         /* a cannot recover to fork'd state */
         {
@@ -959,12 +980,13 @@ mod test {
             .send(TestStateAction::Set { slot: 3, value: 11 })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        assert_eq!(a.state().read().accept_seq(), 4);
-        assert_eq!(b.state().read().accept_seq(), 4);
-        assert_eq!(c.state().read().accept_seq(), 4);
-        assert_eq!(d.state().read().accept_seq(), 4);
+        wait_for("initial recovery setup did not converge", || {
+            a.state().read().accept_seq() == 4
+                && b.state().read().accept_seq() == 4
+                && c.state().read().accept_seq() == 4
+                && d.state().read().accept_seq() == 4
+        })
+        .await;
 
         /* d goes offline so we can recover later */
         d.go_offline().await;
@@ -1003,7 +1025,12 @@ mod test {
             })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        wait_for("post-B leader updates did not converge", || {
+            a.state().read().accept_seq() == 8
+                && b.state().read().accept_seq() == 8
+                && c.state().read().accept_seq() == 8
+        })
+        .await;
 
         /* promote C and have B follow */
         c.lead().await;
@@ -1039,12 +1066,13 @@ mod test {
             })
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        assert_eq!(a.state().read().accept_seq(), 12);
-        assert_eq!(b.state().read().accept_seq(), 12);
-        assert_eq!(c.state().read().accept_seq(), 12);
-        assert_eq!(d.state().read().accept_seq(), 4);
+        wait_for("multi-generation recovery did not converge", || {
+            a.state().read().accept_seq() == 12
+                && b.state().read().accept_seq() == 12
+                && c.state().read().accept_seq() == 12
+                && d.state().read().accept_seq() == 4
+        })
+        .await;
 
         /* have D recover from A */
         {
@@ -1058,11 +1086,13 @@ mod test {
             a.provide_action_rx(action_rx);
         }
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(a.state().read().accept_seq(), 12);
-        assert_eq!(b.state().read().accept_seq(), 12);
-        assert_eq!(c.state().read().accept_seq(), 12);
-        assert_eq!(d.state().read().accept_seq(), 12);
+        wait_for("late follower recovery did not converge", || {
+            a.state().read().accept_seq() == 12
+                && b.state().read().accept_seq() == 12
+                && c.state().read().accept_seq() == 12
+                && d.state().read().accept_seq() == 12
+        })
+        .await;
 
         let a_state = a.state.read().clone();
         let b_state = b.state.read().clone();

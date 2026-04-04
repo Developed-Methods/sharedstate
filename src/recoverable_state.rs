@@ -175,7 +175,8 @@ impl<I: SourceId, D: DeterministicState> RecoverableState<I, D> {
 }
 
 impl MessageEncoding for RecovGenerationEnd {
-    const STATIC_SIZE: Option<usize> = m_opt_sum(&[u64::STATIC_SIZE, u64::STATIC_SIZE]);
+    const STATIC_SIZE: Option<usize> =
+        m_opt_sum(&[u64::STATIC_SIZE, u64::STATIC_SIZE, u64::STATIC_SIZE]);
 
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
@@ -359,5 +360,19 @@ mod test {
             state: MockState(300),
             _phantom: PhantomData::<u64>,
         });
+    }
+
+    #[test]
+    fn recov_generation_end_static_size_matches_encoding_test() {
+        let mut out = Vec::new();
+        let value = RecovGenerationEnd {
+            old_id: 10,
+            generation: 11,
+            next_sequence: 12,
+        };
+
+        let written = value.write_to(&mut out).unwrap();
+        assert_eq!(Some(written), RecovGenerationEnd::STATIC_SIZE);
+        assert_eq!(written, out.len());
     }
 }

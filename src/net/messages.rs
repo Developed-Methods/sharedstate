@@ -9,6 +9,9 @@ use crate::{
 
 use super::{io::SyncIO, message_io::unknown_id_err};
 
+const MAX_PEER_LIST_ITEMS: usize = 16_384;
+const MAX_LEADER_PATH_ITEMS: usize = 256;
+
 pub enum SyncRequest<I: SyncIO, D: DeterministicState> {
     MyAddress(I::Address),
     Ping(u64),
@@ -91,7 +94,7 @@ where
             3 => Self::SubscribeFresh,
             4 => Self::ShareLeaderPath,
             5 => Self::SendMePeers,
-            6 => Self::NoticePeers(read_vec(read)?),
+            6 => Self::NoticePeers(read_vec_bounded(read, MAX_PEER_LIST_ITEMS, "NoticePeers")?),
             7 => Self::SubscribeRecovery(MessageEncoding::read_from(read)?),
             8 => Self::Action {
                 source: MessageEncoding::read_from(read)?,
@@ -150,8 +153,8 @@ where
                 MessageEncoding::read_from(read)?,
                 MessageEncoding::read_from(read)?,
             ),
-            5 => Self::LeaderPath(read_vec(read)?),
-            6 => Self::Peers(read_vec(read)?),
+            5 => Self::LeaderPath(read_vec_bounded(read, MAX_LEADER_PATH_ITEMS, "LeaderPath")?),
+            6 => Self::Peers(read_vec_bounded(read, MAX_PEER_LIST_ITEMS, "Peers")?),
             other => return Err(unknown_id_err(other, "SyncResponse")),
         })
     }
@@ -168,11 +171,62 @@ fn write_vec<T: MessageEncoding, W: std::io::Write>(
     Ok(sum)
 }
 
-fn read_vec<T: MessageEncoding, R: std::io::Read>(read: &mut R) -> std::io::Result<Vec<T>> {
+fn read_vec_bounded<T: MessageEncoding, R: std::io::Read>(
+    read: &mut R,
+    max_items: usize,
+    field_name: &str,
+) -> std::io::Result<Vec<T>> {
     let count = u64::read_from(read)? as usize;
+    if max_items < count {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{field_name} count {count} exceeds maximum {max_items}"),
+        ));
+    }
     let mut vec = Vec::with_capacity(count);
     for _ in 0..count {
         vec.push(MessageEncoding::read_from(read)?);
     }
     Ok(vec)
+}
+
+#[cfg(test)]
+mod test {
+    use message_encoding::MessageEncoding;
+
+    use crate::testing::state_tests::TestState;
+
+    use super::*;
+
+    #[test]
+    fn sync_response_rejects_oversized_peers_test() {
+        let mut data = Vec::new();
+        6u16.write_to(&mut data).unwrap();
+        ((MAX_PEER_LIST_ITEMS + 1) as u64).write_to(&mut data).unwrap();
+
+        let err = match SyncResponse::<crate::testing::test_sync_io::TestSyncIO, TestState>::read_from(
+            &mut &data[..],
+        ) {
+            Ok(_) => panic!("expected oversized peers to fail decoding"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn sync_response_rejects_oversized_leader_path_test() {
+        let mut data = Vec::new();
+        5u16.write_to(&mut data).unwrap();
+        ((MAX_LEADER_PATH_ITEMS + 1) as u64)
+            .write_to(&mut data)
+            .unwrap();
+
+        let err = match SyncResponse::<crate::testing::test_sync_io::TestSyncIO, TestState>::read_from(
+            &mut &data[..],
+        ) {
+            Ok(_) => panic!("expected oversized leader path to fail decoding"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 }

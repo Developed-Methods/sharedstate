@@ -277,7 +277,7 @@ impl<D: DeterministicState> FollowUpdater<D> {
     }
 
     pub fn read_state(&self) -> RwLockReadGuard<'_, D> {
-        self.updater.inner.states[0].read()
+        self.updater.inner.read()
     }
 
     pub fn accept_seq(&self) -> u64 {
@@ -530,5 +530,17 @@ mod test {
             let read = state.read();
             assert_eq!(read.numbers.len(), 1);
         }
+    }
+
+    #[test]
+    fn follow_updater_read_state_tracks_active_buffer_test() {
+        let (_, updater) = SharedState::new(TestState::default());
+        let mut lead = updater.into_lead();
+
+        lead.queue(1);
+        assert!(lead.update());
+
+        let follow = lead.into_follow();
+        assert_eq!(follow.read_state().accept_seq, 1);
     }
 }

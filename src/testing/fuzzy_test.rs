@@ -7,7 +7,6 @@ use std::{
 };
 
 use rand_chacha::rand_core::{RngCore, SeedableRng};
-use tokio::sync::mpsc::channel;
 use tokio_util::sync::CancellationToken;
 
 use crate::{

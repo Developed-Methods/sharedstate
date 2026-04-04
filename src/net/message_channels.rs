@@ -12,6 +12,7 @@ use super::{
 pub struct NetIoSettings {
     pub process_timeout: Duration,
     pub message_timeout: Duration,
+    pub max_message_size_bytes: usize,
 }
 
 impl Default for NetIoSettings {
@@ -19,6 +20,7 @@ impl Default for NetIoSettings {
         Self {
             process_timeout: Duration::from_secs(2),
             message_timeout: Duration::from_secs(12),
+            max_message_size_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -48,6 +50,7 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> ReadChannel<I, M> {
                     &mut self.input,
                     self.settings.process_timeout,
                     Some(self.settings.message_timeout),
+                    self.settings.max_message_size_bytes,
                 ) => read_opt_res,
                 _ = self.output.closed() => {
                     tracing::info!("output closed, stopping read");

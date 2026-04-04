@@ -11,7 +11,7 @@ pub async fn read_message<M: MessageEncoding, R: AsyncRead + Unpin>(
     read: &mut R,
     progress_timeout: Duration,
 ) -> Result<Option<M>, ReadMessageError> {
-    read_message_opt(buffer, read, progress_timeout, None).await
+    read_message_opt(buffer, read, progress_timeout, None, MessageSizeHeader::MAX as usize).await
 }
 
 pub async fn read_message_opt<M: MessageEncoding, R: AsyncRead + Unpin>(
@@ -19,10 +19,12 @@ pub async fn read_message_opt<M: MessageEncoding, R: AsyncRead + Unpin>(
     read: &mut R,
     progress_timeout: Duration,
     recv_timeout: Option<Duration>,
+    max_message_size: usize,
 ) -> Result<Option<M>, ReadMessageError> {
     let _assert = black_box(M::_ASSERT);
 
-    if !read_message_to_vec(buffer, read, progress_timeout, recv_timeout).await? {
+    if !read_message_to_vec(buffer, read, progress_timeout, recv_timeout, max_message_size).await?
+    {
         return Ok(None);
     }
 
@@ -36,6 +38,7 @@ pub async fn read_message_to_vec<R: AsyncRead + Unpin>(
     read: &mut R,
     progress_timeout: Duration,
     recv_timeout: Option<Duration>,
+    max_message_size: usize,
 ) -> Result<bool, ReadMessageError> {
     let mut len_bytes = [0u8; MESSAGE_HEADER_SIZE];
 
@@ -53,6 +56,9 @@ pub async fn read_message_to_vec<R: AsyncRead + Unpin>(
     let msg_len = MessageSizeHeader::from_be_bytes(len_bytes) as usize;
     if msg_len == 0 {
         return Ok(false);
+    }
+    if max_message_size < msg_len {
+        return Err(ReadMessageError::MessageTooLarge(msg_len));
     }
 
     buffer.clear();
@@ -77,6 +83,7 @@ pub async fn read_message_to_vec<R: AsyncRead + Unpin>(
 pub enum ReadMessageError {
     MessageReadTimeout,
     NextMessageTimeout(Duration),
+    MessageTooLarge(usize),
     SizeReadError(std::io::Error),
     MessageReadError(std::io::Error),
     EncodingError(std::io::Error),
@@ -92,6 +99,10 @@ impl From<ReadMessageError> for std::io::Error {
                     "timeout reading remaining message data",
                 )
             }
+            ReadMessageError::MessageTooLarge(len) => std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("message size {len} exceeds configured maximum"),
+            ),
             ReadMessageError::Closed => std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "end of file reading message",
@@ -134,18 +145,14 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
         "M::write_to returned incorrect number of bytes"
     );
 
-    /* if static size is known, we've already written size with MAX_SIZE var */
     if let Some(size) = M::STATIC_SIZE {
         assert_eq!(
             size, bytes_written,
             "M::STATIC_SIZE does not match M::write_to"
         );
     }
-    /* write size to start of buffer */
-    else {
-        buffer[..MESSAGE_HEADER_SIZE]
-            .copy_from_slice(&(bytes_written as MessageSizeHeader).to_be_bytes());
-    }
+    buffer[..MESSAGE_HEADER_SIZE]
+        .copy_from_slice(&(bytes_written as MessageSizeHeader).to_be_bytes());
 
     /* note: send in batches with timeout to ensure connection isn't hanging and we also can
      * support sending really large messages */
@@ -219,10 +226,33 @@ pub const fn m_max_opt_list(samples: &'static [Option<usize>]) -> Option<usize> 
 mod test {
     use std::time::Duration;
 
+    use message_encoding::m_opt_sum;
     use tokio::io::duplex;
 
     use super::*;
     use crate::testing::state_tests::TestStateAction;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct FixedMessage {
+        a: u64,
+        b: u64,
+    }
+
+    impl MessageEncoding for FixedMessage {
+        const STATIC_SIZE: Option<usize> = m_opt_sum(&[u64::STATIC_SIZE, u64::STATIC_SIZE]);
+        const MAX_SIZE: Option<usize> = Self::STATIC_SIZE;
+
+        fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
+            Ok(self.a.write_to(out)? + self.b.write_to(out)?)
+        }
+
+        fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
+            Ok(Self {
+                a: MessageEncoding::read_from(read)?,
+                b: MessageEncoding::read_from(read)?,
+            })
+        }
+    }
 
     #[tokio::test]
     async fn message_io_test() {
@@ -242,9 +272,52 @@ mod test {
             &mut b,
             Duration::from_secs(1),
             Some(Duration::from_secs(2)),
+            1024,
         )
         .await
         .unwrap();
         assert_eq!(Some(send), read);
+    }
+
+    #[tokio::test]
+    async fn message_io_fixed_size_message_test() {
+        let (mut a, mut b) = duplex(2048);
+        let mut buffer = Vec::with_capacity(1024);
+
+        let send = FixedMessage { a: 7, b: 11 };
+        send_message(&mut buffer, &send, &mut a, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let read = read_message_opt(
+            &mut buffer,
+            &mut b,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(2)),
+            1024,
+        )
+        .await
+        .unwrap();
+        assert_eq!(Some(send), read);
+    }
+
+    #[tokio::test]
+    async fn message_io_rejects_oversized_message_test() {
+        let (mut a, mut b) = duplex(2048);
+        a.write_all(&(128u32).to_be_bytes()).await.unwrap();
+        a.write_all(&[1u8; 128]).await.unwrap();
+
+        let mut buffer = Vec::new();
+        let err = read_message_opt::<FixedMessage, _>(
+            &mut buffer,
+            &mut b,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(2)),
+            64,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ReadMessageError::MessageTooLarge(128)));
     }
 }

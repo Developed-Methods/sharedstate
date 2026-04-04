@@ -145,6 +145,20 @@ pub enum Timer {
     BroadcastPeers,
 }
 
+impl Timer {
+    fn from_index(idx: usize) -> Option<Self> {
+        match idx {
+            0 => Some(Self::SendVerifyLeader),
+            1 => Some(Self::RequireVerifyLeader),
+            2 => Some(Self::RejectPeer),
+            3 => Some(Self::ConnectToPeer),
+            4 => Some(Self::RequireState),
+            5 => Some(Self::BroadcastPeers),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Timers {
     next_scan: usize,
@@ -170,7 +184,9 @@ impl Timers {
         let mut timers = Vec::new();
         for (pos, state) in self.timers.iter().enumerate() {
             if state.is_set() {
-                timers.push(unsafe { std::mem::transmute::<usize, Timer>(pos) });
+                timers.push(Timer::from_index(pos).unwrap_or_else(|| {
+                    panic!("invalid timer index in active set: {pos}");
+                }));
             }
         }
         timers
@@ -212,7 +228,8 @@ impl Timers {
         };
 
         self.timers[done_timer_pos].clear();
-        unsafe { std::mem::transmute::<usize, Timer>(done_timer_pos) }
+        Timer::from_index(done_timer_pos)
+            .unwrap_or_else(|| panic!("invalid timer index while waiting: {done_timer_pos}"))
     }
 }
 
@@ -710,7 +727,7 @@ where
                 let conn_timeout = self.connect_timeout;
                 let net_settings = self.net_settings.clone();
 
-                self.last_connect_attempt = Some(connect_target.clone());
+                self.last_connect_attempt = Some(connect_target);
                 self.waiting_for_connection_update = true;
 
                 tokio::spawn(
@@ -983,7 +1000,6 @@ where
                         let now = now_ms();
                         let latency = Latency {
                             latency_ms: now.max(pong) - pong,
-                            last_pong_epoch: now,
                         };
 
                         match self.peers.entry(follow.remote) {
@@ -1677,7 +1693,6 @@ impl<I: SyncIO, D: DeterministicState> DiscoveredPeer<I, D> {
 }
 
 struct Latency {
-    last_pong_epoch: u64,
     latency_ms: u64,
 }
 
@@ -1690,6 +1705,17 @@ mod test {
     };
 
     use super::*;
+
+    #[test]
+    fn timer_from_index_test() {
+        assert_eq!(Timer::from_index(0), Some(Timer::SendVerifyLeader));
+        assert_eq!(Timer::from_index(1), Some(Timer::RequireVerifyLeader));
+        assert_eq!(Timer::from_index(2), Some(Timer::RejectPeer));
+        assert_eq!(Timer::from_index(3), Some(Timer::ConnectToPeer));
+        assert_eq!(Timer::from_index(4), Some(Timer::RequireState));
+        assert_eq!(Timer::from_index(5), Some(Timer::BroadcastPeers));
+        assert_eq!(Timer::from_index(6), None);
+    }
 
     #[tokio::test]
     async fn sync_manager_doesnt_allow_peer_with_different_leader_test() {

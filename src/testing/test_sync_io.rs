@@ -114,7 +114,7 @@ struct NetInner {
 struct ConnManage {
     id: u64,
     kill: Option<oneshot::Sender<TestIOKillMode>>,
-    rate_limit_bps: Arc<AtomicU64>,
+    _rate_limit_bps: Arc<AtomicU64>,
 }
 
 impl NetInner {
@@ -184,7 +184,7 @@ impl SyncIO for TestSyncIO {
             ConnManage {
                 id: conn_id,
                 kill: Some(read_kill),
-                rate_limit_bps: Arc::new(AtomicU64::new(0)),
+                _rate_limit_bps: Arc::new(AtomicU64::new(0)),
             },
         );
         lock.add_conn(
@@ -193,7 +193,7 @@ impl SyncIO for TestSyncIO {
             ConnManage {
                 id: conn_id,
                 kill: Some(write_kill),
-                rate_limit_bps: Arc::new(AtomicU64::new(0)),
+                _rate_limit_bps: Arc::new(AtomicU64::new(0)),
             },
         );
 
@@ -234,7 +234,7 @@ impl SyncIO for TestSyncIO {
             ConnManage {
                 id: conn_id,
                 kill: Some(read_kill),
-                rate_limit_bps: Arc::new(AtomicU64::new(0)),
+                _rate_limit_bps: Arc::new(AtomicU64::new(0)),
             },
         );
         lock.add_conn(
@@ -243,7 +243,7 @@ impl SyncIO for TestSyncIO {
             ConnManage {
                 id: conn_id,
                 kill: Some(write_kill),
-                rate_limit_bps: Arc::new(AtomicU64::new(0)),
+                _rate_limit_bps: Arc::new(AtomicU64::new(0)),
             },
         );
 
