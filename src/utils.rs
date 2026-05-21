@@ -1,8 +1,4 @@
-use std::{
-    fmt::Debug,
-    panic::Location,
-    time::UNIX_EPOCH,
-};
+use std::{fmt::Debug, panic::Location, time::UNIX_EPOCH};
 
 pub trait LogHelper {
     fn err_log(self, msg: &str) -> Self;

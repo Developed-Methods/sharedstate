@@ -11,7 +11,14 @@ pub async fn read_message<M: MessageEncoding, R: AsyncRead + Unpin>(
     read: &mut R,
     progress_timeout: Duration,
 ) -> Result<Option<M>, ReadMessageError> {
-    read_message_opt(buffer, read, progress_timeout, None, MessageSizeHeader::MAX as usize).await
+    read_message_opt(
+        buffer,
+        read,
+        progress_timeout,
+        None,
+        MessageSizeHeader::MAX as usize,
+    )
+    .await
 }
 
 pub async fn read_message_opt<M: MessageEncoding, R: AsyncRead + Unpin>(
@@ -21,9 +28,36 @@ pub async fn read_message_opt<M: MessageEncoding, R: AsyncRead + Unpin>(
     recv_timeout: Option<Duration>,
     max_message_size: usize,
 ) -> Result<Option<M>, ReadMessageError> {
+    read_message_opt_with_oversized_id(
+        buffer,
+        read,
+        progress_timeout,
+        recv_timeout,
+        max_message_size,
+        None,
+    )
+    .await
+}
+
+pub async fn read_message_opt_with_oversized_id<M: MessageEncoding, R: AsyncRead + Unpin>(
+    buffer: &mut Vec<u8>,
+    read: &mut R,
+    progress_timeout: Duration,
+    recv_timeout: Option<Duration>,
+    max_message_size: usize,
+    oversized_message_id: Option<(u16, Option<usize>)>,
+) -> Result<Option<M>, ReadMessageError> {
     let _assert = black_box(M::_ASSERT);
 
-    if !read_message_to_vec(buffer, read, progress_timeout, recv_timeout, max_message_size).await?
+    if !read_message_to_vec(
+        buffer,
+        read,
+        progress_timeout,
+        recv_timeout,
+        max_message_size,
+        oversized_message_id,
+    )
+    .await?
     {
         return Ok(None);
     }
@@ -39,6 +73,7 @@ pub async fn read_message_to_vec<R: AsyncRead + Unpin>(
     progress_timeout: Duration,
     recv_timeout: Option<Duration>,
     max_message_size: usize,
+    oversized_message_id: Option<(u16, Option<usize>)>,
 ) -> Result<bool, ReadMessageError> {
     let mut len_bytes = [0u8; MESSAGE_HEADER_SIZE];
 
@@ -58,14 +93,42 @@ pub async fn read_message_to_vec<R: AsyncRead + Unpin>(
         return Ok(false);
     }
     if max_message_size < msg_len {
-        return Err(ReadMessageError::MessageTooLarge(msg_len));
+        let Some((allowed_id, max_oversized_message_size)) = oversized_message_id else {
+            return Err(ReadMessageError::MessageTooLarge(msg_len));
+        };
+
+        let message_id_size = std::mem::size_of::<u16>();
+        if msg_len < message_id_size {
+            return Err(ReadMessageError::MessageTooLarge(msg_len));
+        }
+
+        let mut msg_id_bytes = [0u8; std::mem::size_of::<u16>()];
+        read_message_bytes(read, progress_timeout, &mut msg_id_bytes).await?;
+        let msg_id = u16::from_be_bytes(msg_id_bytes);
+        if msg_id != allowed_id || max_oversized_message_size.is_some_and(|max| max < msg_len) {
+            return Err(ReadMessageError::MessageTooLarge(msg_len));
+        }
+
+        buffer.clear();
+        buffer.resize(msg_len, 0u8);
+        buffer[..message_id_size].copy_from_slice(&msg_id_bytes);
+        read_message_bytes(read, progress_timeout, &mut buffer[message_id_size..]).await?;
+        return Ok(true);
     }
 
     buffer.clear();
     buffer.resize(msg_len, 0u8);
+    read_message_bytes(read, progress_timeout, buffer).await?;
+    Ok(true)
+}
 
+async fn read_message_bytes<R: AsyncRead + Unpin>(
+    read: &mut R,
+    progress_timeout: Duration,
+    buffer: &mut [u8],
+) -> Result<(), ReadMessageError> {
     let mut bytes_read = 0;
-    while bytes_read < msg_len {
+    while bytes_read < buffer.len() {
         match tokio::time::timeout(progress_timeout, read.read(&mut buffer[bytes_read..])).await {
             Err(_) => return Err(ReadMessageError::MessageReadTimeout),
             Ok(Err(error)) => return Err(ReadMessageError::MessageReadError(error)),
@@ -76,7 +139,7 @@ pub async fn read_message_to_vec<R: AsyncRead + Unpin>(
         }
     }
 
-    Ok(true)
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -314,6 +377,73 @@ mod test {
             Duration::from_secs(1),
             Some(Duration::from_secs(2)),
             64,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ReadMessageError::MessageTooLarge(128)));
+    }
+
+    #[tokio::test]
+    async fn message_io_allows_unbounded_oversized_message_id_test() {
+        let (mut a, mut b) = duplex(2048);
+        a.write_all(&(128u32).to_be_bytes()).await.unwrap();
+        a.write_all(&3u16.to_be_bytes()).await.unwrap();
+        a.write_all(&[1u8; 126]).await.unwrap();
+
+        let mut buffer = Vec::new();
+        let read = read_message_to_vec(
+            &mut buffer,
+            &mut b,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(2)),
+            64,
+            Some((3, None)),
+        )
+        .await
+        .unwrap();
+
+        assert!(read);
+        assert_eq!(buffer.len(), 128);
+    }
+
+    #[tokio::test]
+    async fn message_io_rejects_bounded_oversized_message_id_test() {
+        let (mut a, mut b) = duplex(2048);
+        a.write_all(&(128u32).to_be_bytes()).await.unwrap();
+        a.write_all(&3u16.to_be_bytes()).await.unwrap();
+        a.write_all(&[1u8; 126]).await.unwrap();
+
+        let mut buffer = Vec::new();
+        let err = read_message_to_vec(
+            &mut buffer,
+            &mut b,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(2)),
+            64,
+            Some((3, Some(100))),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ReadMessageError::MessageTooLarge(128)));
+    }
+
+    #[tokio::test]
+    async fn message_io_rejects_wrong_oversized_message_id_test() {
+        let (mut a, mut b) = duplex(2048);
+        a.write_all(&(128u32).to_be_bytes()).await.unwrap();
+        a.write_all(&4u16.to_be_bytes()).await.unwrap();
+        a.write_all(&[1u8; 126]).await.unwrap();
+
+        let mut buffer = Vec::new();
+        let err = read_message_to_vec(
+            &mut buffer,
+            &mut b,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(2)),
+            64,
+            Some((3, None)),
         )
         .await
         .unwrap_err();

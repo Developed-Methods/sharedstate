@@ -11,6 +11,7 @@ use super::{io::SyncIO, message_io::unknown_id_err};
 
 const MAX_PEER_LIST_ITEMS: usize = 16_384;
 const MAX_LEADER_PATH_ITEMS: usize = 256;
+pub const SYNC_RESPONSE_FRESH_STATE_ID: u16 = 3;
 
 pub enum SyncRequest<I: SyncIO, D: DeterministicState> {
     MyAddress(I::Address),
@@ -123,7 +124,7 @@ where
                 next_seq.write_to(out)?
             }
             Self::FreshState(state) => {
-                sum += 3u16.write_to(out)?;
+                sum += SYNC_RESPONSE_FRESH_STATE_ID.write_to(out)?;
                 state.write_to(out)?
             }
             Self::AuthorityAction(seq, action) => {
@@ -148,7 +149,7 @@ where
         Ok(match u16::read_from(read)? {
             1 => Self::Pong(MessageEncoding::read_from(read)?),
             2 => Self::RecoveryAccepted(MessageEncoding::read_from(read)?),
-            3 => Self::FreshState(MessageEncoding::read_from(read)?),
+            SYNC_RESPONSE_FRESH_STATE_ID => Self::FreshState(MessageEncoding::read_from(read)?),
             4 => Self::AuthorityAction(
                 MessageEncoding::read_from(read)?,
                 MessageEncoding::read_from(read)?,
@@ -202,14 +203,17 @@ mod test {
     fn sync_response_rejects_oversized_peers_test() {
         let mut data = Vec::new();
         6u16.write_to(&mut data).unwrap();
-        ((MAX_PEER_LIST_ITEMS + 1) as u64).write_to(&mut data).unwrap();
+        ((MAX_PEER_LIST_ITEMS + 1) as u64)
+            .write_to(&mut data)
+            .unwrap();
 
-        let err = match SyncResponse::<crate::testing::test_sync_io::TestSyncIO, TestState>::read_from(
-            &mut &data[..],
-        ) {
-            Ok(_) => panic!("expected oversized peers to fail decoding"),
-            Err(err) => err,
-        };
+        let err =
+            match SyncResponse::<crate::testing::test_sync_io::TestSyncIO, TestState>::read_from(
+                &mut &data[..],
+            ) {
+                Ok(_) => panic!("expected oversized peers to fail decoding"),
+                Err(err) => err,
+            };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
@@ -221,12 +225,13 @@ mod test {
             .write_to(&mut data)
             .unwrap();
 
-        let err = match SyncResponse::<crate::testing::test_sync_io::TestSyncIO, TestState>::read_from(
-            &mut &data[..],
-        ) {
-            Ok(_) => panic!("expected oversized leader path to fail decoding"),
-            Err(err) => err,
-        };
+        let err =
+            match SyncResponse::<crate::testing::test_sync_io::TestSyncIO, TestState>::read_from(
+                &mut &data[..],
+            ) {
+                Ok(_) => panic!("expected oversized leader path to fail decoding"),
+                Err(err) => err,
+            };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

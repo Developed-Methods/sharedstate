@@ -5,7 +5,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use super::{
     io::SyncIO,
-    message_io::{read_message_opt, send_message, send_zero_message},
+    message_io::{read_message_opt_with_oversized_id, send_message, send_zero_message},
 };
 
 #[derive(Clone, Debug)]
@@ -13,6 +13,7 @@ pub struct NetIoSettings {
     pub process_timeout: Duration,
     pub message_timeout: Duration,
     pub max_message_size_bytes: usize,
+    pub max_state_message_size: Option<usize>,
 }
 
 impl Default for NetIoSettings {
@@ -21,6 +22,7 @@ impl Default for NetIoSettings {
             process_timeout: Duration::from_secs(2),
             message_timeout: Duration::from_secs(12),
             max_message_size_bytes: 8 * 1024 * 1024,
+            max_state_message_size: None,
         }
     }
 }
@@ -29,6 +31,7 @@ pub struct ReadChannel<I: SyncIO, M: MessageEncoding> {
     pub input: I::Read,
     pub output: Sender<M>,
     pub settings: NetIoSettings,
+    pub oversized_message_id: Option<(u16, Option<usize>)>,
 }
 
 pub struct WriteChannel<I: SyncIO, M: MessageEncoding> {
@@ -45,12 +48,13 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> ReadChannel<I, M> {
             tokio::task::yield_now().await;
 
             let read_opt_res = tokio::select! {
-                read_opt_res = read_message_opt::<M, _>(
+                read_opt_res = read_message_opt_with_oversized_id::<M, _>(
                     &mut buffer,
                     &mut self.input,
                     self.settings.process_timeout,
                     Some(self.settings.message_timeout),
                     self.settings.max_message_size_bytes,
+                    self.oversized_message_id,
                 ) => read_opt_res,
                 _ = self.output.closed() => {
                     tracing::info!("output closed, stopping read");

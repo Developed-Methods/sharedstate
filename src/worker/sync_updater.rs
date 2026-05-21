@@ -655,10 +655,7 @@ mod test {
             if condition() {
                 return;
             }
-            assert!(
-                start.elapsed() < Duration::from_secs(1),
-                "{msg}"
-            );
+            assert!(start.elapsed() < Duration::from_secs(1), "{msg}");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }

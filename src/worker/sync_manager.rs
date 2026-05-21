@@ -21,7 +21,7 @@ use crate::{
     net::{
         io::{SyncConnection, SyncIO},
         message_channels::{NetIoSettings, ReadChannel, WriteChannel},
-        messages::{SyncRequest, SyncResponse},
+        messages::{SyncRequest, SyncResponse, SYNC_RESPONSE_FRESH_STATE_ID},
     },
     recoverable_state::{RecoverableState, RecoverableStateAction, SourceId},
     state::{DeterministicState, SharedState},
@@ -764,6 +764,10 @@ where
                                             input: conn.read,
                                             output: from_server_tx,
                                             settings: net_settings.clone(),
+                                            oversized_message_id: Some((
+                                                SYNC_RESPONSE_FRESH_STATE_ID,
+                                                net_settings.max_state_message_size,
+                                            )),
                                         }
                                         .start()
                                         .instrument(
@@ -1508,6 +1512,7 @@ where
                             input: client.read,
                             output: from_client_tx,
                             settings: net_settings.clone(),
+                            oversized_message_id: None,
                         }
                         .start()
                         .instrument(tracing::info_span!("ReadClient", remote = ?client.remote)),
