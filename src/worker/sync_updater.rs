@@ -663,6 +663,106 @@ mod test {
     }
 
     #[tokio::test]
+    async fn sync_updater_promoted_follower_bumps_generation_id_test() {
+        let mut a = SyncUpdater::<u64, TestState>::new(1, Default::default(), Default::default());
+        let mut b = SyncUpdater::<u64, TestState>::new(2, Default::default(), Default::default());
+
+        {
+            let follow = a.add_fresh_subscriber().await.unwrap();
+            let (action_tx, action_rx) = channel(1024);
+            b.follow(action_tx, follow).await;
+            a.provide_action_rx(action_rx);
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = b.state.read().details().clone();
+
+        b.lead().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let after = b.state.read().details().clone();
+        assert_ne!(before.id, after.id);
+        assert_eq!(before.generation + 1, after.generation);
+        assert_eq!(after.history.back().unwrap().old_id, before.id);
+    }
+
+    #[tokio::test]
+    async fn sync_updater_promoted_master_recovers_older_follower_test() {
+        let mut a = SyncUpdater::<u64, TestState>::new(1, Default::default(), Default::default());
+        let mut b = SyncUpdater::<u64, TestState>::new(2, Default::default(), Default::default());
+        let mut c = SyncUpdater::<u64, TestState>::new(3, Default::default(), Default::default());
+
+        {
+            let follow = a.add_fresh_subscriber().await.unwrap();
+            let (action_tx, action_rx) = channel(1024);
+            b.follow(action_tx, follow).await;
+            a.provide_action_rx(action_rx);
+        }
+
+        {
+            let follow = a.add_fresh_subscriber().await.unwrap();
+            let (action_tx, action_rx) = channel(1024);
+            c.follow(action_tx, follow).await;
+            a.provide_action_rx(action_rx);
+        }
+
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 1, value: 10 })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        c.go_offline().await;
+
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 2, value: 20 })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        b.lead().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let c_recover = c.go_offline().await.recovery_details();
+        let follow = b.add_subscriber(c_recover).await;
+        assert!(follow.is_some());
+    }
+
+    #[tokio::test]
+    async fn sync_updater_promoted_master_recovers_equal_follower_test() {
+        let mut a = SyncUpdater::<u64, TestState>::new(1, Default::default(), Default::default());
+        let mut b = SyncUpdater::<u64, TestState>::new(2, Default::default(), Default::default());
+        let mut c = SyncUpdater::<u64, TestState>::new(3, Default::default(), Default::default());
+
+        {
+            let follow = a.add_fresh_subscriber().await.unwrap();
+            let (action_tx, action_rx) = channel(1024);
+            b.follow(action_tx, follow).await;
+            a.provide_action_rx(action_rx);
+        }
+
+        {
+            let follow = a.add_fresh_subscriber().await.unwrap();
+            let (action_tx, action_rx) = channel(1024);
+            c.follow(action_tx, follow).await;
+            a.provide_action_rx(action_rx);
+        }
+
+        a.local_action_tx
+            .send(TestStateAction::Set { slot: 1, value: 10 })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        b.lead().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let c_recover = c.go_offline().await.recovery_details();
+        let follow = b.add_subscriber(c_recover).await;
+        assert!(follow.is_some());
+    }
+
+    #[tokio::test]
     async fn sync_updater_recover_state_fork_same_seq_reject_test() {
         let mut a = SyncUpdater::<u64, TestState>::new(1, Default::default(), Default::default());
         let mut b = SyncUpdater::<u64, TestState>::new(2, Default::default(), Default::default());

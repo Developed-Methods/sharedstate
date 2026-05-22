@@ -21,7 +21,7 @@ use crate::{
     net::{
         io::{SyncConnection, SyncIO},
         message_channels::{NetIoSettings, ReadChannel, WriteChannel},
-        messages::{SyncRequest, SyncResponse},
+        messages::{PeerInfo, SentinelConnectivity, SentinelVote, SyncRequest, SyncResponse},
     },
     recoverable_state::{RecoverableState, RecoverableStateAction, SourceId},
     state::{DeterministicState, SharedState},
@@ -63,6 +63,7 @@ where
                 msg_tx: worker.client_msg_tx.clone(),
                 net_settings: worker.net_settings.clone(),
                 io: worker.io.clone(),
+                is_sentinel: worker.settings_is_sentinel,
             }
             .start()
             .instrument(tracing::Span::current()),
@@ -109,6 +110,8 @@ struct SyncManagerWorker<I: SyncIO, D: DeterministicState> {
     leader: I::Address,
 
     last_connect_attempt: Option<I::Address>,
+    settings_is_sentinel: bool,
+    sentinel_settings: SentinelSettings,
 
     metrics: Arc<SyncManagerMetrics>,
 
@@ -116,6 +119,10 @@ struct SyncManagerWorker<I: SyncIO, D: DeterministicState> {
 
     updater: SyncUpdater<I::Address, D>,
     peers: HashMap<I::Address, DiscoveredPeer<I, D>>,
+    sentinel_links: HashMap<I::Address, SentinelLink<I, D>>,
+    sentinel_stats: HashMap<I::Address, SentinelConnectionStats>,
+    peer_sentinel_reports: HashMap<I::Address, TimedPeerSentinelReport<I::Address>>,
+    sentinel_votes: HashMap<I::Address, TimedSentinelVote<I::Address>>,
 
     control_rx: Receiver<ControlMessage<I>>,
     client_msg_tx: Sender<ClientMessage<I, D>>,
@@ -143,6 +150,9 @@ pub enum Timer {
 
     RequireState,
     BroadcastPeers,
+    ConnectSentinels,
+    ReportSentinelConnectivity,
+    EvaluateSentinelElection,
 }
 
 #[derive(Default)]
@@ -237,6 +247,49 @@ struct FollowState<I: SyncIO, D: DeterministicState> {
     feed_updater: Option<SequencedSender<RecoverableStateAction<I::Address, D::AuthorityAction>>>,
 }
 
+struct SentinelLink<I: SyncIO, D: DeterministicState> {
+    cancel: CancellationToken,
+    send: Sender<SyncRequest<I, D>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SentinelConnectionStats {
+    is_connected: bool,
+    disconnect_epochs: Vec<u64>,
+    last_update_epoch: u64,
+}
+
+impl SentinelConnectionStats {
+    fn disconnects_in_past_hour(&mut self) -> u32 {
+        let cutoff = now_ms().saturating_sub(3_600_000);
+        self.disconnect_epochs.retain(|epoch| cutoff <= *epoch);
+        self.disconnect_epochs.len() as u32
+    }
+
+    fn mark_connected(&mut self) {
+        self.is_connected = true;
+        self.last_update_epoch = now_ms();
+    }
+
+    fn mark_disconnected(&mut self) {
+        self.is_connected = false;
+        let now = now_ms();
+        self.last_update_epoch = now;
+        self.disconnect_epochs.push(now);
+        self.disconnects_in_past_hour();
+    }
+}
+
+struct TimedPeerSentinelReport<A> {
+    reports: Vec<SentinelConnectivity<A>>,
+    epoch: u64,
+}
+
+struct TimedSentinelVote<A> {
+    vote: SentinelVote<A>,
+    epoch: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct SyncManagerMetrics {
     pub client_send_dropped: IntCounter,
@@ -292,7 +345,16 @@ impl<I: SyncIO, D: DeterministicState> Debug for Event<I, D> {
             Self::ConnectionUpdate(ConnectionUpdate::ConnectFailed(addr)) => {
                 write!(f, "ConnectionUpdate::ConnectFailed({:?})", addr)
             }
+            Self::ConnectionUpdate(ConnectionUpdate::SentinelConnected { address, .. }) => {
+                write!(f, "ConnectionUpdate::SentinelConnected({:?})", address)
+            }
+            Self::ConnectionUpdate(ConnectionUpdate::SentinelDisconnected(address)) => {
+                write!(f, "ConnectionUpdate::SentinelDisconnected({:?})", address)
+            }
             Self::Timer(timer) => write!(f, "Timer({:?})", timer),
+            Self::LeaderMessage(SyncResponse::NodeInfo { is_sentinel }) => {
+                write!(f, "LeaderMessage::NodeInfo({})", is_sentinel)
+            }
             Self::LeaderMessage(SyncResponse::LeaderPath(path)) => {
                 write!(f, "LeaderMessage::LeaderPath({:?})", path)
             }
@@ -308,6 +370,9 @@ impl<I: SyncIO, D: DeterministicState> Debug for Event<I, D> {
             Self::LeaderMessage(SyncResponse::Peers(peers)) => {
                 write!(f, "LeaderMessage::Peers(count: {})", peers.len())
             }
+            Self::LeaderMessage(SyncResponse::PeerInfo(peers)) => {
+                write!(f, "LeaderMessage::PeerInfo(count: {})", peers.len())
+            }
             Self::LeaderMessage(SyncResponse::AuthorityAction(seq, _)) => {
                 write!(f, "LeaderMessage::AuthorityAction(seq: {})", seq)
             }
@@ -320,6 +385,12 @@ impl<I: SyncIO, D: DeterministicState> Debug for Event<I, D> {
 enum ConnectionUpdate<I: SyncIO, D: DeterministicState> {
     ConnectFailed(I::Address),
     UpdatedFollow(FollowState<I, D>),
+    SentinelConnected {
+        address: I::Address,
+        send: Sender<SyncRequest<I, D>>,
+        cancel: CancellationToken,
+    },
+    SentinelDisconnected(I::Address),
 }
 
 struct ClientMessage<I: SyncIO, D: DeterministicState> {
@@ -334,6 +405,27 @@ pub struct SyncMangerSettings<A> {
     pub connect_timeout: Duration,
     pub receive_state_timeout: Duration,
     pub initial_peers: Vec<A>,
+    pub is_sentinel: bool,
+    pub sentinel: SentinelSettings,
+}
+
+#[derive(Clone, Debug)]
+pub struct SentinelSettings {
+    pub report_interval: Duration,
+    pub election_interval: Duration,
+    pub unhealthy_disconnect_threshold: u32,
+    pub stale_report_after: Duration,
+}
+
+impl Default for SentinelSettings {
+    fn default() -> Self {
+        Self {
+            report_interval: Duration::from_secs(15),
+            election_interval: Duration::from_secs(5),
+            unhealthy_disconnect_threshold: 3,
+            stale_report_after: Duration::from_secs(90),
+        }
+    }
 }
 
 impl<A> Default for SyncMangerSettings<A> {
@@ -344,6 +436,8 @@ impl<A> Default for SyncMangerSettings<A> {
             connect_timeout: Duration::from_secs(8),
             receive_state_timeout: Duration::from_secs(80),
             initial_peers: Vec::new(),
+            is_sentinel: false,
+            sentinel: Default::default(),
         }
     }
 }
@@ -363,6 +457,8 @@ where
     ) -> Self {
         let (client_msg_tx, client_msg_rx) = channel(2048);
         let (conn_tx, conn_rx) = channel(256);
+        let is_sentinel = settings.is_sentinel;
+        let sentinel_settings = settings.sentinel.clone();
         let peers = settings
             .initial_peers
             .into_iter()
@@ -375,6 +471,8 @@ where
             local,
             leader: local,
             last_connect_attempt: None,
+            settings_is_sentinel: is_sentinel,
+            sentinel_settings,
             metrics: Arc::new(SyncManagerMetrics::default()),
             follow_state: None,
             control_rx,
@@ -383,12 +481,306 @@ where
             conn_tx,
             conn_rx,
             peers,
+            sentinel_links: HashMap::new(),
+            sentinel_stats: HashMap::new(),
+            peer_sentinel_reports: HashMap::new(),
+            sentinel_votes: HashMap::new(),
             updater: SyncUpdater::new(local, state, settings.broadcast),
             timers: Timers::default(),
             connect_timeout: settings.connect_timeout,
             receive_state_timeout: settings.receive_state_timeout,
             net_settings: settings.net_io,
             waiting_for_connection_update: false,
+        }
+        .with_initial_sentinel_timers()
+    }
+
+    fn with_initial_sentinel_timers(mut self) -> Self {
+        self.timers
+            .get(Timer::ConnectSentinels)
+            .set(Duration::from_secs(1));
+        self.timers
+            .get(Timer::ReportSentinelConnectivity)
+            .set(self.sentinel_settings.report_interval);
+
+        if self.settings_is_sentinel {
+            self.sentinel_stats
+                .entry(self.local)
+                .or_default()
+                .mark_connected();
+            self.timers
+                .get(Timer::EvaluateSentinelElection)
+                .set(self.sentinel_settings.election_interval);
+        }
+
+        self
+    }
+
+    fn peer_entry(&mut self, address: I::Address) -> &mut DiscoveredPeer<I, D> {
+        self.peers
+            .entry(address)
+            .or_insert_with(DiscoveredPeer::new)
+    }
+
+    fn mark_peer_sentinel(&mut self, address: I::Address, is_sentinel: bool) {
+        if address == self.local {
+            return;
+        }
+
+        let peer = self.peer_entry(address);
+        if is_sentinel && !peer.is_sentinel {
+            tracing::info!(peer = ?address, "discovered sentinel");
+        }
+        peer.is_sentinel |= is_sentinel;
+
+        if peer.is_sentinel {
+            self.sentinel_stats.entry(address).or_default();
+            self.timers
+                .get(Timer::ConnectSentinels)
+                .set_earlier(Duration::from_secs(1));
+        }
+    }
+
+    fn apply_peer_info(&mut self, peers: Vec<PeerInfo<I::Address>>) {
+        for peer in peers {
+            self.mark_peer_sentinel(peer.address, peer.is_sentinel);
+        }
+    }
+
+    fn peer_infos(&self) -> Vec<PeerInfo<I::Address>> {
+        let mut peers = self
+            .peers
+            .iter()
+            .map(|(address, peer)| PeerInfo {
+                address: *address,
+                is_sentinel: peer.is_sentinel,
+            })
+            .collect::<Vec<_>>();
+
+        peers.push(PeerInfo {
+            address: self.local,
+            is_sentinel: self.settings_is_sentinel,
+        });
+        peers
+    }
+
+    fn known_sentinels(&self) -> Vec<I::Address> {
+        let mut sentinels = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.is_sentinel)
+            .map(|(address, _)| *address)
+            .collect::<Vec<_>>();
+
+        if self.settings_is_sentinel {
+            sentinels.push(self.local);
+        }
+
+        sentinels
+    }
+
+    fn connectivity_report(&mut self) -> Vec<SentinelConnectivity<I::Address>> {
+        self.known_sentinels()
+            .into_iter()
+            .filter(|sentinel| *sentinel != self.local)
+            .map(|sentinel| {
+                let stats = self.sentinel_stats.entry(sentinel).or_default();
+                SentinelConnectivity {
+                    sentinel,
+                    is_connected: stats.is_connected,
+                    disconnects_in_past_hour: stats.disconnects_in_past_hour(),
+                }
+            })
+            .collect()
+    }
+
+    fn current_state_vote(&self, candidate: I::Address) -> SentinelVote<I::Address> {
+        let details = self.updater.state.read().details().clone();
+        SentinelVote {
+            observed_master: self.leader,
+            observed_state_id: details.id,
+            candidate,
+            candidate_state_accept_seq: details.state_accept_seq,
+            candidate_recover_accept_seq: details.recover_accept_seq,
+        }
+    }
+
+    fn encoded_addr_key(address: &I::Address) -> Vec<u8> {
+        let mut out = Vec::new();
+        address.write_to(&mut out).unwrap();
+        out
+    }
+
+    fn choose_sentinel_candidate(&self) -> Option<I::Address> {
+        let mut best: Option<(I::Address, u64, u64, Vec<u8>)> = None;
+        let local_details = self.updater.state.read().details().clone();
+
+        for sentinel in self.known_sentinels() {
+            if sentinel == self.leader {
+                continue;
+            }
+
+            let (state_seq, recover_seq) = if sentinel == self.local {
+                (
+                    local_details.state_accept_seq,
+                    local_details.recover_accept_seq,
+                )
+            } else if let Some(vote) = self.sentinel_votes.get(&sentinel) {
+                (
+                    vote.vote.candidate_state_accept_seq,
+                    vote.vote.candidate_recover_accept_seq,
+                )
+            } else {
+                (
+                    local_details.state_accept_seq,
+                    local_details.recover_accept_seq,
+                )
+            };
+
+            let key = Self::encoded_addr_key(&sentinel);
+            let replace = match &best {
+                None => true,
+                Some((_, best_state, best_recover, best_key)) => {
+                    state_seq > *best_state
+                        || (state_seq == *best_state && recover_seq > *best_recover)
+                        || (state_seq == *best_state
+                            && recover_seq == *best_recover
+                            && key < *best_key)
+                }
+            };
+
+            if replace {
+                best = Some((sentinel, state_seq, recover_seq, key));
+            }
+        }
+
+        best.map(|(sentinel, _, _, _)| sentinel)
+    }
+
+    fn local_master_unhealthy(&mut self) -> bool {
+        if self.leader == self.local {
+            return false;
+        }
+
+        if self.updater.is_following() {
+            return false;
+        }
+
+        let stale_after = self.sentinel_settings.stale_report_after.as_millis() as u64;
+        let now = now_ms();
+        let peer_report_unhealthy = self.peer_sentinel_reports.values().any(|report| {
+            now.saturating_sub(report.epoch) <= stale_after
+                && report.reports.iter().any(|item| {
+                    item.sentinel == self.leader
+                        && (!item.is_connected
+                            || self.sentinel_settings.unhealthy_disconnect_threshold
+                                <= item.disconnects_in_past_hour)
+                })
+        });
+
+        let leader_stats = self.peers.get(&self.leader);
+        peer_report_unhealthy
+            || leader_stats
+                .map(|stats| {
+                    0 < stats.last_peer_failure_epoch
+                        || stats
+                            .latency
+                            .as_ref()
+                            .map(|latency| {
+                                (self.sentinel_settings.stale_report_after.as_millis() as u64)
+                                    < now_ms().saturating_sub(latency.last_pong_epoch)
+                            })
+                            .unwrap_or(true)
+                })
+                .unwrap_or(true)
+    }
+
+    async fn maybe_elect_sentinel_master(&mut self) {
+        if !self.settings_is_sentinel || !self.local_master_unhealthy() {
+            return;
+        }
+
+        let known_sentinels = self.known_sentinels();
+        if known_sentinels.len() <= 1 {
+            return;
+        }
+
+        let Some(candidate) = self.choose_sentinel_candidate() else {
+            return;
+        };
+
+        let vote = self.current_state_vote(candidate);
+        self.sentinel_votes.insert(
+            self.local,
+            TimedSentinelVote {
+                vote: vote.clone(),
+                epoch: now_ms(),
+            },
+        );
+
+        for link in self.sentinel_links.values() {
+            let _ = link.send.try_send(SyncRequest::SentinelVote(vote.clone()));
+        }
+
+        let required_votes = known_sentinels.len() / 2 + 1;
+        let stale_after = self.sentinel_settings.stale_report_after.as_millis() as u64;
+        let now = now_ms();
+        let votes = self
+            .sentinel_votes
+            .values()
+            .filter(|timed| {
+                now.saturating_sub(timed.epoch) <= stale_after
+                    && timed.vote.observed_master == self.leader
+                    && timed.vote.observed_state_id == vote.observed_state_id
+                    && timed.vote.candidate == candidate
+            })
+            .count();
+
+        if votes < required_votes {
+            return;
+        }
+
+        if candidate == self.local {
+            self.set_leader_inner(self.local).await;
+        } else {
+            self.set_leader_inner(candidate).await;
+        }
+    }
+
+    async fn set_leader_inner(&mut self, leader: I::Address) {
+        let changed = std::mem::replace(&mut self.leader, leader) != leader;
+        if !changed {
+            tracing::info!(?leader, "ignore set leader, no change");
+            return;
+        }
+
+        if self.local == self.leader {
+            tracing::info!("self set as leader");
+
+            self.timers.get(Timer::ConnectToPeer).clear();
+            self.timers.get(Timer::RequireState).clear();
+            self.timers.get(Timer::SendVerifyLeader).clear();
+            self.timers.get(Timer::RequireVerifyLeader).clear();
+
+            if let Some(state) = self.follow_state.take() {
+                state.cancel.cancel();
+            }
+
+            self.updater.lead().await;
+        } else if self.follow_state.is_some() {
+            tracing::info!("leader changed but connected to peer already, queue confirm request");
+
+            self.timers
+                .get(Timer::SendVerifyLeader)
+                .set_earlier(Duration::from_secs(2));
+            self.timers
+                .get(Timer::RequireVerifyLeader)
+                .set(Duration::from_secs(10));
+        } else {
+            self.updater.go_offline().await;
+
+            tracing::info!("need leader connection");
+            self.timers.get(Timer::ConnectToPeer).now();
         }
     }
 
@@ -562,12 +954,14 @@ where
             }
             Event::Timer(Timer::BroadcastPeers) => {
                 let peers = self.peers.keys().cloned().collect::<Vec<_>>();
+                let peer_infos = self.peer_infos();
 
                 let mut count = 0;
                 for peer in self.peers.values() {
                     if let Some(send) = &peer.client_send {
                         count += 1;
                         let _ = send.try_send(SyncResponse::Peers(peers.clone()));
+                        let _ = send.try_send(SyncResponse::PeerInfo(peer_infos.clone()));
                     }
                 }
 
@@ -575,6 +969,139 @@ where
                 self.timers
                     .get(Timer::BroadcastPeers)
                     .set_earlier(Duration::from_secs(30));
+            }
+            Event::Timer(Timer::ConnectSentinels) => {
+                let sentinels = self
+                    .known_sentinels()
+                    .into_iter()
+                    .filter(|sentinel| *sentinel != self.local)
+                    .filter(|sentinel| !self.sentinel_links.contains_key(sentinel))
+                    .collect::<Vec<_>>();
+
+                for sentinel in sentinels {
+                    let io = self.io.clone();
+                    let conn_tx = self.conn_tx.clone();
+                    let conn_timeout = self.connect_timeout;
+                    let net_settings = self.net_settings.clone();
+                    let local = self.local;
+                    let is_sentinel = self.settings_is_sentinel;
+
+                    tokio::spawn(async move {
+                        let cancel = CancellationToken::new();
+
+                        let conn = match tokio::time::timeout(conn_timeout, io.connect(&sentinel))
+                            .await
+                        {
+                            Ok(Ok(conn)) => conn,
+                            Ok(Err(error)) => {
+                                tracing::debug!(?error, sentinel = ?sentinel, "sentinel connect failed");
+                                let _ = conn_tx
+                                    .send(ConnectionUpdate::SentinelDisconnected(sentinel))
+                                    .await;
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::debug!(sentinel = ?sentinel, "sentinel connect timed out");
+                                let _ = conn_tx
+                                    .send(ConnectionUpdate::SentinelDisconnected(sentinel))
+                                    .await;
+                                return;
+                            }
+                        };
+
+                        let mut from_server = {
+                            let (from_server_tx, from_server_rx) =
+                                channel::<SyncResponse<I, D>>(1024);
+                            tokio::spawn(
+                                cancel.clone().run_until_cancelled_owned(
+                                    ReadChannel::<I, _> {
+                                        input: conn.read,
+                                        output: from_server_tx,
+                                        settings: net_settings.clone(),
+                                    }
+                                    .start(),
+                                ),
+                            );
+                            from_server_rx
+                        };
+
+                        let to_server = {
+                            let (to_server_tx, to_server_rx) = channel::<SyncRequest<I, D>>(1024);
+                            tokio::spawn(
+                                cancel.clone().run_until_cancelled_owned(
+                                    WriteChannel::<I, _> {
+                                        input: to_server_rx,
+                                        output: conn.write,
+                                        settings: net_settings,
+                                    }
+                                    .start(),
+                                ),
+                            );
+                            to_server_tx
+                        };
+
+                        if to_server.send(SyncRequest::MyAddress(local)).await.is_err()
+                            || to_server
+                                .send(SyncRequest::NodeInfo { is_sentinel })
+                                .await
+                                .is_err()
+                        {
+                            cancel.cancel();
+                            let _ = conn_tx
+                                .send(ConnectionUpdate::SentinelDisconnected(sentinel))
+                                .await;
+                            return;
+                        }
+
+                        let _ = to_server.try_send(SyncRequest::SendMePeerInfo);
+
+                        if conn_tx
+                            .send(ConnectionUpdate::SentinelConnected {
+                                address: sentinel,
+                                send: to_server,
+                                cancel: cancel.clone(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            cancel.cancel();
+                            return;
+                        }
+
+                        while from_server.recv().await.is_some() {
+                            tokio::task::yield_now().await;
+                        }
+
+                        cancel.cancel();
+                        let _ = conn_tx
+                            .send(ConnectionUpdate::SentinelDisconnected(sentinel))
+                            .await;
+                    });
+                }
+
+                self.timers
+                    .get(Timer::ConnectSentinels)
+                    .set_earlier(Duration::from_secs(10));
+            }
+            Event::Timer(Timer::ReportSentinelConnectivity) => {
+                let report = self.connectivity_report();
+                if !report.is_empty() {
+                    for link in self.sentinel_links.values() {
+                        let _ = link
+                            .send
+                            .try_send(SyncRequest::SentinelConnectivityReport(report.clone()));
+                    }
+                }
+
+                self.timers
+                    .get(Timer::ReportSentinelConnectivity)
+                    .set(self.sentinel_settings.report_interval);
+            }
+            Event::Timer(Timer::EvaluateSentinelElection) => {
+                self.maybe_elect_sentinel_master().await;
+                self.timers
+                    .get(Timer::EvaluateSentinelElection)
+                    .set(self.sentinel_settings.election_interval);
             }
             Event::Timer(Timer::RejectPeer | Timer::RequireVerifyLeader | Timer::RequireState) => {
                 self.timers.get(Timer::RejectPeer).clear();
@@ -597,6 +1124,7 @@ where
                                 last_peer_failure_epoch: now_ms(),
                                 last_client_msg_epoch: 0,
                                 client_send: None,
+                                is_sentinel: false,
                             });
                         }
                         hash_map::Entry::Occupied(o) => {
@@ -709,6 +1237,7 @@ where
                 let conn_tx = self.conn_tx.clone();
                 let conn_timeout = self.connect_timeout;
                 let net_settings = self.net_settings.clone();
+                let is_sentinel = self.settings_is_sentinel;
 
                 self.last_connect_attempt = Some(connect_target.clone());
                 self.waiting_for_connection_update = true;
@@ -788,6 +1317,13 @@ where
                                     "failed to send initial MyAddress message to upstream"
                                 );
                             }
+                            if to_server
+                                .send(SyncRequest::NodeInfo { is_sentinel })
+                                .await
+                                .is_err()
+                            {
+                                tracing::error!("failed to send node info to upstream");
+                            }
 
                             {
                                 let now = now_ms();
@@ -802,32 +1338,36 @@ where
 
                                 tracing::info!("send ping to peer, waiting for pong");
 
-                                let pong_res = tokio::time::timeout(
-                                    Duration::from_secs(5),
-                                    from_server.recv(),
-                                )
-                                .await;
-                                let latency = match pong_res {
-                                    Err(_) => {
-                                        tracing::error!("timeout waiting for pong from peer");
-                                        break 'connect ConnectionUpdate::ConnectFailed(
-                                            connect_target,
-                                        );
-                                    }
-                                    Ok(None) => {
-                                        tracing::error!("channel closed waiting for pong");
-                                        break 'connect ConnectionUpdate::ConnectFailed(
-                                            connect_target,
-                                        );
-                                    }
-                                    Ok(Some(SyncResponse::Pong(pong))) if pong == now => {
-                                        now_ms() - pong
-                                    }
-                                    Ok(Some(_)) => {
-                                        tracing::error!("got unexpected ping response");
-                                        break 'connect ConnectionUpdate::ConnectFailed(
-                                            connect_target,
-                                        );
+                                let latency = loop {
+                                    let pong_res = tokio::time::timeout(
+                                        Duration::from_secs(5),
+                                        from_server.recv(),
+                                    )
+                                    .await;
+                                    match pong_res {
+                                        Err(_) => {
+                                            tracing::error!("timeout waiting for pong from peer");
+                                            break 'connect ConnectionUpdate::ConnectFailed(
+                                                connect_target,
+                                            );
+                                        }
+                                        Ok(None) => {
+                                            tracing::error!("channel closed waiting for pong");
+                                            break 'connect ConnectionUpdate::ConnectFailed(
+                                                connect_target,
+                                            );
+                                        }
+                                        Ok(Some(SyncResponse::Pong(pong))) if pong == now => {
+                                            break now_ms() - pong;
+                                        }
+                                        Ok(Some(SyncResponse::NodeInfo { .. }))
+                                        | Ok(Some(SyncResponse::PeerInfo(_))) => continue,
+                                        Ok(Some(_)) => {
+                                            tracing::error!("got unexpected ping response");
+                                            break 'connect ConnectionUpdate::ConnectFailed(
+                                                connect_target,
+                                            );
+                                        }
                                     }
                                 };
 
@@ -846,35 +1386,42 @@ where
 
                                 tracing::info!("request leader path from peer");
 
-                                let peer_res = tokio::time::timeout(
-                                    Duration::from_secs(5),
-                                    from_server.recv(),
-                                )
-                                .await;
-                                match peer_res {
-                                    Err(_) => {
-                                        tracing::error!("timeout waiting for path to leader");
-                                        break 'connect ConnectionUpdate::ConnectFailed(
-                                            connect_target,
-                                        );
-                                    }
-                                    Ok(None) => {
-                                        tracing::error!("channel closed waiting for leader path");
-                                        break 'connect ConnectionUpdate::ConnectFailed(
-                                            connect_target,
-                                        );
-                                    }
-                                    Ok(Some(SyncResponse::LeaderPath(path))) => path,
-                                    Ok(Some(_)) => {
-                                        tracing::error!("got unexpected leader path response");
-                                        break 'connect ConnectionUpdate::ConnectFailed(
-                                            connect_target,
-                                        );
+                                loop {
+                                    let peer_res = tokio::time::timeout(
+                                        Duration::from_secs(5),
+                                        from_server.recv(),
+                                    )
+                                    .await;
+                                    match peer_res {
+                                        Err(_) => {
+                                            tracing::error!("timeout waiting for path to leader");
+                                            break 'connect ConnectionUpdate::ConnectFailed(
+                                                connect_target,
+                                            );
+                                        }
+                                        Ok(None) => {
+                                            tracing::error!(
+                                                "channel closed waiting for leader path"
+                                            );
+                                            break 'connect ConnectionUpdate::ConnectFailed(
+                                                connect_target,
+                                            );
+                                        }
+                                        Ok(Some(SyncResponse::LeaderPath(path))) => break path,
+                                        Ok(Some(SyncResponse::NodeInfo { .. }))
+                                        | Ok(Some(SyncResponse::PeerInfo(_))) => continue,
+                                        Ok(Some(_)) => {
+                                            tracing::error!("got unexpected leader path response");
+                                            break 'connect ConnectionUpdate::ConnectFailed(
+                                                connect_target,
+                                            );
+                                        }
                                     }
                                 }
                             };
 
                             let _ = to_server.try_send(SyncRequest::SendMePeers);
+                            let _ = to_server.try_send(SyncRequest::SendMePeerInfo);
 
                             ConnectionUpdate::UpdatedFollow(FollowState {
                                 remote: conn.remote,
@@ -907,6 +1454,7 @@ where
                                 last_peer_failure_epoch: now_ms(),
                                 last_client_msg_epoch: 0,
                                 client_send: None,
+                                is_sentinel: false,
                             });
                         }
                         hash_map::Entry::Occupied(o) => {
@@ -916,6 +1464,36 @@ where
 
                     self.timers
                         .get(Timer::ConnectToPeer)
+                        .set_earlier(Duration::from_secs(1));
+                }
+                ConnectionUpdate::SentinelConnected {
+                    address,
+                    send,
+                    cancel,
+                } => {
+                    self.mark_peer_sentinel(address, true);
+                    self.sentinel_stats
+                        .entry(address)
+                        .or_default()
+                        .mark_connected();
+
+                    if let Some(existing) = self
+                        .sentinel_links
+                        .insert(address, SentinelLink { cancel, send })
+                    {
+                        existing.cancel.cancel();
+                    }
+                }
+                ConnectionUpdate::SentinelDisconnected(address) => {
+                    if let Some(existing) = self.sentinel_links.remove(&address) {
+                        existing.cancel.cancel();
+                    }
+                    self.sentinel_stats
+                        .entry(address)
+                        .or_default()
+                        .mark_disconnected();
+                    self.timers
+                        .get(Timer::ConnectSentinels)
                         .set_earlier(Duration::from_secs(1));
                 }
                 ConnectionUpdate::UpdatedFollow(follow) => {
@@ -979,6 +1557,10 @@ where
                 let follow = self.follow_state.as_mut().panic("follow_state missing");
 
                 match msg {
+                    SyncResponse::NodeInfo { is_sentinel } => {
+                        let remote = follow.remote;
+                        self.mark_peer_sentinel(remote, is_sentinel);
+                    }
                     SyncResponse::Pong(pong) => {
                         let now = now_ms();
                         let latency = Latency {
@@ -993,6 +1575,7 @@ where
                                     last_peer_failure_epoch: 0,
                                     last_client_msg_epoch: 0,
                                     client_send: None,
+                                    is_sentinel: false,
                                 });
                             }
                             hash_map::Entry::Occupied(o) => {
@@ -1175,45 +1758,18 @@ where
                                     last_peer_failure_epoch: 0,
                                     last_client_msg_epoch: 0,
                                     client_send: None,
+                                    is_sentinel: false,
                                 });
                             }
                         }
                     }
+                    SyncResponse::PeerInfo(peers) => {
+                        self.apply_peer_info(peers);
+                    }
                 }
             }
             Event::Control(ControlMessage::SetLeader(leader)) => {
-                let changed = std::mem::replace(&mut self.leader, leader) != leader;
-                if !changed {
-                    tracing::info!(?leader, "ignore set leader, no change");
-                    return;
-                }
-
-                if self.local == self.leader {
-                    tracing::info!("self set as leader");
-
-                    if let Some(state) = self.follow_state.take() {
-                        state.cancel.cancel();
-                    }
-
-                    tracing::info!("self set as leader");
-                    self.updater.lead().await;
-                } else if self.follow_state.is_some() {
-                    tracing::info!(
-                        "leader changed but connected to peer already, queue confirm request"
-                    );
-
-                    self.timers
-                        .get(Timer::SendVerifyLeader)
-                        .set_earlier(Duration::from_secs(2));
-                    self.timers
-                        .get(Timer::RequireVerifyLeader)
-                        .set(Duration::from_secs(10));
-                } else {
-                    self.updater.go_offline().await;
-
-                    tracing::info!("need leader connection");
-                    self.timers.get(Timer::ConnectToPeer).now();
-                }
+                self.set_leader_inner(leader).await;
             }
             Event::ClientMessage(ClientMessage { client, msg, send }) => {
                 if client.cancel.is_cancelled() {
@@ -1232,6 +1788,7 @@ where
                             last_client_msg_epoch: now_ms(),
                             last_peer_failure_epoch: 0,
                             client_send: Some(send.clone()),
+                            is_sentinel: false,
                         });
                     }
                     hash_map::Entry::Occupied(o) => {
@@ -1255,6 +1812,12 @@ where
                             tracing::warn!("got MyAddress which doesn't match source id");
                         }
                     }
+                    SyncRequest::NodeInfo { is_sentinel } => {
+                        self.mark_peer_sentinel(client.source_id, is_sentinel);
+                        let _ = send.try_send(SyncResponse::NodeInfo {
+                            is_sentinel: self.settings_is_sentinel,
+                        });
+                    }
                     SyncRequest::Ping(num) => {
                         self.metrics.client_req_ping.inc();
 
@@ -1273,6 +1836,16 @@ where
                         let peers = self.peers.keys().cloned().collect::<Vec<_>>();
                         permit.send(SyncResponse::Peers(peers));
                     }
+                    SyncRequest::SendMePeerInfo => {
+                        self.metrics.client_req_send_me_peers.inc();
+
+                        let Ok(permit) = send.try_reserve() else {
+                            self.metrics.client_send_dropped.inc();
+                            return;
+                        };
+
+                        permit.send(SyncResponse::PeerInfo(self.peer_infos()));
+                    }
                     SyncRequest::NoticePeers(peers) => {
                         self.metrics.client_req_notice_peers.inc();
 
@@ -1283,8 +1856,39 @@ where
                                     last_peer_failure_epoch: 0,
                                     last_client_msg_epoch: 0,
                                     client_send: None,
+                                    is_sentinel: false,
                                 });
                             }
+                        }
+                    }
+                    SyncRequest::NoticePeerInfo(peers) => {
+                        self.metrics.client_req_notice_peers.inc();
+                        self.apply_peer_info(peers);
+                    }
+                    SyncRequest::SentinelConnectivityReport(report) => {
+                        if self.settings_is_sentinel {
+                            self.peer_sentinel_reports.insert(
+                                client.source_id,
+                                TimedPeerSentinelReport {
+                                    reports: report,
+                                    epoch: now_ms(),
+                                },
+                            );
+                        }
+                    }
+                    SyncRequest::SentinelVote(vote) => {
+                        if self.settings_is_sentinel {
+                            self.mark_peer_sentinel(client.source_id, true);
+                            self.sentinel_votes.insert(
+                                client.source_id,
+                                TimedSentinelVote {
+                                    vote,
+                                    epoch: now_ms(),
+                                },
+                            );
+                            self.timers
+                                .get(Timer::EvaluateSentinelElection)
+                                .set_earlier(Duration::from_millis(10));
                         }
                     }
                     SyncRequest::ShareLeaderPath => {
@@ -1441,6 +2045,7 @@ struct ClientAcceptor<I: SyncIO, D: DeterministicState> {
     msg_tx: Sender<ClientMessage<I, D>>,
     net_settings: NetIoSettings,
     metrics: Arc<SyncManagerMetrics>,
+    is_sentinel: bool,
 }
 
 impl<I: SyncIO, D: DeterministicState> ClientAcceptor<I, D>
@@ -1479,6 +2084,7 @@ where
         let event_tx = self.msg_tx.clone();
         let metrics = self.metrics.clone();
         let net_settings = self.net_settings.clone();
+        let is_sentinel = self.is_sentinel;
 
         tokio::spawn(async move {
             let cancel = CancellationToken::new();
@@ -1544,6 +2150,8 @@ where
 
                 to_client_tx
             };
+
+            let _ = to_client.try_send(SyncResponse::NodeInfo { is_sentinel });
 
             tokio::spawn(async move {
                 metrics.clients_connected.inc();
@@ -1663,6 +2271,7 @@ struct DiscoveredPeer<I: SyncIO, D: DeterministicState> {
     last_peer_failure_epoch: u64,
     last_client_msg_epoch: u64,
     client_send: Option<Sender<SyncResponse<I, D>>>,
+    is_sentinel: bool,
 }
 
 impl<I: SyncIO, D: DeterministicState> DiscoveredPeer<I, D> {
@@ -1672,6 +2281,7 @@ impl<I: SyncIO, D: DeterministicState> DiscoveredPeer<I, D> {
             last_peer_failure_epoch: 0,
             last_client_msg_epoch: 0,
             client_send: None,
+            is_sentinel: false,
         }
     }
 }
@@ -1690,6 +2300,128 @@ mod test {
     };
 
     use super::*;
+
+    fn sentinel_test_settings(initial_peers: Vec<u64>) -> SyncMangerSettings<u64> {
+        SyncMangerSettings {
+            initial_peers,
+            is_sentinel: true,
+            connect_timeout: Duration::from_millis(200),
+            receive_state_timeout: Duration::from_secs(2),
+            sentinel: SentinelSettings {
+                report_interval: Duration::from_millis(100),
+                election_interval: Duration::from_millis(100),
+                unhealthy_disconnect_threshold: 1,
+                stale_report_after: Duration::from_secs(2),
+            },
+            ..Default::default()
+        }
+    }
+
+    async fn wait_for<F: FnMut() -> bool>(mut check: F, timeout: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if check() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(check());
+    }
+
+    #[tokio::test]
+    async fn sync_manager_sentinel_majority_promotes_new_master_test() {
+        setup_logging();
+
+        let test_net = TestSyncNet::new();
+
+        let a = test_net.io(1).await;
+        let b = test_net.io(2).await;
+        let c = test_net.io(3).await;
+
+        let a_work = {
+            let _span = tracing::info_span!("A").entered();
+            SyncManager::new(
+                a,
+                1,
+                TestState::default(),
+                sentinel_test_settings(vec![2, 3]),
+            )
+        };
+        let b_work = {
+            let _span = tracing::info_span!("B").entered();
+            SyncManager::new(
+                b,
+                2,
+                TestState::default(),
+                sentinel_test_settings(vec![1, 3]),
+            )
+        };
+        let c_work = {
+            let _span = tracing::info_span!("C").entered();
+            SyncManager::new(
+                c,
+                3,
+                TestState::default(),
+                sentinel_test_settings(vec![1, 2]),
+            )
+        };
+
+        b_work.set_leader(1).await;
+        c_work.set_leader(1).await;
+
+        a_work
+            .action_tx()
+            .send(TestStateAction::Set { slot: 0, value: 10 })
+            .await
+            .unwrap();
+
+        wait_for(
+            || {
+                b_work.shared().read().state().numbers[0] == 10
+                    && c_work.shared().read().state().numbers[0] == 10
+            },
+            Duration::from_secs(4),
+        )
+        .await;
+
+        let old_id = b_work.shared().read().details().id;
+
+        test_net.block_connection(1, 2, true).await;
+        test_net.block_connection(1, 3, true).await;
+        test_net
+            .kill_connection(1, 2, TestIOKillMode::Shutdown)
+            .await;
+        test_net
+            .kill_connection(1, 3, TestIOKillMode::Shutdown)
+            .await;
+
+        wait_for(
+            || {
+                let b_shared = b_work.shared();
+                let c_shared = c_work.shared();
+                let b = b_shared.read();
+                let c = c_shared.read();
+                b.details().id != old_id && b.details().id == c.details().id
+            },
+            Duration::from_secs(8),
+        )
+        .await;
+
+        c_work
+            .action_tx()
+            .send(TestStateAction::Add { slot: 0, value: 5 })
+            .await
+            .unwrap();
+
+        wait_for(
+            || {
+                b_work.shared().read().state().numbers[0] == 15
+                    && c_work.shared().read().state().numbers[0] == 15
+            },
+            Duration::from_secs(4),
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn sync_manager_doesnt_allow_peer_with_different_leader_test() {
