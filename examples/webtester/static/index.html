@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>sharedstate webtester</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>sharedstate webtester</h1>
+        <div id="cluster-meta" class="meta"></div>
+      </div>
+      <div class="global-actions">
+        <button data-command="reset">Reset</button>
+        <button data-command="start-all">Start all</button>
+        <button data-command="stop-all">Stop all</button>
+        <button data-command="network-all-on">Network on</button>
+        <button data-command="network-all-off">Network off</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel nodes-panel">
+        <div class="panel-head">
+          <h2>Nodes</h2>
+          <span id="poll-state" class="meta"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="nodes-table">
+            <thead>
+              <tr>
+                <th>id</th>
+                <th>role</th>
+                <th>task</th>
+                <th>network</th>
+                <th>state_id</th>
+                <th>generation</th>
+                <th>recover_seq</th>
+                <th>state_seq</th>
+                <th>app_seq</th>
+                <th>counters</th>
+                <th>actions</th>
+              </tr>
+            </thead>
+            <tbody id="nodes-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <aside class="panel detail-panel">
+        <div class="panel-head">
+          <h2 id="detail-title">Node</h2>
+        </div>
+        <div id="detail-tabs" class="tabs">
+          <button data-tab="summary" class="active">Summary</button>
+          <button data-tab="recoverable">Recoverable</button>
+          <button data-tab="state">State</button>
+          <button data-tab="network">Network</button>
+          <button data-tab="raw">Raw</button>
+        </div>
+        <pre id="detail-json" class="json-view"></pre>
+      </aside>
+
+      <section class="panel action-panel">
+        <div class="panel-head">
+          <h2>Send Action</h2>
+        </div>
+        <form id="action-form" class="form-grid">
+          <label>
+            Node
+            <select name="node" id="action-node"></select>
+          </label>
+          <label>
+            Type
+            <select name="type" id="action-type">
+              <option value="Add">Add</option>
+              <option value="Set">Set</option>
+              <option value="AppendLog">AppendLog</option>
+            </select>
+          </label>
+          <label>
+            Slot
+            <input name="slot" type="number" min="0" max="7" value="0" />
+          </label>
+          <label>
+            Value
+            <input name="value" type="number" value="1" />
+          </label>
+          <label class="wide">
+            Label
+            <input name="label" type="text" value="manual action" maxlength="128" />
+          </label>
+          <button type="submit">Send</button>
+        </form>
+        <div id="api-message" class="api-message"></div>
+      </section>
+
+      <section class="panel links-panel">
+        <div class="panel-head">
+          <h2>Connections</h2>
+        </div>
+        <div id="links-grid" class="links-grid"></div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
