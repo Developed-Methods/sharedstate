@@ -1,20 +1,23 @@
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{hash_map, HashMap, HashSet},
     fmt::Debug,
+    future::pending,
     sync::{atomic::AtomicU64, Arc},
-    task::Poll,
     time::Duration,
 };
 
 use arc_metrics::{IntCounter, IntGauge};
-use futures_util::future::poll_fn;
+use futures_util::StreamExt;
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedBroadcastSettings, SequencedReceiver, SequencedSender};
 use tokio::{
     sync::mpsc::{channel, Receiver, Sender},
     time::Instant,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{
+    sync::CancellationToken,
+    time::{delay_queue::Key, DelayQueue},
+};
 use tracing::Instrument;
 
 use crate::{
@@ -132,8 +135,7 @@ struct SyncManagerWorker<I: SyncIO, D: DeterministicState> {
     waiting_for_connection_update: bool,
 }
 
-#[repr(usize)]
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Timer {
     SendVerifyLeader,
     RequireVerifyLeader,
@@ -147,8 +149,9 @@ pub enum Timer {
 
 #[derive(Default)]
 struct Timers {
-    next_scan: usize,
-    timers: Vec<TimerOpt>,
+    queue: DelayQueue<Timer>,
+    entries: HashMap<Timer, TimerEntry>,
+    triggered: HashSet<Timer>,
 }
 
 impl Debug for Timers {
@@ -158,75 +161,136 @@ impl Debug for Timers {
 }
 
 impl Timers {
-    pub fn get(&mut self, timer: Timer) -> &mut TimerOpt {
-        let pos = timer as usize;
-        while self.timers.len() <= pos {
-            self.timers.push(TimerOpt::default());
+    pub fn get(&mut self, timer: Timer) -> TimerHandle<'_> {
+        TimerHandle {
+            timers: self,
+            timer,
         }
-        &mut self.timers[pos]
     }
 
     pub fn active(&self) -> Vec<Timer> {
-        let mut timers = Vec::new();
-        for (pos, state) in self.timers.iter().enumerate() {
-            if state.is_set() {
-                timers.push(unsafe { std::mem::transmute::<usize, Timer>(pos) });
-            }
-        }
+        let mut timers = self.triggered.iter().copied().collect::<Vec<_>>();
+        timers.extend(self.entries.keys().copied());
         timers
     }
 
     pub async fn wait(&mut self) -> Timer {
-        let done_timer_pos = 'triggered: {
-            let mut next = Option::<(Instant, usize)>::None;
-
-            for _ in 0..self.timers.len() {
-                let pos = self.next_scan % self.timers.len();
-                let timer = &mut self.timers[pos];
-                self.next_scan += 1;
-
-                if timer.trigger {
-                    break 'triggered pos;
-                }
-
-                let Some(opt) = timer.expires_at else {
-                    continue;
-                };
-
-                next = match next {
-                    Some((time, pos)) if time < opt => Some((time, pos)),
-                    _ => Some((opt, pos)),
-                };
+        loop {
+            if let Some(timer) = self.triggered.iter().next().copied() {
+                self.triggered.remove(&timer);
+                return timer;
             }
 
-            match next {
-                None => {
-                    poll_fn(|_| Poll::<()>::Pending).await;
-                    unreachable!()
-                }
-                Some((next, pos)) => {
-                    tokio::time::sleep_until(next).await;
-                    pos
-                }
-            }
-        };
+            let Some(expired) = self.queue.next().await else {
+                return pending::<Timer>().await;
+            };
 
-        self.timers[done_timer_pos].clear();
-        unsafe { std::mem::transmute::<usize, Timer>(done_timer_pos) }
+            let key = expired.key();
+            let timer = expired.into_inner();
+
+            if self
+                .entries
+                .get(&timer)
+                .map(|entry| entry.key == key)
+                .unwrap_or(false)
+            {
+                self.entries.remove(&timer);
+                return timer;
+            }
+        }
+    }
+
+    fn clear_timer(&mut self, timer: Timer) {
+        if let Some(entry) = self.entries.remove(&timer) {
+            self.queue.remove(&entry.key);
+        }
+        self.triggered.remove(&timer);
+    }
+
+    fn set_timer(&mut self, timer: Timer, expires_at_start: Instant, expires_at: Instant) {
+        self.clear_timer(timer);
+        let key = self.queue.insert_at(timer, expires_at);
+        self.entries.insert(
+            timer,
+            TimerEntry {
+                key,
+                expires_at_start,
+                expires_at,
+            },
+        );
     }
 }
 
-// #[derive(Debug, Default)]
-// struct Timers {
-//     ensure_leader: TimerOpt,
-//     confirm_leader_timeout: TimerOpt,
-//     leader_failed: TimerOpt,
-//     send_ping: TimerOpt,
-//     pong_timeout: TimerOpt,
-//     connect_to_leader: TimerOpt,
-//     receive_state_timeout: TimerOpt,
-//     broadcast_peers: TimerOpt,
-// }
+#[derive(Debug)]
+struct TimerEntry {
+    key: Key,
+    expires_at_start: Instant,
+    expires_at: Instant,
+}
+
+struct TimerHandle<'a> {
+    timers: &'a mut Timers,
+    timer: Timer,
+}
+
+impl TimerHandle<'_> {
+    fn now(self) {
+        self.timers.clear_timer(self.timer);
+        self.timers.triggered.insert(self.timer);
+    }
+
+    fn extend(self, wait: Duration, max: Duration) -> Self {
+        if self.timers.triggered.contains(&self.timer) {
+            return self;
+        }
+
+        let now = Instant::now();
+        let updated = now + wait;
+
+        let (expires_at_start, expires_at) =
+            if let Some(entry) = self.timers.entries.get(&self.timer) {
+                let limit = entry.expires_at_start + max;
+                (
+                    entry.expires_at_start,
+                    updated.max(entry.expires_at).min(limit),
+                )
+            } else {
+                let limit = now + max;
+                (now, updated.min(limit))
+            };
+
+        self.timers
+            .set_timer(self.timer, expires_at_start, expires_at);
+        self
+    }
+
+    fn set(self, wait: Duration) {
+        let now = Instant::now();
+        self.timers.set_timer(self.timer, now, now + wait);
+    }
+
+    fn set_earlier(self, wait: Duration) {
+        if self.timers.triggered.contains(&self.timer) {
+            return;
+        }
+
+        let now = Instant::now();
+        let updated = now + wait;
+
+        if let Some(entry) = self.timers.entries.get_mut(&self.timer) {
+            if updated < entry.expires_at {
+                entry.expires_at = updated;
+                self.timers.queue.reset_at(&entry.key, updated);
+            }
+        } else {
+            self.timers.set_timer(self.timer, now, updated);
+        }
+    }
+
+    fn clear(self) {
+        self.timers.clear_timer(self.timer);
+    }
+}
 
 struct FollowState<I: SyncIO, D: DeterministicState> {
     remote: I::Address,
@@ -235,6 +299,11 @@ struct FollowState<I: SyncIO, D: DeterministicState> {
     to_leader: Sender<SyncRequest<I, D>>,
     from_leader: Receiver<SyncResponse<I, D>>,
     feed_updater: Option<SequencedSender<RecoverableStateAction<I::Address, D::AuthorityAction>>>,
+}
+
+enum FollowStart<I: SyncIO, D: DeterministicState> {
+    Fresh(RecoverableState<I::Address, D>),
+    Recovery(u64),
 }
 
 #[derive(Debug, Default)]
@@ -465,8 +534,7 @@ where
 
             async move {
                 let Some(follow) = follow else {
-                    poll_fn(|_| Poll::<()>::Pending).await;
-                    unreachable!()
+                    return pending::<Option<SyncResponse<I, D>>>().await;
                 };
 
                 follow.from_leader.recv().await
@@ -553,6 +621,133 @@ where
                 break;
             }
         }
+    }
+
+    async fn start_follow_session(&mut self, start: FollowStart<I, D>) -> Result<&'static str, ()> {
+        let (cancel, to_leader) = {
+            let Some(follow) = self.follow_state.as_ref() else {
+                tracing::error!("got leader session response but follow_state is missing");
+                self.timers.get(Timer::RejectPeer).now();
+                return Err(());
+            };
+
+            if follow.feed_updater.is_some() {
+                tracing::error!("already in session with leader but got fresh state");
+                self.timers.get(Timer::RejectPeer).now();
+                return Err(());
+            }
+
+            (follow.cancel.clone(), follow.to_leader.clone())
+        };
+
+        let (action_tx, action_rx) = channel(1024);
+        let (authority_tx, authority_rx) = channel(1024);
+
+        let (seq, label) = match start {
+            FollowStart::Fresh(state) => {
+                let seq = state.accept_seq();
+                self.updater
+                    .follow(
+                        action_tx,
+                        NewFollowState {
+                            state,
+                            authority_rx: SequencedReceiver::new(seq, authority_rx),
+                        }
+                        .try_into_valid()
+                        .panic("could not create valid follow state"),
+                    )
+                    .await;
+                (seq, "FreshState")
+            }
+            FollowStart::Recovery(seq) => {
+                let success = self
+                    .updater
+                    .try_follow(
+                        action_tx,
+                        FollowTarget {
+                            leader_state_check: None,
+                            authority_rx: SequencedReceiver::new(seq, authority_rx),
+                        },
+                    )
+                    .await;
+
+                if !success {
+                    tracing::error!("failed to recover connection from leader");
+                    self.timers.get(Timer::RejectPeer).now();
+                    return Err(());
+                }
+
+                (seq, "Recovery")
+            }
+        };
+
+        let Some(follow) = self.follow_state.as_mut() else {
+            tracing::error!("follow_state missing after follow session setup");
+            self.timers.get(Timer::RejectPeer).now();
+            return Err(());
+        };
+
+        follow.feed_updater = Some(SequencedSender::new(seq, authority_tx));
+        Self::spawn_forward_actions_to_leader(cancel, to_leader, action_rx);
+
+        tracing::info!("Connected to leader with {}", label);
+        self.timers.get(Timer::RequireState).clear();
+        self.last_connect_attempt = None;
+
+        Ok(label)
+    }
+
+    fn spawn_forward_actions_to_leader(
+        cancel: CancellationToken,
+        to_leader: Sender<SyncRequest<I, D>>,
+        mut action_rx: Receiver<(I::Address, D::Action)>,
+    ) {
+        let task_cancel = cancel.clone();
+        tokio::spawn(task_cancel.run_until_cancelled_owned(async move {
+            while let Some((source, action)) = action_rx.recv().await {
+                tokio::task::yield_now().await;
+                if to_leader
+                    .send(SyncRequest::Action { source, action })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            tokio::task::yield_now().await;
+            if !cancel.is_cancelled() {
+                tracing::error!("forwarding action to leader task stopped without cancel");
+            }
+        }));
+    }
+
+    fn spawn_client_authority_stream(
+        cancel: CancellationToken,
+        send: Sender<SyncResponse<I, D>>,
+        initial_response: SyncResponse<I, D>,
+        mut authority_rx: SequencedReceiver<RecoverableStateAction<I::Address, D::AuthorityAction>>,
+    ) {
+        let task_cancel = cancel.clone();
+        tokio::spawn(task_cancel.run_until_cancelled_owned(async move {
+            if send.send(initial_response).await.is_err() {
+                cancel.cancel();
+                return;
+            }
+
+            while let Some((seq, action)) = authority_rx.recv().await {
+                tokio::task::yield_now().await;
+                if send
+                    .send(SyncResponse::AuthorityAction(seq, action))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            cancel.cancel();
+        }));
     }
 
     async fn handle_event(&mut self, event: Event<I, D>) {
@@ -975,212 +1170,107 @@ where
                         .set(self.receive_state_timeout);
                 }
             },
-            Event::LeaderMessage(msg) => {
-                let follow = self.follow_state.as_mut().panic("follow_state missing");
+            Event::LeaderMessage(msg) => match msg {
+                SyncResponse::Pong(pong) => {
+                    let follow = self.follow_state.as_mut().panic("follow_state missing");
+                    let now = now_ms();
+                    let latency = Latency {
+                        latency_ms: now.max(pong) - pong,
+                        last_pong_epoch: now,
+                    };
 
-                match msg {
-                    SyncResponse::Pong(pong) => {
-                        let now = now_ms();
-                        let latency = Latency {
-                            latency_ms: now.max(pong) - pong,
-                            last_pong_epoch: now,
-                        };
-
-                        match self.peers.entry(follow.remote) {
-                            hash_map::Entry::Vacant(v) => {
-                                v.insert(DiscoveredPeer {
-                                    latency: Some(latency),
-                                    last_peer_failure_epoch: 0,
-                                    last_client_msg_epoch: 0,
-                                    client_send: None,
-                                });
-                            }
-                            hash_map::Entry::Occupied(o) => {
-                                o.into_mut().latency.replace(latency);
-                            }
+                    match self.peers.entry(follow.remote) {
+                        hash_map::Entry::Vacant(v) => {
+                            v.insert(DiscoveredPeer {
+                                latency: Some(latency),
+                                last_peer_failure_epoch: 0,
+                                last_client_msg_epoch: 0,
+                                client_send: None,
+                            });
                         }
-                    }
-                    SyncResponse::FreshState(state) => {
-                        if follow.feed_updater.is_some() {
-                            tracing::error!("already in session with leader but got fresh state");
-                            self.timers.get(Timer::RejectPeer).now();
-                            return;
-                        }
-
-                        let (action_tx, mut action_rx) = channel(1024);
-                        let (authority_tx, authority_rx) = channel(1024);
-                        let seq = state.accept_seq();
-
-                        self.updater
-                            .follow(
-                                action_tx,
-                                NewFollowState {
-                                    state,
-                                    authority_rx: SequencedReceiver::new(seq, authority_rx),
-                                }
-                                .try_into_valid()
-                                .panic("could not create valid follow state"),
-                            )
-                            .await;
-
-                        follow.feed_updater = Some(SequencedSender::new(seq, authority_tx));
-
-                        /* forward actions to leader */
-                        {
-                            let to_leader = follow.to_leader.clone();
-                            tokio::spawn(follow.cancel.clone().run_until_cancelled_owned(
-                                async move {
-                                    while let Some((source, action)) = action_rx.recv().await {
-                                        tokio::task::yield_now().await;
-                                        if to_leader
-                                            .send(SyncRequest::Action { source, action })
-                                            .await
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-
-                                    tokio::task::yield_now().await;
-                                    tracing::error!(
-                                        "forwarding action to leader task stopped without cancel"
-                                    );
-                                },
-                            ));
-                        }
-
-                        tracing::info!("Connected to leader with FreshState");
-                        self.timers.get(Timer::RequireState).clear();
-                        self.last_connect_attempt = None;
-                    }
-                    SyncResponse::RecoveryAccepted(seq) => {
-                        if follow.feed_updater.is_some() {
-                            tracing::error!("already in session with leader but got fresh state");
-                            self.timers.get(Timer::RejectPeer).now();
-                            return;
-                        }
-
-                        let (action_tx, mut action_rx) = channel(1024);
-                        let (authority_tx, authority_rx) = channel(1024);
-
-                        let success = self
-                            .updater
-                            .try_follow(
-                                action_tx,
-                                FollowTarget {
-                                    leader_state_check: None,
-                                    authority_rx: SequencedReceiver::new(seq, authority_rx),
-                                },
-                            )
-                            .await;
-
-                        if !success {
-                            tracing::error!("failed to recover connection from leader");
-                            self.timers.get(Timer::RejectPeer).now();
-                            return;
-                        }
-
-                        follow.feed_updater = Some(SequencedSender::new(seq, authority_tx));
-
-                        /* forward actions to leader */
-                        {
-                            let to_leader = follow.to_leader.clone();
-                            tokio::spawn(follow.cancel.clone().run_until_cancelled_owned(
-                                async move {
-                                    while let Some((source, action)) = action_rx.recv().await {
-                                        tokio::task::yield_now().await;
-                                        if to_leader
-                                            .send(SyncRequest::Action { source, action })
-                                            .await
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-
-                                    tokio::task::yield_now().await;
-                                    tracing::error!(
-                                        "forwarding action to leader task stopped without cancel"
-                                    );
-                                },
-                            ));
-                        }
-
-                        tracing::info!("Connected to leader with Recovery");
-                        self.timers.get(Timer::RequireState).clear();
-                        self.last_connect_attempt = None;
-                    }
-                    SyncResponse::AuthorityAction(seq, action) => {
-                        let Some(updater) = follow.feed_updater.as_mut() else {
-                            tracing::error!("got AuthorityAction but not following leader yet");
-                            self.timers.get(Timer::RejectPeer).now();
-                            return;
-                        };
-
-                        if let Err(error) = updater.safe_send(seq, action).await {
-                            tracing::error!(?error, "leader sent invalid sequence");
-                            self.timers.get(Timer::RejectPeer).now();
-                        }
-                    }
-                    SyncResponse::LeaderPath(path) => {
-                        let is_valid = 'check: {
-                            if path.is_empty() {
-                                tracing::error!("got empty leader path from peer");
-                                break 'check false;
-                            }
-
-                            if path[0] != self.leader {
-                                tracing::debug!("leader path doesn't go to same leader");
-                                break 'check false;
-                            }
-
-                            for step in &path[1..] {
-                                if *step == self.local {
-                                    tracing::warn!("leader path from peer includes us");
-                                    self.timers.get(Timer::RejectPeer).now();
-                                    return;
-                                }
-                            }
-
-                            true
-                        };
-
-                        if is_valid {
-                            follow.leader_path = path;
-
-                            self.timers
-                                .get(Timer::SendVerifyLeader)
-                                .set_earlier(Duration::from_secs(10));
-                            self.timers
-                                .get(Timer::RequireVerifyLeader)
-                                .set(Duration::from_secs(40));
-                        } else {
-                            follow.leader_path = vec![];
-
-                            self.timers
-                                .get(Timer::SendVerifyLeader)
-                                .set_earlier(Duration::from_secs(2));
-                            self.timers
-                                .get(Timer::RequireVerifyLeader)
-                                .extend(Duration::from_secs(4), Duration::from_secs(20))
-                                .set_earlier(Duration::from_secs(2) + self.connect_timeout);
-                        }
-                    }
-                    SyncResponse::Peers(peers) => {
-                        for peer in peers {
-                            if let hash_map::Entry::Vacant(v) = self.peers.entry(peer) {
-                                tracing::info!("Informed of new new peer: {:?}", peer);
-                                v.insert(DiscoveredPeer {
-                                    latency: None,
-                                    last_peer_failure_epoch: 0,
-                                    last_client_msg_epoch: 0,
-                                    client_send: None,
-                                });
-                            }
+                        hash_map::Entry::Occupied(o) => {
+                            o.into_mut().latency.replace(latency);
                         }
                     }
                 }
-            }
+                SyncResponse::FreshState(state) => {
+                    let _ = self.start_follow_session(FollowStart::Fresh(state)).await;
+                }
+                SyncResponse::RecoveryAccepted(seq) => {
+                    let _ = self.start_follow_session(FollowStart::Recovery(seq)).await;
+                }
+                SyncResponse::AuthorityAction(seq, action) => {
+                    let follow = self.follow_state.as_mut().panic("follow_state missing");
+                    let Some(updater) = follow.feed_updater.as_mut() else {
+                        tracing::error!("got AuthorityAction but not following leader yet");
+                        self.timers.get(Timer::RejectPeer).now();
+                        return;
+                    };
+
+                    if let Err(error) = updater.safe_send(seq, action).await {
+                        tracing::error!(?error, "leader sent invalid sequence");
+                        self.timers.get(Timer::RejectPeer).now();
+                    }
+                }
+                SyncResponse::LeaderPath(path) => {
+                    let follow = self.follow_state.as_mut().panic("follow_state missing");
+                    let is_valid = 'check: {
+                        if path.is_empty() {
+                            tracing::error!("got empty leader path from peer");
+                            break 'check false;
+                        }
+
+                        if path[0] != self.leader {
+                            tracing::debug!("leader path doesn't go to same leader");
+                            break 'check false;
+                        }
+
+                        for step in &path[1..] {
+                            if *step == self.local {
+                                tracing::warn!("leader path from peer includes us");
+                                self.timers.get(Timer::RejectPeer).now();
+                                return;
+                            }
+                        }
+
+                        true
+                    };
+
+                    if is_valid {
+                        follow.leader_path = path;
+
+                        self.timers
+                            .get(Timer::SendVerifyLeader)
+                            .set_earlier(Duration::from_secs(10));
+                        self.timers
+                            .get(Timer::RequireVerifyLeader)
+                            .set(Duration::from_secs(40));
+                    } else {
+                        follow.leader_path = vec![];
+
+                        self.timers
+                            .get(Timer::SendVerifyLeader)
+                            .set_earlier(Duration::from_secs(2));
+                        self.timers
+                            .get(Timer::RequireVerifyLeader)
+                            .extend(Duration::from_secs(4), Duration::from_secs(20))
+                            .set_earlier(Duration::from_secs(2) + self.connect_timeout);
+                    }
+                }
+                SyncResponse::Peers(peers) => {
+                    for peer in peers {
+                        if let hash_map::Entry::Vacant(v) = self.peers.entry(peer) {
+                            tracing::info!("Informed of new new peer: {:?}", peer);
+                            v.insert(DiscoveredPeer {
+                                latency: None,
+                                last_peer_failure_epoch: 0,
+                                last_client_msg_epoch: 0,
+                                client_send: None,
+                            });
+                        }
+                    }
+                }
+            },
             Event::Control(ControlMessage::SetLeader(leader)) => {
                 let changed = std::mem::replace(&mut self.leader, leader) != leader;
                 if !changed {
@@ -1319,7 +1409,7 @@ where
                     SyncRequest::SubscribeRecovery(recovery) => {
                         self.metrics.client_req_recover.inc();
 
-                        let Some(mut follow_target) = self.updater.add_subscriber(recovery).await
+                        let Some(follow_target) = self.updater.add_subscriber(recovery).await
                         else {
                             self.metrics.client_recovery_fails.inc();
 
@@ -1354,31 +1444,15 @@ where
                             return;
                         }
 
-                        tokio::spawn(client.cancel.clone().run_until_cancelled_owned(async move {
-                            if send
-                                .send(SyncResponse::RecoveryAccepted(
-                                    follow_target.authority_rx.next_seq(),
-                                ))
-                                .await
-                                .is_err()
-                            {
-                                client.cancel.cancel();
-                                return;
-                            }
+                        let initial_response =
+                            SyncResponse::RecoveryAccepted(follow_target.authority_rx.next_seq());
 
-                            while let Some(msg) = follow_target.authority_rx.recv().await {
-                                tokio::task::yield_now().await;
-                                if send
-                                    .send(SyncResponse::AuthorityAction(msg.0, msg.1))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-
-                            client.cancel.cancel();
-                        }));
+                        Self::spawn_client_authority_stream(
+                            client.cancel.clone(),
+                            send,
+                            initial_response,
+                            follow_target.authority_rx,
+                        );
                     }
                     SyncRequest::SubscribeFresh => {
                         self.metrics.client_req_fresh.inc();
@@ -1407,28 +1481,15 @@ where
 
                         let NewFollowState {
                             state,
-                            mut authority_rx,
+                            authority_rx,
                         } = details.into_inner();
 
-                        tokio::spawn(async move {
-                            if send.send(SyncResponse::FreshState(state)).await.is_err() {
-                                client.cancel.cancel();
-                                return;
-                            }
-
-                            while let Some(msg) = authority_rx.recv().await {
-                                tokio::task::yield_now().await;
-                                if send
-                                    .send(SyncResponse::AuthorityAction(msg.0, msg.1))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-
-                            client.cancel.cancel();
-                        });
+                        Self::spawn_client_authority_stream(
+                            client.cancel.clone(),
+                            send,
+                            SyncResponse::FreshState(state),
+                            authority_rx,
+                        );
                     }
                 }
             }
@@ -1577,75 +1638,6 @@ where
                 metrics.clients_connected.dec();
             });
         });
-    }
-}
-
-#[derive(Debug, Default)]
-struct TimerOpt {
-    expires_at_start: Option<Instant>,
-    expires_at: Option<Instant>,
-    trigger: bool,
-}
-
-impl TimerOpt {
-    fn is_set(&self) -> bool {
-        self.trigger || self.expires_at.is_some()
-    }
-
-    fn now(&mut self) {
-        self.clear();
-        self.trigger = true;
-    }
-
-    fn extend(&mut self, wait: Duration, max: Duration) -> &mut Self {
-        let now = Instant::now();
-        let mut expires_at = now + wait;
-
-        if let Some(start) = self.expires_at_start {
-            let limit = start + max;
-            if let Some(current) = self.expires_at {
-                expires_at = expires_at.max(current);
-            }
-
-            self.expires_at = Some(expires_at.min(limit));
-        } else {
-            let limit = now + max;
-            if let Some(current) = self.expires_at {
-                self.expires_at = Some(expires_at.max(current).min(limit));
-            } else {
-                self.expires_at = Some(expires_at.min(limit));
-            }
-            self.expires_at_start = Some(now);
-        }
-
-        self
-    }
-
-    fn set(&mut self, wait: Duration) {
-        self.trigger = false;
-        let now = Instant::now();
-        self.expires_at = Some(now + wait);
-        self.expires_at_start = Some(now);
-    }
-
-    fn set_earlier(&mut self, wait: Duration) {
-        let now = Instant::now();
-        let updated = now + wait;
-
-        if self.expires_at.is_none() {
-            self.expires_at_start = Some(now);
-        }
-
-        self.expires_at = match self.expires_at {
-            Some(opt) if opt < updated => Some(opt),
-            _ => Some(updated),
-        };
-    }
-
-    fn clear(&mut self) {
-        self.trigger = false;
-        self.expires_at.take();
-        self.expires_at_start.take();
     }
 }
 

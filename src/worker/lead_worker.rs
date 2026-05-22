@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use sequenced_broadcast::{SequencedReceiver, SequencedSender};
 use tokio::sync::mpsc::{channel, Receiver};
 use tokio_util::sync::CancellationToken;
@@ -9,7 +7,12 @@ use crate::{
     utils::PanicHelper,
 };
 
-use super::task_and_cancel::TaskAndCancel;
+use super::{
+    task_and_cancel::TaskAndCancel,
+    update_worker_loop::{
+        drain_pending, process_batch, update_if_ready, UpdateWorker, UPDATE_TICK,
+    },
+};
 
 pub struct LeadWorker<D: DeterministicState> {
     updater: LeadUpdater<D>,
@@ -29,14 +32,15 @@ where
     }
 
     pub async fn run_until_cancelled(&mut self, cancel: CancellationToken) {
+        let mut tick = tokio::time::interval(UPDATE_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::task::yield_now().await;
 
             let action = tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                    if self.updater.update_ready() {
-                        self.updater.update();
-                    }
+                _ = tick.tick() => {
+                    update_if_ready(self);
                     continue;
                 }
                 _ = cancel.cancelled() => break,
@@ -46,41 +50,46 @@ where
                 }
             };
 
+            process_batch(self, action).await;
+        }
+
+        drain_pending(self).await;
+    }
+}
+
+impl<D: DeterministicState> UpdateWorker for LeadWorker<D>
+where
+    D::AuthorityAction: Clone,
+{
+    type Item = D::Action;
+    type TryRecvError = tokio::sync::mpsc::error::TryRecvError;
+
+    fn try_recv_update_item(&mut self) -> Result<Self::Item, Self::TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    fn apply_update_item<'a>(
+        &'a mut self,
+        action: Self::Item,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>
+    where
+        Self::Item: 'a,
+    {
+        Box::pin(async move {
             let (seq, authority) = self.updater.queue(action);
             self.tx
                 .safe_send(seq, authority.clone())
                 .await
                 .panic("failed to queue message in broadcast");
+        })
+    }
 
-            let mut remaining = 128;
-            while let Ok(action) = self.rx.try_recv() {
-                let (seq, authority) = self.updater.queue(action);
+    fn update_ready(&mut self) -> bool {
+        self.updater.update_ready()
+    }
 
-                self.tx
-                    .safe_send(seq, authority.clone())
-                    .await
-                    .panic("failed to queue message in broadcast");
-
-                if remaining == 0 {
-                    break;
-                }
-                remaining -= 1;
-            }
-
-            if self.updater.update_ready() {
-                self.updater.update();
-            }
-        }
-
-        /* apply pending messages */
-        while let Ok(action) = self.rx.try_recv() {
-            let (seq, authority) = self.updater.queue(action);
-            self.tx.safe_send(seq, authority.clone()).await.unwrap();
-        }
-
-        if self.updater.update_ready() {
-            self.updater.update();
-        }
+    fn update(&mut self) {
+        self.updater.update();
     }
 }
 
