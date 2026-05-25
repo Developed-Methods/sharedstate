@@ -84,12 +84,12 @@ where
             };
 
             let authority = self.updater.queue(seq, action);
-            self.tx.safe_send(seq, authority.clone()).await.unwrap();
+            self.tx.safe_send(seq, authority).await.unwrap();
 
             let mut remaining = 128;
             while let Ok((seq, action)) = self.rx.try_recv() {
                 let authority = self.updater.queue(seq, action);
-                self.tx.safe_send(seq, authority.clone()).await.unwrap();
+                self.tx.safe_send(seq, authority).await.unwrap();
 
                 if remaining == 0 {
                     break;
@@ -105,7 +105,7 @@ where
         /* apply pending messages */
         while let Ok((seq, action)) = self.rx.try_recv() {
             let authority = self.updater.queue(seq, action);
-            self.tx.safe_send(seq, authority.clone()).await.unwrap();
+            self.tx.safe_send(seq, authority).await.unwrap();
         }
 
         if self.updater.update_ready() {

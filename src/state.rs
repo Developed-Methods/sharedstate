@@ -1,18 +1,15 @@
-use parking_lot::{RwLock, RwLockReadGuard};
 use std::{
-    collections::VecDeque,
+    fmt,
     ops::{Deref, DerefMut},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    ptr::NonNull,
+    sync::Arc,
 };
 
-use crate::utils::PanicHelper;
+use hotread::{HotRead, HotReadHandle, HotReadState};
 
 pub trait DeterministicState: Sized + Send + Sync + Clone + 'static {
     type Action: Sized + Send + Sync + 'static;
-    type AuthorityAction: Sized + Send + Sync + 'static;
+    type AuthorityAction: Sized + Clone + Send + Sync + 'static;
 
     fn accept_seq(&self) -> u64;
 
@@ -21,61 +18,195 @@ pub trait DeterministicState: Sized + Send + Sync + Clone + 'static {
     fn update(&mut self, action: &Self::AuthorityAction);
 }
 
+#[derive(Clone)]
+struct HotSharedState<D: DeterministicState> {
+    state: D,
+}
+
+#[derive(Clone)]
+enum HotSharedStateUpdate<D: DeterministicState> {
+    Authority {
+        seq: u64,
+        action: D::AuthorityAction,
+    },
+    Reset(D),
+}
+
+impl<D: DeterministicState> HotReadState for HotSharedState<D> {
+    type Action = HotSharedStateUpdate<D>;
+
+    fn apply_update(&mut self, update: &Self::Action) {
+        match update {
+            HotSharedStateUpdate::Authority { seq, action } => {
+                assert_eq!(self.state.accept_seq(), *seq);
+                self.state.update(action);
+                assert_eq!(self.state.accept_seq(), seq + 1);
+            }
+            HotSharedStateUpdate::Reset(state) => {
+                self.state = state.clone();
+            }
+        }
+    }
+}
+
+struct StateInner<D: DeterministicState> {
+    hot: HotRead<HotSharedState<D>>,
+}
+
+impl<D: DeterministicState> StateInner<D> {
+    fn maintain(&self) -> bool {
+        let result = self.hot.maintain();
+
+        result.applied_updates != 0
+            || result.pruned_updates != 0
+            || result.ready_to_publish
+            || result.blocked_by_workers
+    }
+
+    fn maintain_until_flushed(&self) {
+        const MAX_SPINS: usize = 1_048_576;
+
+        for _ in 0..MAX_SPINS {
+            if self.hot.queued_update_count() == 0 {
+                return;
+            }
+
+            let result = self.hot.maintain();
+
+            if result.blocked_by_workers {
+                std::hint::spin_loop();
+            }
+        }
+
+        panic!(
+            "failed to flush shared state: stale reader handles are blocking hotread maintenance"
+        );
+    }
+
+    fn read(&self) -> SharedStateReadGuard<'_, D> {
+        let mut handle = self.hot.create_handle();
+        let state = NonNull::from(&handle.current().state);
+
+        SharedStateReadGuard { handle, state }
+    }
+
+    fn current_state(&self) -> D {
+        self.read().clone()
+    }
+}
+
 pub struct SharedState<D: DeterministicState> {
     inner: Arc<StateInner<D>>,
 }
 
-impl<D: DeterministicState + Clone> SharedState<D> {
+impl<D: DeterministicState> SharedState<D> {
     pub fn new(state: D) -> (Self, FlushedUpdater<D>) {
         let accept_seq = state.accept_seq();
 
         let inner = Arc::new(StateInner {
-            read_pos: AtomicUsize::new(0),
-            states: [RwLock::new(state.clone()), RwLock::new(state)],
+            hot: HotRead::new(HotSharedState { state }),
         });
 
         let shared = SharedState {
             inner: inner.clone(),
         };
 
-        let updater = StateUpdater {
-            inner,
-            queue: VecDeque::new(),
-            queue_offset: [0, 0],
-            queue_accept_seq: accept_seq,
-        };
-
         (
             shared,
             FlushedUpdater {
-                updater,
                 state: None,
+                inner,
+                accept_seq,
             },
         )
+    }
+
+    pub fn reader(&self) -> SharedStateReader<'_, D> {
+        SharedStateReader {
+            handle: self.inner.hot.create_handle(),
+        }
+    }
+
+    pub fn read(&self) -> SharedStateReadGuard<'_, D> {
+        self.inner.read()
+    }
+}
+
+impl<D: DeterministicState> Clone for SharedState<D> {
+    fn clone(&self) -> Self {
+        SharedState {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+pub struct SharedStateReader<'a, D: DeterministicState> {
+    handle: HotReadHandle<'a, HotSharedState<D>>,
+}
+
+impl<D: DeterministicState> SharedStateReader<'_, D> {
+    pub fn current(&mut self) -> &D {
+        &self.handle.current().state
+    }
+
+    pub fn quiescent(&mut self) {
+        self.handle.quiescent();
+    }
+}
+
+pub struct SharedStateReadGuard<'a, D: DeterministicState> {
+    handle: HotReadHandle<'a, HotSharedState<D>>,
+    state: NonNull<D>,
+}
+
+impl<D: DeterministicState> Deref for SharedStateReadGuard<'_, D> {
+    type Target = D;
+
+    fn deref(&self) -> &Self::Target {
+        let _keep_handle_alive = &self.handle;
+
+        // SAFETY: `state` points at the hotread copy selected by `handle.current()`.
+        // The handle remains live for the lifetime of this guard, so hotread will not
+        // mutate or recycle that copy until the guard is dropped.
+        unsafe { self.state.as_ref() }
+    }
+}
+
+impl<D> fmt::Debug for SharedStateReadGuard<'_, D>
+where
+    D: DeterministicState + fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
     }
 }
 
 pub struct FlushedUpdater<D: DeterministicState> {
     state: Option<D>,
-    updater: StateUpdater<D>,
+    inner: Arc<StateInner<D>>,
+    accept_seq: u64,
 }
 
 impl<D: DeterministicState> FlushedUpdater<D> {
     pub fn accept_seq(&self) -> u64 {
-        self.updater.queue_accept_seq
+        self.accept_seq
     }
 
     pub fn reset_state(&mut self, state: D) {
+        self.accept_seq = state.accept_seq();
         self.state = None;
-        self.updater.reset(state);
+        self.inner
+            .hot
+            .queue_update(HotSharedStateUpdate::Reset(state));
+        self.inner.maintain_until_flushed();
     }
 
     pub fn view_state<R, F: FnOnce(&D) -> R>(&self, update: F) -> R {
         if let Some(state) = &self.state {
             update(state)
         } else {
-            let state = self.updater.read();
-            update(&*state)
+            let state = self.inner.read();
+            update(&state)
         }
     }
 
@@ -89,12 +220,16 @@ impl<D: DeterministicState> FlushedUpdater<D> {
             let result = update(&mut ptr);
 
             if ptr.as_mut {
-                self.updater.reset(state.clone());
+                self.accept_seq = state.accept_seq();
+                self.inner
+                    .hot
+                    .queue_update(HotSharedStateUpdate::Reset(state.clone()));
+                self.inner.maintain_until_flushed();
             }
 
             result
         } else {
-            let mut state = self.updater.read().clone();
+            let mut state = self.inner.current_state();
 
             let mut ptr = StatePtr {
                 item: &mut state,
@@ -104,7 +239,7 @@ impl<D: DeterministicState> FlushedUpdater<D> {
             let result = update(&mut ptr);
 
             if ptr.as_mut {
-                self.updater.reset(state);
+                self.reset_state(state);
             }
 
             result
@@ -113,79 +248,61 @@ impl<D: DeterministicState> FlushedUpdater<D> {
 
     pub fn into_lead(mut self) -> LeadUpdater<D> {
         let state = match self.state.take() {
-            None => self.updater.read().clone(),
+            None => self.inner.current_state(),
             Some(state) => state,
         };
 
         LeadUpdater {
-            updater: self.updater,
+            inner: self.inner,
+            accept_seq: self.accept_seq,
             state,
         }
     }
 
     pub fn into_follow(self) -> FollowUpdater<D> {
         FollowUpdater {
-            updater: self.updater,
+            inner: self.inner,
+            accept_seq: self.accept_seq,
         }
-    }
-}
-
-impl<D: DeterministicState> Clone for SharedState<D> {
-    fn clone(&self) -> Self {
-        SharedState {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<D: DeterministicState> SharedState<D> {
-    pub fn read(&self) -> RwLockReadGuard<'_, D> {
-        self.inner.read()
-    }
-}
-
-impl<D: DeterministicState> StateInner<D> {
-    pub fn read(&self) -> RwLockReadGuard<'_, D> {
-        for _ in 0..1048576 {
-            let pos = self.read_pos.load(Ordering::Acquire);
-            let idx = pos & 0x1;
-            if let Some(lock) = self.states[idx].try_read() {
-                return lock;
-            }
-            std::hint::spin_loop();
-        }
-
-        /* should not happen as read */
-        panic!("failed to acquire read lock");
     }
 }
 
 pub struct LeadUpdater<D: DeterministicState> {
-    updater: StateUpdater<D>,
+    inner: Arc<StateInner<D>>,
     state: D,
+    accept_seq: u64,
 }
 
 impl<D: DeterministicState> LeadUpdater<D> {
-    pub fn queue(&mut self, action: D::Action) -> (u64, &D::AuthorityAction) {
+    pub fn queue(&mut self, action: D::Action) -> (u64, D::AuthorityAction) {
         let authority = self.state.authority(action);
-
         let seq = self.state.accept_seq();
+
+        assert_eq!(self.accept_seq, seq);
+
         self.state.update(&authority);
-        self.updater
-            .queue_sequenced(seq, authority)
-            .panic("invalid sequence")
+        self.accept_seq = self.state.accept_seq();
+
+        self.inner
+            .hot
+            .queue_update(HotSharedStateUpdate::Authority {
+                seq,
+                action: authority.clone(),
+            });
+
+        (seq, authority)
     }
 
     pub fn update_ready(&mut self) -> bool {
-        self.updater.update_ready()
+        self.inner.hot.queued_update_count() > 0
     }
 
     pub fn update(&mut self) -> bool {
-        self.updater.update()
+        self.inner.maintain()
     }
 
     pub fn flush(&mut self) {
-        self.updater.flush_queue();
+        self.inner.maintain_until_flushed();
     }
 
     pub fn state(&self) -> &D {
@@ -193,28 +310,30 @@ impl<D: DeterministicState> LeadUpdater<D> {
     }
 
     pub fn accept_seq(&self) -> u64 {
-        self.updater.queue_accept_seq
+        self.accept_seq
     }
 
     pub fn into_follow(self) -> FollowUpdater<D> {
+        self.inner.maintain_until_flushed();
+
         FollowUpdater {
-            updater: self.updater,
+            inner: self.inner,
+            accept_seq: self.accept_seq,
         }
     }
 
-    pub fn into_flushed(mut self) -> FlushedUpdater<D> {
-        self.updater.flush_queue();
+    pub fn into_flushed(self) -> FlushedUpdater<D> {
+        self.inner.maintain_until_flushed();
 
         {
-            let state0 = self.updater.inner.states[0].read();
-            let state1 = self.updater.inner.states[1].read();
-            assert_eq!(state0.accept_seq(), state1.accept_seq());
-            assert_eq!(state0.accept_seq(), self.state.accept_seq());
+            let state = self.inner.read();
+            assert_eq!(state.accept_seq(), self.state.accept_seq());
         }
 
         FlushedUpdater {
             state: Some(self.state),
-            updater: self.updater,
+            inner: self.inner,
+            accept_seq: self.accept_seq,
         }
     }
 }
@@ -253,215 +372,81 @@ impl<T> DerefMut for StatePtr<'_, T> {
 }
 
 pub struct FollowUpdater<D: DeterministicState> {
-    updater: StateUpdater<D>,
+    inner: Arc<StateInner<D>>,
+    accept_seq: u64,
 }
 
 impl<D: DeterministicState> FollowUpdater<D> {
-    pub fn queue(&mut self, seq: u64, action: D::AuthorityAction) -> &D::AuthorityAction {
-        self.updater
-            .queue_sequenced(seq, action)
-            .panic("invalid sequence")
-            .1
+    pub fn queue(&mut self, seq: u64, action: D::AuthorityAction) -> D::AuthorityAction {
+        assert_eq!(self.accept_seq, seq);
+
+        self.inner
+            .hot
+            .queue_update(HotSharedStateUpdate::Authority {
+                seq,
+                action: action.clone(),
+            });
+
+        self.accept_seq += 1;
+        action
     }
 
     pub fn update_ready(&self) -> bool {
-        self.updater.update_ready()
+        self.inner.hot.queued_update_count() > 0
     }
 
     pub fn update(&mut self) -> bool {
-        self.updater.update()
+        self.inner.maintain()
     }
 
     pub fn flush(&mut self) {
-        self.updater.flush_queue();
+        self.inner.maintain_until_flushed();
     }
 
-    pub fn read_state(&self) -> RwLockReadGuard<'_, D> {
-        self.updater.inner.states[0].read()
-    }
-
-    pub fn accept_seq(&self) -> u64 {
-        self.updater.queue_accept_seq
-    }
-
-    pub fn into_flushed(mut self) -> FlushedUpdater<D> {
-        self.updater.flush_queue();
-
-        {
-            let state0 = self.updater.inner.states[0].read();
-            let state1 = self.updater.inner.states[1].read();
-            assert_eq!(state0.accept_seq(), state1.accept_seq());
-        }
-
-        FlushedUpdater {
-            state: None,
-            updater: self.updater,
-        }
-    }
-
-    pub fn into_lead(mut self) -> LeadUpdater<D> {
-        self.updater.flush_queue();
-
-        let state = {
-            let state0 = self.updater.inner.states[0].read();
-            let state1 = self.updater.inner.states[1].read();
-            assert_eq!(state0.accept_seq(), state1.accept_seq());
-            state0.clone()
-        };
-
-        LeadUpdater {
-            state,
-            updater: self.updater,
-        }
-    }
-}
-
-pub struct StateUpdater<D: DeterministicState> {
-    inner: Arc<StateInner<D>>,
-    queue: VecDeque<(u64, D::AuthorityAction)>,
-    queue_accept_seq: u64,
-    queue_offset: [usize; 2],
-}
-
-struct StateInner<D: DeterministicState> {
-    read_pos: AtomicUsize,
-    states: [RwLock<D>; 2],
-}
-
-impl<D: DeterministicState> StateUpdater<D> {
-    pub fn shared(&self) -> SharedState<D> {
-        SharedState {
-            inner: self.inner.clone(),
-        }
-    }
-
-    pub fn reset(&mut self, state: D) {
-        /* we're the only writer so load can be relaxed */
-        let read_pos = self.inner.read_pos.load(Ordering::Relaxed);
-
-        /* write pos shouldn't be locked or locks should be dropping soon */
-        let write_pos = read_pos.overflowing_add(1).0;
-        let write_idx = write_pos & 0x1;
-
-        let state_sequence = state.accept_seq();
-
-        {
-            let mut state_lock = self.inner.states[write_idx].write();
-            *state_lock = state.clone();
-        }
-
-        self.inner.read_pos.store(write_pos, Ordering::Release);
-
-        {
-            let mut state_lock = self.inner.states[read_pos & 0x1].write();
-            *state_lock = state;
-        }
-
-        self.queue.clear();
-        self.queue_offset = [0, 0];
-        self.queue_accept_seq = state_sequence;
-    }
-
-    pub fn queue_sequenced(
-        &mut self,
-        seq: u64,
-        item: D::AuthorityAction,
-    ) -> Result<(u64, &D::AuthorityAction), D::AuthorityAction> {
-        if self.queue_accept_seq != seq {
-            return Err(item);
-        }
-        Ok((seq, self.queue(item)))
-    }
-
-    pub fn queue(&mut self, item: D::AuthorityAction) -> &D::AuthorityAction {
-        self.queue.push_back((self.queue_accept_seq, item));
-        self.queue_accept_seq += 1;
-        &self.queue.back().unwrap().1
-    }
-
-    pub fn next_queued_sequence(&self) -> u64 {
-        self.queue_accept_seq
-    }
-
-    pub fn update_ready(&self) -> bool {
-        let read_pos = self.inner.read_pos.load(Ordering::Relaxed);
-        let write_pos = read_pos.overflowing_add(1).0;
-        self.inner.states[write_pos & 0x1].try_write().is_some()
-    }
-
-    pub fn flush_queue(&mut self) {
-        self.update();
-        self.update();
-
-        if self.update() {
-            panic!("expected update to be flushed after 2 .update() calls");
-        }
-
-        assert_eq!(self.queue.len(), 0);
-    }
-
-    pub fn read(&self) -> RwLockReadGuard<'_, D> {
+    pub fn read(&self) -> SharedStateReadGuard<'_, D> {
         self.inner.read()
     }
 
-    pub fn update(&mut self) -> bool {
-        /* we're the only writer so load can be relaxed */
-        let read_pos = self.inner.read_pos.load(Ordering::Acquire);
-
-        /* write pos shouldn't be locked or locks should be dropping soon */
-        let write_pos = read_pos.overflowing_add(1).0;
-        let write_idx = write_pos & 0x1;
-
-        let mut had_update = false;
-
-        /* apply all actions available in the queue */
-        {
-            let mut state = self.inner.states[write_idx].write();
-            let mut offset = self.queue_offset[write_idx];
-
-            let mut next_seq = state.accept_seq() + 1;
-            while offset < self.queue.len() {
-                let (target_seq, action) = &self.queue[offset];
-                assert_eq!(state.accept_seq(), *target_seq);
-                offset += 1;
-
-                had_update = true;
-                state.update(action);
-
-                assert_eq!(
-                    state.accept_seq(),
-                    next_seq,
-                    "state::update(action) did not increment sequence"
-                );
-                next_seq += 1;
-            }
-
-            self.queue_offset[write_idx] = offset;
-        }
-
-        self.trim_queue();
-
-        /* set reader to be updated pos so current reader can be updated */
-        self.inner.read_pos.store(write_pos, Ordering::Release);
-
-        had_update
+    pub fn read_state(&self) -> SharedStateReadGuard<'_, D> {
+        self.read()
     }
 
-    fn trim_queue(&mut self) {
-        let trim_size = self.queue_offset[0].min(self.queue_offset[1]);
+    pub fn accept_seq(&self) -> u64 {
+        self.accept_seq
+    }
 
-        for _ in 0..trim_size {
-            let _ = self.queue.pop_front();
+    pub fn into_flushed(self) -> FlushedUpdater<D> {
+        self.inner.maintain_until_flushed();
+
+        FlushedUpdater {
+            state: None,
+            inner: self.inner,
+            accept_seq: self.accept_seq,
         }
+    }
 
-        self.queue_offset[0] -= trim_size;
-        self.queue_offset[1] -= trim_size;
+    pub fn into_lead(self) -> LeadUpdater<D> {
+        self.inner.maintain_until_flushed();
+
+        let state = self.inner.current_state();
+
+        LeadUpdater {
+            state,
+            inner: self.inner,
+            accept_seq: self.accept_seq,
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::{
+        sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc,
+        },
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
 
@@ -530,5 +515,78 @@ mod test {
             let read = state.read();
             assert_eq!(read.numbers.len(), 1);
         }
+    }
+
+    #[test]
+    fn reader_handle_sees_updates() {
+        let (state, updater) = SharedState::new(TestState::default());
+        let mut updater = updater.into_lead();
+        let mut reader = state.reader();
+
+        updater.queue(10);
+        updater.queue(20);
+        updater.flush();
+
+        let current = reader.current();
+        assert_eq!(current.accept_seq, 2);
+        assert_eq!(current.numbers, vec![10, 20]);
+    }
+
+    #[test]
+    fn reader_handle_can_be_used_from_thread() {
+        let (state, updater) = SharedState::new(TestState::default());
+        let mut updater = updater.into_lead();
+        let run = Arc::new(AtomicBool::new(true));
+        let latest = Arc::new(AtomicU64::new(0));
+
+        let thread = std::thread::spawn({
+            let state = state.clone();
+            let run = run.clone();
+            let latest = latest.clone();
+
+            move || {
+                let mut reader = state.reader();
+                let mut last = 0;
+
+                while run.load(Ordering::Acquire) {
+                    let seq = reader.current().accept_seq;
+                    assert!(last <= seq);
+                    last = seq;
+                    latest.store(seq, Ordering::Release);
+                    std::hint::spin_loop();
+                }
+
+                reader.quiescent();
+                last
+            }
+        });
+
+        for i in 0..100 {
+            updater.queue(i);
+            updater.update();
+        }
+        updater.flush();
+
+        while latest.load(Ordering::Acquire) < updater.accept_seq() {
+            std::thread::yield_now();
+        }
+
+        run.store(false, Ordering::Release);
+        let observed = thread.join().unwrap();
+
+        assert_eq!(observed, updater.accept_seq());
+    }
+
+    #[test]
+    fn follow_queue_applies_directly() {
+        let (state, updater) = SharedState::new(TestState::default());
+        let mut updater = updater.into_follow();
+
+        updater.queue(0, (1, 42));
+        updater.flush();
+
+        let read = state.read();
+        assert_eq!(read.accept_seq, 1);
+        assert_eq!(read.numbers, vec![42]);
     }
 }

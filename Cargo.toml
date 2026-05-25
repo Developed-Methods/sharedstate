@@ -18,8 +18,8 @@ slab = "0.4.9"
 rand_chacha = "0.3.1"
 parking_lot = "0.12.3"
 arc-metrics = "0.1"
+hotread = "0.1.0"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
 assert_matches = "1.5.0"
-
