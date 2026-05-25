@@ -1,7 +1,5 @@
 use std::{
-    fmt,
     ops::{Deref, DerefMut},
-    ptr::NonNull,
     sync::Arc,
 };
 
@@ -57,41 +55,18 @@ impl<D: DeterministicState> StateInner<D> {
     fn maintain(&self) -> bool {
         let result = self.hot.maintain();
 
-        result.applied_updates != 0
-            || result.pruned_updates != 0
-            || result.ready_to_publish
-            || result.blocked_by_workers
-    }
-
-    fn maintain_until_flushed(&self) {
-        const MAX_SPINS: usize = 1_048_576;
-
-        for _ in 0..MAX_SPINS {
-            if self.hot.queued_update_count() == 0 {
-                return;
-            }
-
-            let result = self.hot.maintain();
-
-            if result.blocked_by_workers {
-                std::hint::spin_loop();
-            }
-        }
-
-        panic!(
-            "failed to flush shared state: stale reader handles are blocking hotread maintenance"
-        );
-    }
-
-    fn read(&self) -> SharedStateReadGuard<'_, D> {
-        let mut handle = self.hot.create_handle();
-        let state = NonNull::from(&handle.current().state);
-
-        SharedStateReadGuard { handle, state }
+        result.applied_updates != 0 || result.pruned_updates != 0 || result.ready_to_publish
     }
 
     fn current_state(&self) -> D {
-        self.read().clone()
+        let mut reader = self.reader();
+        reader.current().clone()
+    }
+
+    fn reader(&self) -> SharedStateReader<'_, D> {
+        SharedStateReader {
+            handle: self.hot.create_handle(),
+        }
     }
 }
 
@@ -122,13 +97,13 @@ impl<D: DeterministicState> SharedState<D> {
     }
 
     pub fn reader(&self) -> SharedStateReader<'_, D> {
-        SharedStateReader {
-            handle: self.inner.hot.create_handle(),
-        }
+        self.inner.reader()
     }
 
-    pub fn read(&self) -> SharedStateReadGuard<'_, D> {
-        self.inner.read()
+    #[cfg(test)]
+    pub fn read(&self) -> D {
+        let mut reader = self.reader();
+        reader.current().clone()
     }
 }
 
@@ -149,35 +124,20 @@ impl<D: DeterministicState> SharedStateReader<'_, D> {
         &self.handle.current().state
     }
 
+    pub fn read(&mut self) -> &D {
+        self.current()
+    }
+
     pub fn quiescent(&mut self) {
         self.handle.quiescent();
     }
-}
 
-pub struct SharedStateReadGuard<'a, D: DeterministicState> {
-    handle: HotReadHandle<'a, HotSharedState<D>>,
-    state: NonNull<D>,
-}
-
-impl<D: DeterministicState> Deref for SharedStateReadGuard<'_, D> {
-    type Target = D;
-
-    fn deref(&self) -> &Self::Target {
-        let _keep_handle_alive = &self.handle;
-
-        // SAFETY: `state` points at the hotread copy selected by `handle.current()`.
-        // The handle remains live for the lifetime of this guard, so hotread will not
-        // mutate or recycle that copy until the guard is dropped.
-        unsafe { self.state.as_ref() }
+    pub fn generation(&self) -> u64 {
+        self.handle.generation()
     }
-}
 
-impl<D> fmt::Debug for SharedStateReadGuard<'_, D>
-where
-    D: DeterministicState + fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
+    pub fn copy_index(&self) -> Option<usize> {
+        self.handle.copy_index()
     }
 }
 
@@ -194,19 +154,19 @@ impl<D: DeterministicState> FlushedUpdater<D> {
 
     pub fn reset_state(&mut self, state: D) {
         self.accept_seq = state.accept_seq();
-        self.state = None;
+        self.state = Some(state.clone());
         self.inner
             .hot
             .queue_update(HotSharedStateUpdate::Reset(state));
-        self.inner.maintain_until_flushed();
+        self.inner.maintain();
     }
 
     pub fn view_state<R, F: FnOnce(&D) -> R>(&self, update: F) -> R {
         if let Some(state) = &self.state {
             update(state)
         } else {
-            let state = self.inner.read();
-            update(&state)
+            let mut reader = self.inner.reader();
+            update(reader.current())
         }
     }
 
@@ -224,7 +184,7 @@ impl<D: DeterministicState> FlushedUpdater<D> {
                 self.inner
                     .hot
                     .queue_update(HotSharedStateUpdate::Reset(state.clone()));
-                self.inner.maintain_until_flushed();
+                self.inner.maintain();
             }
 
             result
@@ -260,9 +220,15 @@ impl<D: DeterministicState> FlushedUpdater<D> {
     }
 
     pub fn into_follow(self) -> FollowUpdater<D> {
+        let state = match self.state {
+            None => self.inner.current_state(),
+            Some(state) => state,
+        };
+
         FollowUpdater {
             inner: self.inner,
-            accept_seq: self.accept_seq,
+            accept_seq: state.accept_seq(),
+            state,
         }
     }
 }
@@ -302,7 +268,7 @@ impl<D: DeterministicState> LeadUpdater<D> {
     }
 
     pub fn flush(&mut self) {
-        self.inner.maintain_until_flushed();
+        self.inner.maintain();
     }
 
     pub fn state(&self) -> &D {
@@ -314,21 +280,17 @@ impl<D: DeterministicState> LeadUpdater<D> {
     }
 
     pub fn into_follow(self) -> FollowUpdater<D> {
-        self.inner.maintain_until_flushed();
+        self.inner.maintain();
 
         FollowUpdater {
             inner: self.inner,
             accept_seq: self.accept_seq,
+            state: self.state,
         }
     }
 
     pub fn into_flushed(self) -> FlushedUpdater<D> {
-        self.inner.maintain_until_flushed();
-
-        {
-            let state = self.inner.read();
-            assert_eq!(state.accept_seq(), self.state.accept_seq());
-        }
+        self.inner.maintain();
 
         FlushedUpdater {
             state: Some(self.state),
@@ -374,11 +336,15 @@ impl<T> DerefMut for StatePtr<'_, T> {
 pub struct FollowUpdater<D: DeterministicState> {
     inner: Arc<StateInner<D>>,
     accept_seq: u64,
+    state: D,
 }
 
 impl<D: DeterministicState> FollowUpdater<D> {
     pub fn queue(&mut self, seq: u64, action: D::AuthorityAction) -> D::AuthorityAction {
         assert_eq!(self.accept_seq, seq);
+        assert_eq!(self.state.accept_seq(), seq);
+
+        self.state.update(&action);
 
         self.inner
             .hot
@@ -387,7 +353,7 @@ impl<D: DeterministicState> FollowUpdater<D> {
                 action: action.clone(),
             });
 
-        self.accept_seq += 1;
+        self.accept_seq = self.state.accept_seq();
         action
     }
 
@@ -400,15 +366,11 @@ impl<D: DeterministicState> FollowUpdater<D> {
     }
 
     pub fn flush(&mut self) {
-        self.inner.maintain_until_flushed();
+        self.inner.maintain();
     }
 
-    pub fn read(&self) -> SharedStateReadGuard<'_, D> {
-        self.inner.read()
-    }
-
-    pub fn read_state(&self) -> SharedStateReadGuard<'_, D> {
-        self.read()
+    pub fn state(&self) -> &D {
+        &self.state
     }
 
     pub fn accept_seq(&self) -> u64 {
@@ -416,22 +378,20 @@ impl<D: DeterministicState> FollowUpdater<D> {
     }
 
     pub fn into_flushed(self) -> FlushedUpdater<D> {
-        self.inner.maintain_until_flushed();
+        self.inner.maintain();
 
         FlushedUpdater {
-            state: None,
+            state: Some(self.state),
             inner: self.inner,
             accept_seq: self.accept_seq,
         }
     }
 
     pub fn into_lead(self) -> LeadUpdater<D> {
-        self.inner.maintain_until_flushed();
-
-        let state = self.inner.current_state();
+        self.inner.maintain();
 
         LeadUpdater {
-            state,
+            state: self.state,
             inner: self.inner,
             accept_seq: self.accept_seq,
         }

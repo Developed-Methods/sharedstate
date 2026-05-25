@@ -209,7 +209,8 @@ where
         }
 
         let leader_recovery_details = {
-            let read = self.state.read();
+            let mut reader = self.state.reader();
+            let read = reader.current();
             let details = read.details();
             if !details.can_recover_follower(&recovery_details) {
                 return None;
@@ -237,8 +238,8 @@ where
         }
 
         let state = {
-            let read = self.state.read();
-            read.clone()
+            let mut reader = self.state.reader();
+            reader.current().clone()
         };
 
         let sub = match self.broadcast.add_client(state.accept_seq(), true).await {
@@ -273,11 +274,13 @@ where
     }
 
     pub async fn clone_state(&self) -> RecoverableState<I, D> {
-        self.state.read().clone()
+        let mut reader = self.state.reader();
+        reader.current().clone()
     }
 
     pub async fn state_recovery_details(&self) -> RecoverableStateDetails {
-        self.state.read().details().clone()
+        let mut reader = self.state.reader();
+        reader.current().details().clone()
     }
 }
 

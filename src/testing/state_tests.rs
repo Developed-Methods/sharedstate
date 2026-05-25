@@ -190,13 +190,13 @@ fn slow_state_deadlock_test() {
             move || {
                 let mut update = Instant::now();
                 let mut last_sequence = 0;
+                let mut reader = state.reader();
 
                 while run.load(Ordering::Acquire) {
-                    let lock = state.read();
-                    let reader = &*lock;
+                    let state = reader.current();
 
-                    if reader.sequence != last_sequence {
-                        last_sequence = reader.sequence;
+                    if state.sequence != last_sequence {
+                        last_sequence = state.sequence;
                         update = Instant::now();
                         continue;
                     }
