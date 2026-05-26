@@ -259,16 +259,12 @@ impl<D: DeterministicState> LeadUpdater<D> {
         (seq, authority)
     }
 
-    pub fn update_ready(&mut self) -> bool {
+    pub(crate) fn update_ready(&mut self) -> bool {
         self.inner.hot.queued_update_count() > 0
     }
 
-    pub fn update(&mut self) -> bool {
+    pub(crate) fn update(&mut self) -> bool {
         self.inner.maintain()
-    }
-
-    pub fn flush(&mut self) {
-        self.inner.maintain();
     }
 
     pub fn state(&self) -> &D {
@@ -357,16 +353,12 @@ impl<D: DeterministicState> FollowUpdater<D> {
         action
     }
 
-    pub fn update_ready(&self) -> bool {
+    pub(crate) fn update_ready(&self) -> bool {
         self.inner.hot.queued_update_count() > 0
     }
 
-    pub fn update(&mut self) -> bool {
+    pub(crate) fn update(&mut self) -> bool {
         self.inner.maintain()
-    }
-
-    pub fn flush(&mut self) {
-        self.inner.maintain();
     }
 
     pub fn state(&self) -> &D {
@@ -455,7 +447,9 @@ mod test {
             updater.queue(i);
         }
 
-        updater.flush();
+        while updater.update_ready() {
+            updater.update();
+        }
 
         {
             assert_eq!(updater.accept_seq(), 20);
@@ -485,7 +479,9 @@ mod test {
 
         updater.queue(10);
         updater.queue(20);
-        updater.flush();
+        while updater.update_ready() {
+            updater.update();
+        }
 
         let current = reader.current();
         assert_eq!(current.accept_seq, 2);
@@ -525,7 +521,9 @@ mod test {
             updater.queue(i);
             updater.update();
         }
-        updater.flush();
+        while updater.update_ready() {
+            updater.update();
+        }
 
         while latest.load(Ordering::Acquire) < updater.accept_seq() {
             std::thread::yield_now();
@@ -543,7 +541,9 @@ mod test {
         let mut updater = updater.into_follow();
 
         updater.queue(0, (1, 42));
-        updater.flush();
+        while updater.update_ready() {
+            updater.update();
+        }
 
         let read = state.read();
         assert_eq!(read.accept_seq, 1);
