@@ -48,7 +48,7 @@ where
 
             let (seq, authority) = self.updater.queue(action);
             self.tx
-                .safe_send(seq, authority.clone())
+                .safe_send(seq, authority)
                 .await
                 .panic("failed to queue message in broadcast");
 
@@ -57,7 +57,7 @@ where
                 let (seq, authority) = self.updater.queue(action);
 
                 self.tx
-                    .safe_send(seq, authority.clone())
+                    .safe_send(seq, authority)
                     .await
                     .panic("failed to queue message in broadcast");
 
@@ -75,7 +75,7 @@ where
         /* apply pending messages */
         while let Ok(action) = self.rx.try_recv() {
             let (seq, authority) = self.updater.queue(action);
-            self.tx.safe_send(seq, authority.clone()).await.unwrap();
+            self.tx.safe_send(seq, authority).await.unwrap();
         }
 
         if self.updater.update_ready() {

@@ -3,6 +3,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use parking_lot::Mutex;
 use sequenced_broadcast::{
     NewClientError, SequencedBroadcast, SequencedBroadcastSettings, SequencedReceiver,
     SequencedSender,
@@ -14,7 +15,7 @@ use crate::{
     recoverable_state::{
         RecoverableState, RecoverableStateAction, RecoverableStateDetails, SourceId,
     },
-    state::{DeterministicState, FlushedUpdater, SharedState},
+    state::{DeterministicState, FlushedUpdater, SharedState, SharedStateReader},
     utils::{LogHelper, PanicHelper},
 };
 
@@ -30,6 +31,7 @@ pub struct SyncUpdater<I: SourceId, D: DeterministicState> {
     pub(super) local_action_tx: Sender<D::Action>,
     pub(super) action_tx: Sender<(I, D::Action)>,
     pub(super) state: SharedState<RecoverableState<I, D>>,
+    state_reader: Mutex<SharedStateReader<RecoverableState<I, D>>>,
 
     mode: Mode<I, D>,
 
@@ -50,6 +52,7 @@ where
 {
     pub fn new(local_id: I, state: D, broadcast_settings: SequencedBroadcastSettings) -> Self {
         let (state, updater) = SharedState::new(RecoverableState::new(rnd_id(local_id), state));
+        let state_reader = Mutex::new(state.reader());
 
         let (local_action_tx, mut local_action_rx) = channel(2048);
         let (action_tx, action_rx) = channel(2048);
@@ -89,6 +92,7 @@ where
             action_tx,
             local_action_tx,
             state,
+            state_reader,
             mode,
             broadcast_settings,
             broadcast,
@@ -209,12 +213,17 @@ where
         }
 
         let leader_recovery_details = {
-            let read = self.state.read();
+            let mut reader = self.state_reader.lock();
+            let read = reader.current();
             let details = read.details();
-            if !details.can_recover_follower(&recovery_details) {
+            let can_recover = details.can_recover_follower(&recovery_details);
+            let details = details.clone();
+            reader.quiescent();
+
+            if !can_recover {
                 return None;
             }
-            details.clone()
+            details
         };
 
         let recv = self
@@ -237,8 +246,10 @@ where
         }
 
         let state = {
-            let read = self.state.read();
-            read.clone()
+            let mut reader = self.state_reader.lock();
+            let state = reader.current().clone();
+            reader.quiescent();
+            state
         };
 
         let sub = match self.broadcast.add_client(state.accept_seq(), true).await {
@@ -273,11 +284,17 @@ where
     }
 
     pub async fn clone_state(&self) -> RecoverableState<I, D> {
-        self.state.read().clone()
+        let mut reader = self.state_reader.lock();
+        let state = reader.current().clone();
+        reader.quiescent();
+        state
     }
 
     pub async fn state_recovery_details(&self) -> RecoverableStateDetails {
-        self.state.read().details().clone()
+        let mut reader = self.state_reader.lock();
+        let details = reader.current().details().clone();
+        reader.quiescent();
+        details
     }
 }
 
@@ -654,12 +671,13 @@ mod test {
         setup_logging();
 
         let a = SyncUpdater::<u64, TestState>::new(1, Default::default(), Default::default());
+        let mut a_reader = a.state.reader();
         a.local_action_tx
             .send(TestStateAction::Set { slot: 0, value: 33 })
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(a.state.read().state().numbers[0], 33);
+        assert_eq!(a_reader.current().state().numbers[0], 33);
     }
 
     #[tokio::test]
@@ -668,6 +686,10 @@ mod test {
         let mut b = SyncUpdater::<u64, TestState>::new(2, Default::default(), Default::default());
         let mut c = SyncUpdater::<u64, TestState>::new(3, Default::default(), Default::default());
         let mut d = SyncUpdater::<u64, TestState>::new(4, Default::default(), Default::default());
+        let mut a_reader = a.state.reader();
+        let mut b_reader = b.state.reader();
+        let mut c_reader = c.state.reader();
+        let mut d_reader = d.state.reader();
 
         /* all follow A */
         {
@@ -709,10 +731,14 @@ mod test {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(a.state().read().accept_seq(), 4);
-        assert_eq!(b.state().read().accept_seq(), 4);
-        assert_eq!(c.state().read().accept_seq(), 4);
-        assert_eq!(d.state().read().accept_seq(), 4);
+        assert_eq!(a_reader.current().accept_seq(), 4);
+        assert_eq!(b_reader.current().accept_seq(), 4);
+        assert_eq!(c_reader.current().accept_seq(), 4);
+        assert_eq!(d_reader.current().accept_seq(), 4);
+        a_reader.quiescent();
+        b_reader.quiescent();
+        c_reader.quiescent();
+        d_reader.quiescent();
 
         /* FORK: C lead followed by D */
         c.lead().await;
@@ -775,10 +801,14 @@ mod test {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(a.state().read().accept_seq(), 8);
-        assert_eq!(b.state().read().accept_seq(), 8);
-        assert_eq!(c.state().read().accept_seq(), 8);
-        assert_eq!(d.state().read().accept_seq(), 8);
+        assert_eq!(a_reader.current().accept_seq(), 8);
+        assert_eq!(b_reader.current().accept_seq(), 8);
+        assert_eq!(c_reader.current().accept_seq(), 8);
+        assert_eq!(d_reader.current().accept_seq(), 8);
+        a_reader.quiescent();
+        b_reader.quiescent();
+        c_reader.quiescent();
+        d_reader.quiescent();
 
         /* a cannot recover to fork'd state */
         {
@@ -801,6 +831,10 @@ mod test {
         let mut b = SyncUpdater::<u64, TestState>::new(2, Default::default(), Default::default());
         let mut c = SyncUpdater::<u64, TestState>::new(3, Default::default(), Default::default());
         let mut d = SyncUpdater::<u64, TestState>::new(4, Default::default(), Default::default());
+        let mut a_reader = a.state.reader();
+        let mut b_reader = b.state.reader();
+        let mut c_reader = c.state.reader();
+        let mut d_reader = d.state.reader();
 
         /* all follow A */
         {
@@ -842,10 +876,14 @@ mod test {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(a.state().read().accept_seq(), 4);
-        assert_eq!(b.state().read().accept_seq(), 4);
-        assert_eq!(c.state().read().accept_seq(), 4);
-        assert_eq!(d.state().read().accept_seq(), 4);
+        assert_eq!(a_reader.current().accept_seq(), 4);
+        assert_eq!(b_reader.current().accept_seq(), 4);
+        assert_eq!(c_reader.current().accept_seq(), 4);
+        assert_eq!(d_reader.current().accept_seq(), 4);
+        a_reader.quiescent();
+        b_reader.quiescent();
+        c_reader.quiescent();
+        d_reader.quiescent();
 
         /* FORK: c lead and d follow c */
         c.lead().await;
@@ -896,10 +934,14 @@ mod test {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(a.state().read().accept_seq(), 7);
-        assert_eq!(b.state().read().accept_seq(), 7);
-        assert_eq!(c.state().read().accept_seq(), 8);
-        assert_eq!(d.state().read().accept_seq(), 8);
+        assert_eq!(a_reader.current().accept_seq(), 7);
+        assert_eq!(b_reader.current().accept_seq(), 7);
+        assert_eq!(c_reader.current().accept_seq(), 8);
+        assert_eq!(d_reader.current().accept_seq(), 8);
+        a_reader.quiescent();
+        b_reader.quiescent();
+        c_reader.quiescent();
+        d_reader.quiescent();
 
         /* a cannot recover to fork'd state */
         {
@@ -922,6 +964,10 @@ mod test {
         let mut b = SyncUpdater::<u64, TestState>::new(2, Default::default(), Default::default());
         let mut c = SyncUpdater::<u64, TestState>::new(3, Default::default(), Default::default());
         let mut d = SyncUpdater::<u64, TestState>::new(4, Default::default(), Default::default());
+        let mut a_reader = a.state.reader();
+        let mut b_reader = b.state.reader();
+        let mut c_reader = c.state.reader();
+        let mut d_reader = d.state.reader();
 
         {
             let follow = a.add_fresh_subscriber().await.unwrap();
@@ -961,10 +1007,14 @@ mod test {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(a.state().read().accept_seq(), 4);
-        assert_eq!(b.state().read().accept_seq(), 4);
-        assert_eq!(c.state().read().accept_seq(), 4);
-        assert_eq!(d.state().read().accept_seq(), 4);
+        assert_eq!(a_reader.current().accept_seq(), 4);
+        assert_eq!(b_reader.current().accept_seq(), 4);
+        assert_eq!(c_reader.current().accept_seq(), 4);
+        assert_eq!(d_reader.current().accept_seq(), 4);
+        a_reader.quiescent();
+        b_reader.quiescent();
+        c_reader.quiescent();
+        d_reader.quiescent();
 
         /* d goes offline so we can recover later */
         d.go_offline().await;
@@ -1041,10 +1091,14 @@ mod test {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        assert_eq!(a.state().read().accept_seq(), 12);
-        assert_eq!(b.state().read().accept_seq(), 12);
-        assert_eq!(c.state().read().accept_seq(), 12);
-        assert_eq!(d.state().read().accept_seq(), 4);
+        assert_eq!(a_reader.current().accept_seq(), 12);
+        assert_eq!(b_reader.current().accept_seq(), 12);
+        assert_eq!(c_reader.current().accept_seq(), 12);
+        assert_eq!(d_reader.current().accept_seq(), 4);
+        a_reader.quiescent();
+        b_reader.quiescent();
+        c_reader.quiescent();
+        d_reader.quiescent();
 
         /* have D recover from A */
         {
@@ -1059,15 +1113,19 @@ mod test {
         }
 
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(a.state().read().accept_seq(), 12);
-        assert_eq!(b.state().read().accept_seq(), 12);
-        assert_eq!(c.state().read().accept_seq(), 12);
-        assert_eq!(d.state().read().accept_seq(), 12);
+        assert_eq!(a_reader.current().accept_seq(), 12);
+        assert_eq!(b_reader.current().accept_seq(), 12);
+        assert_eq!(c_reader.current().accept_seq(), 12);
+        assert_eq!(d_reader.current().accept_seq(), 12);
 
-        let a_state = a.state.read().clone();
-        let b_state = b.state.read().clone();
-        let c_state = c.state.read().clone();
-        let d_state = d.state.read().clone();
+        let a_state = a_reader.current().clone();
+        let b_state = b_reader.current().clone();
+        let c_state = c_reader.current().clone();
+        let d_state = d_reader.current().clone();
+        a_reader.quiescent();
+        b_reader.quiescent();
+        c_reader.quiescent();
+        d_reader.quiescent();
 
         assert_eq!(a_state, b_state);
         assert_eq!(a_state, c_state);
@@ -1084,6 +1142,9 @@ mod test {
         let mut a = SyncUpdater::<u64, TestState>::new(1, Default::default(), Default::default());
         let mut b = SyncUpdater::<u64, TestState>::new(2, Default::default(), Default::default());
         let mut c = SyncUpdater::<u64, TestState>::new(3, Default::default(), Default::default());
+        let mut a_reader = a.state.reader();
+        let mut b_reader = b.state.reader();
+        let mut c_reader = c.state.reader();
 
         {
             let follow = a.add_fresh_subscriber().await.unwrap();
@@ -1116,9 +1177,12 @@ mod test {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let a_state = a.state.read().clone();
-        let b_state = b.state.read().clone();
-        let c_state = c.state.read().clone();
+        let a_state = a_reader.current().clone();
+        let b_state = b_reader.current().clone();
+        let c_state = c_reader.current().clone();
+        a_reader.quiescent();
+        b_reader.quiescent();
+        c_reader.quiescent();
 
         assert_eq!(a_state, b_state);
         assert_eq!(a_state, c_state);
@@ -1156,8 +1220,10 @@ mod test {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let a_state = a.state.read().clone();
-        let b_state = b.state.read().clone();
+        let a_state = a_reader.current().clone();
+        let b_state = b_reader.current().clone();
+        a_reader.quiescent();
+        b_reader.quiescent();
         assert_eq!(a_state, b_state);
         assert_eq!(a_state.state().numbers[1], 88);
         assert_eq!(a_state.state().numbers[2], 22);
@@ -1173,9 +1239,12 @@ mod test {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let a_state = a.state.read().clone();
-        let b_state = b.state.read().clone();
-        let c_state = c.state.read().clone();
+        let a_state = a_reader.current().clone();
+        let b_state = b_reader.current().clone();
+        let c_state = c_reader.current().clone();
+        a_reader.quiescent();
+        b_reader.quiescent();
+        c_reader.quiescent();
 
         assert_eq!(a_state, b_state);
         assert_eq!(a_state, c_state);

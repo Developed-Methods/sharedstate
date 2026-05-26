@@ -150,6 +150,11 @@ async fn _fuzzy_test() {
         node.set_leader(1).await;
     }
 
+    let mut readers: Vec<_> = sync_nodes
+        .iter()
+        .map(|node| node.shared().reader())
+        .collect();
+
     tokio::time::sleep(Duration::from_secs(12)).await;
 
     tokio::time::timeout(Duration::from_secs(300), async {
@@ -158,8 +163,8 @@ async fn _fuzzy_test() {
         loop {
             let mut has_change = false;
 
-            for (pos, node) in sync_nodes.iter().enumerate() {
-                let sequence = node.shared().read().state().accept_seq();
+            for (pos, reader) in readers.iter_mut().enumerate() {
+                let sequence = reader.current().state().accept_seq();
                 if sequences[pos] != sequence {
                     has_change = true;
                     tracing::info!(
@@ -186,19 +191,18 @@ async fn _fuzzy_test() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     {
-        let mut iter = sync_nodes.iter();
-        let expected = iter.next().unwrap().shared().read().clone();
+        let mut iter = readers.iter_mut();
+        let expected = iter.next().unwrap().current().clone();
         assert_ne!(expected.state().numbers[0], 0);
 
-        for node in iter {
-            let shared = node.shared();
-            let state = shared.read();
+        for reader in iter {
+            let state = reader.current();
             assert_eq!(state.state(), expected.state());
         }
     }
 
     {
-        let state = sync_nodes[0].shared().read().state().clone();
+        let state = readers[0].current().state().clone();
         println!("Numbers: {:?}", state.numbers);
     }
 
@@ -210,13 +214,12 @@ async fn _fuzzy_test() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     {
-        let mut iter = sync_nodes.iter();
-        let expected = iter.next().unwrap().shared().read().clone();
+        let mut iter = readers.iter_mut();
+        let expected = iter.next().unwrap().current().clone();
         assert_eq!(expected.state().numbers[0], 0);
 
-        for node in iter {
-            let shared = node.shared();
-            let state = shared.read();
+        for reader in iter {
+            let state = reader.current();
             assert_eq!(state.state(), expected.state());
         }
     }
