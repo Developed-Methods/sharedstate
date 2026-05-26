@@ -128,9 +128,9 @@ checksum = "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f"
 
 [[package]]
 name = "hotread"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16ba220de61446580ef8a75c4b218616e00a9ba86bd2b241f137cde7f9ad522d"
+checksum = "d68ca57b725cced07dbdfd2996069ad77756256f303266a7df1452c8dff763fa"
 dependencies = [
  "parking_lot",
 ]

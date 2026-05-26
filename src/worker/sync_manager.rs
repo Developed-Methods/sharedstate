@@ -1721,6 +1721,9 @@ mod test {
             let _span = tracing::info_span!("C").entered();
             SyncManager::new(c, 3, TestState::default(), Default::default())
         };
+        let mut a_reader = a_work.shared().reader();
+        let mut b_reader = b_work.shared().reader();
+        let mut c_reader = c_work.shared().reader();
 
         b_work.set_leader(1).await;
         c_work.set_leader(2).await;
@@ -1731,9 +1734,9 @@ mod test {
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(a_work.shared().read().state().numbers[0], 99);
-        assert_eq!(b_work.shared().read().state().numbers[0], 99);
-        assert_eq!(c_work.shared().read().state().numbers[0], 0);
+        assert_eq!(a_reader.current().state().numbers[0], 99);
+        assert_eq!(b_reader.current().state().numbers[0], 99);
+        assert_eq!(c_reader.current().state().numbers[0], 0);
 
         tokio::time::sleep(Duration::from_secs(10)).await;
     }
@@ -1768,6 +1771,9 @@ mod test {
             let _span = tracing::info_span!("C").entered();
             SyncManager::new(c, 3, TestState::default(), Default::default())
         };
+        let mut a_reader = a_work.shared().reader();
+        let mut b_reader = b_work.shared().reader();
+        let mut c_reader = c_work.shared().reader();
 
         b_work.set_leader(1).await;
         c_work.set_leader(1).await;
@@ -1780,9 +1786,12 @@ mod test {
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(a_work.shared().read().state().numbers[0], 99);
-        assert_eq!(b_work.shared().read().state().numbers[0], 99);
-        assert_eq!(c_work.shared().read().state().numbers[0], 99);
+        assert_eq!(a_reader.current().state().numbers[0], 99);
+        assert_eq!(b_reader.current().state().numbers[0], 99);
+        assert_eq!(c_reader.current().state().numbers[0], 99);
+        a_reader.quiescent();
+        b_reader.quiescent();
+        c_reader.quiescent();
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -1799,9 +1808,9 @@ mod test {
         .unwrap();
 
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert_eq!(a_work.shared().read().state().numbers[0], 199);
-        assert_eq!(b_work.shared().read().state().numbers[0], 199);
-        assert_eq!(c_work.shared().read().state().numbers[0], 199);
+        assert_eq!(a_reader.current().state().numbers[0], 199);
+        assert_eq!(b_reader.current().state().numbers[0], 199);
+        assert_eq!(c_reader.current().state().numbers[0], 199);
 
         println!("DONE");
     }
@@ -1832,6 +1841,8 @@ mod test {
             let _span = tracing::info_span!("C").entered();
             SyncManager::new(c, 3, TestState::default(), Default::default())
         };
+        let mut a_reader = a_work.shared().reader();
+        let mut c_reader = c_work.shared().reader();
 
         c_work.set_leader(1).await;
 
@@ -1841,7 +1852,8 @@ mod test {
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(c_work.shared().read().state().numbers[0], 99);
+        assert_eq!(c_reader.current().state().numbers[0], 99);
+        c_reader.quiescent();
 
         test_net.block_connection(1, 2, true).await;
 
@@ -1857,11 +1869,13 @@ mod test {
                 },
             )
         };
+        let mut b_reader = b_work.shared().reader();
 
         b_work.set_leader(1).await;
 
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert_eq!(b_work.shared().read().state().numbers[0], 99);
+        assert_eq!(b_reader.current().state().numbers[0], 99);
+        b_reader.quiescent();
 
         tx.send(TestStateAction::Add {
             slot: 0,
@@ -1871,9 +1885,9 @@ mod test {
         .unwrap();
 
         tokio::time::sleep(Duration::from_secs(3)).await;
-        assert_eq!(a_work.shared().read().state().numbers[0], 199);
-        assert_eq!(b_work.shared().read().state().numbers[0], 199);
-        assert_eq!(c_work.shared().read().state().numbers[0], 199);
+        assert_eq!(a_reader.current().state().numbers[0], 199);
+        assert_eq!(b_reader.current().state().numbers[0], 199);
+        assert_eq!(c_reader.current().state().numbers[0], 199);
     }
 
     #[tokio::test]

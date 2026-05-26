@@ -236,5 +236,6 @@ fn slow_state_deadlock_test() {
     }
 
     assert!(!failed.load(Ordering::SeqCst));
-    println!("{:?}", state.read());
+    let mut reader = state.reader();
+    println!("{:?}", reader.current());
 }
