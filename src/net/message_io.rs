@@ -6,14 +6,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub type MessageSizeHeader = u32;
 const MESSAGE_HEADER_SIZE: usize = std::mem::size_of::<MessageSizeHeader>();
 
-pub async fn read_message<M: MessageEncoding, R: AsyncRead + Unpin>(
-    buffer: &mut Vec<u8>,
-    read: &mut R,
-    progress_timeout: Duration,
-) -> Result<Option<M>, ReadMessageError> {
-    read_message_opt(buffer, read, progress_timeout, None).await
-}
-
 pub async fn read_message_opt<M: MessageEncoding, R: AsyncRead + Unpin>(
     buffer: &mut Vec<u8>,
     read: &mut R,
@@ -166,85 +158,4 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
     }
 
     out.flush().await
-}
-
-pub fn require_version<T: std::io::prelude::Read>(
-    version: u16,
-    read: &mut T,
-) -> std::io::Result<()> {
-    let actual = u16::read_from(read)?;
-    if version != actual {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "Invalid message version, expected: {} but got {}",
-                version, actual
-            ),
-        ));
-    }
-    Ok(())
-}
-
-pub fn unknown_id_err(id: u16, name: &str) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!("unknown id for {}: {}", name, id),
-    )
-}
-
-pub const fn m_max_opt_list(samples: &'static [Option<usize>]) -> Option<usize> {
-    const fn scan(max: usize, idx: usize, samples: &'static [Option<usize>]) -> Option<usize> {
-        if idx == samples.len() {
-            return Some(max);
-        }
-
-        match samples[idx] {
-            None => None,
-            Some(next) if next < max => scan(max, idx + 1, samples),
-            Some(larger) => scan(larger, idx + 1, samples),
-        }
-    }
-
-    if samples.is_empty() {
-        panic!("m_max_opt_list provided 0 samples");
-    }
-
-    match samples[0] {
-        None => None,
-        Some(max) => scan(max, 1, samples),
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::time::Duration;
-
-    use tokio::io::duplex;
-
-    use super::*;
-    use crate::testing::state_tests::TestStateAction;
-
-    #[tokio::test]
-    async fn message_io_test() {
-        let (mut a, mut b) = duplex(2048);
-        let mut buffer = Vec::with_capacity(1024);
-
-        let send = TestStateAction::Add {
-            slot: 0,
-            value: 123,
-        };
-        send_message(&mut buffer, &send, &mut a, Duration::from_secs(1))
-            .await
-            .unwrap();
-
-        let read = read_message_opt(
-            &mut buffer,
-            &mut b,
-            Duration::from_secs(1),
-            Some(Duration::from_secs(2)),
-        )
-        .await
-        .unwrap();
-        assert_eq!(Some(send), read);
-    }
 }

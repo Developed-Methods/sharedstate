@@ -29,14 +29,14 @@ pub struct SyncUpdater<I: SourceId, D: DeterministicState> {
     local_id: I,
 
     pub(super) local_action_tx: Sender<D::Action>,
-    pub(super) action_tx: Sender<(I, D::Action)>,
-    pub(super) state: SharedState<RecoverableState<I, D>>,
-    state_reader: Mutex<SharedStateReader<RecoverableState<I, D>>>,
+    pub(super) action_tx: Sender<D::Action>,
+    pub(super) state: SharedState<RecoverableState<D>>,
+    state_reader: Mutex<SharedStateReader<RecoverableState<D>>>,
 
     mode: Mode<I, D>,
 
     broadcast_settings: SequencedBroadcastSettings,
-    broadcast: SequencedBroadcast<RecoverableStateAction<I, D::AuthorityAction>>,
+    broadcast: SequencedBroadcast<RecoverableStateAction<D::AuthorityAction>>,
 }
 
 enum Mode<I: SourceId, D: DeterministicState> {
@@ -80,7 +80,7 @@ where
             tokio::spawn(async move {
                 while let Some(action) = local_action_rx.recv().await {
                     tokio::task::yield_now().await;
-                    if action_tx.send((local_id, action)).await.is_err() {
+                    if action_tx.send(action).await.is_err() {
                         break;
                     }
                 }
@@ -103,28 +103,22 @@ where
         self.local_action_tx.clone()
     }
 
-    pub fn addressed_action_tx(&self) -> Sender<(I, D::Action)> {
+    pub fn addressed_action_tx(&self) -> Sender<D::Action> {
         self.action_tx.clone()
     }
 
-    pub fn state(&self) -> SharedState<RecoverableState<I, D>> {
+    pub fn state(&self) -> SharedState<RecoverableState<D>> {
         self.state.clone()
     }
 
-    pub fn provide_action_rx(&mut self, mut action_rx: Receiver<(I, D::Action)>) {
+    pub fn provide_action_rx(&mut self, mut action_rx: Receiver<D::Action>) {
         let action_tx = self.action_tx.clone();
-        let local_id = self.local_id;
 
         tokio::spawn(async move {
-            while let Some((source, action)) = action_rx.recv().await {
+            while let Some(action) = action_rx.recv().await {
                 tokio::task::yield_now().await;
 
-                /* prevent loops */
-                if source == local_id {
-                    continue;
-                }
-
-                if action_tx.send((source, action)).await.is_err() {
+                if action_tx.send(action).await.is_err() {
                     break;
                 }
 
@@ -228,7 +222,7 @@ where
 
         let recv = self
             .broadcast
-            .add_client(recovery_details.recover_accept_seq, true)
+            .add_client(recovery_details.next_seq(), true)
             .await
             .ok()?;
 

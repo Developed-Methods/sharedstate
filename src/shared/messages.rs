@@ -3,13 +3,16 @@ use std::fmt::Debug;
 use message_encoding::MessageEncoding;
 
 use crate::{
-    recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
-    state::DeterministicState,
+    net::sync_io::SyncIO,
+    state::{
+        determinstic_state::DeterministicState,
+        recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
+    },
+    utils::unknown_id_err,
 };
 
-use super::{io::SyncIO, message_io::unknown_id_err};
-
 pub enum SyncRequest<I: SyncIO, D: DeterministicState> {
+    ProtocolVersion(u64),
     MyAddress(I::Address),
     Ping(u64),
     SubscribeFresh,
@@ -26,6 +29,7 @@ pub enum SyncRequest<I: SyncIO, D: DeterministicState> {
 impl<I: SyncIO, D: DeterministicState> Debug for SyncRequest<I, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ProtocolVersion(v) => write!(f, "ProtocolVersion({v})"),
             Self::MyAddress(address) => write!(f, "MyAddress({address:?})"),
             Self::Ping(num) => write!(f, "Ping({})", num),
             Self::SubscribeFresh => write!(f, "SubscribeFresh"),
@@ -41,8 +45,8 @@ impl<I: SyncIO, D: DeterministicState> Debug for SyncRequest<I, D> {
 pub enum SyncResponse<I: SyncIO, D: DeterministicState> {
     Pong(u64),
     RecoveryAccepted(u64),
-    FreshState(RecoverableState<I::Address, D>),
-    AuthorityAction(u64, RecoverableStateAction<I::Address, D::AuthorityAction>),
+    FreshState(RecoverableState<D>),
+    AuthorityAction(u64, RecoverableStateAction<D::AuthorityAction>),
     LeaderPath(Vec<I::Address>),
     Peers(Vec<I::Address>),
 }
@@ -79,6 +83,10 @@ where
                 sum += source.write_to(out)?;
                 action.write_to(out)?
             }
+            Self::ProtocolVersion(version) => {
+                sum += 9u16.write_to(out)?;
+                version.write_to(out)?
+            }
         };
 
         Ok(sum)
@@ -97,6 +105,7 @@ where
                 source: MessageEncoding::read_from(read)?,
                 action: MessageEncoding::read_from(read)?,
             },
+            9 => Self::ProtocolVersion(MessageEncoding::read_from(read)?),
             other => return Err(unknown_id_err(other, "SyncRequest")),
         })
     }

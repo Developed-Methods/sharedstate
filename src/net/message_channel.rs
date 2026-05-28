@@ -4,8 +4,8 @@ use message_encoding::MessageEncoding;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use super::{
-    io::SyncIO,
     message_io::{read_message_opt, send_message, send_zero_message},
+    sync_io::SyncIO,
 };
 
 #[derive(Clone, Debug)]

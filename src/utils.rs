@@ -219,3 +219,10 @@ pub fn now_ms() -> u64 {
         .unwrap()
         .as_millis() as u64
 }
+
+pub fn unknown_id_err(id: u16, name: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("unknown id for {}: {}", name, id),
+    )
+}
