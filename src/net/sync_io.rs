@@ -12,12 +12,23 @@ use crate::{
 };
 
 pub trait SyncIOAddress:
-    Debug + Clone + Copy + Send + Sync + PartialEq + Eq + Hash + MessageEncoding + 'static
+    Debug + Clone + Copy + Send + Sync + PartialEq + Eq + Ord + Hash + MessageEncoding + 'static
 {
 }
 
-impl<T: Debug + Clone + Copy + Send + Sync + PartialEq + Eq + Hash + MessageEncoding + 'static>
-    SyncIOAddress for T
+impl<
+        T: Debug
+            + Clone
+            + Copy
+            + Send
+            + Sync
+            + PartialEq
+            + Eq
+            + Ord
+            + Hash
+            + MessageEncoding
+            + 'static,
+    > SyncIOAddress for T
 {
 }
 
