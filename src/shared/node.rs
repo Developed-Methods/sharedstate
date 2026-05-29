@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use futures_util::StreamExt;
 use message_encoding::MessageEncoding;
 use tokio::{
     sync::{broadcast, mpsc, Mutex},
@@ -26,10 +27,7 @@ use crate::{
     },
     shared::{
         authorative_state::AuthorativeState,
-        messages::{
-            ElectionObservation, LeaderInfoMessage, LeaderStatus, SharePeerDetails, SyncRequest,
-            SyncResponse,
-        },
+        messages::{ElectionObservation, LeaderInfoMessage, LeaderStatus, SharePeerDetails, SyncRequest, SyncResponse},
     },
     state::{
         determinstic_state::DeterministicState,
@@ -101,12 +99,7 @@ impl<A: SyncIOAddress, D: DeterministicState> NodeState<A, D>
 where
     D::Action: Clone,
 {
-    pub async fn new(
-        address: A,
-        init_state: RecoverableState<D>,
-        can_lead: bool,
-        io_settings: NetIoSettings,
-    ) -> Self {
+    pub async fn new(address: A, init_state: RecoverableState<D>, can_lead: bool, io_settings: NetIoSettings) -> Self {
         let (actions_tx, _) = broadcast::channel(2048);
         let state = AuthorativeState::new(init_state).await;
         let state_reader = state.state_reader();
@@ -223,10 +216,7 @@ where
         })
     }
 
-    pub async fn handle_client<I: SyncIO<Address = A>>(
-        &self,
-        conn: SyncConnection<I>,
-    ) -> JoinHandle<()>
+    pub async fn handle_client<I: SyncIO<Address = A>>(&self, conn: SyncConnection<I>) -> JoinHandle<()>
     where
         D: MessageEncoding,
         D::Action: MessageEncoding + Clone,
@@ -247,10 +237,7 @@ where
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
-    pub async fn discover_peers(
-        &self,
-        peers: impl Iterator<Item = impl Into<SharePeerDetails<A>>>,
-    ) {
+    pub async fn discover_peers(&self, peers: impl Iterator<Item = impl Into<SharePeerDetails<A>>>) {
         let mut peers_lock = self.peers.lock().await;
         let mut election = self.election.lock().await;
 
@@ -373,11 +360,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
 
     async fn record_observation(&self, observation: ElectionObservation<A>) {
         if observation.can_lead {
-            self.election
-                .lock()
-                .await
-                .known_can_lead
-                .insert(observation.observer);
+            self.election.lock().await.known_can_lead.insert(observation.observer);
         }
 
         self.election
@@ -424,11 +407,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         let now = now_ms();
         let (known_can_lead, observations, local_term) = {
             let election = self.election.lock().await;
-            (
-                election.known_can_lead.clone(),
-                election.observations.clone(),
-                election.term,
-            )
+            (election.known_can_lead.clone(), election.observations.clone(), election.term)
         };
         let peer_details = self.peers.lock().await.clone();
 
@@ -470,14 +449,12 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
 
         let mut selected = counts
             .into_iter()
-            .max_by(
-                |((a_term, a_leader), a_count), ((b_term, b_leader), b_count)| {
-                    a_term
-                        .cmp(b_term)
-                        .then(a_count.cmp(b_count))
-                        .then_with(|| b_leader.cmp(a_leader))
-                },
-            )
+            .max_by(|((a_term, a_leader), a_count), ((b_term, b_leader), b_count)| {
+                a_term
+                    .cmp(b_term)
+                    .then(a_count.cmp(b_count))
+                    .then_with(|| b_leader.cmp(a_leader))
+            })
             .map(|((term, leader), _)| (term, leader));
 
         if selected.is_none() {
@@ -520,9 +497,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         }
 
         if leader != self.address {
-            let path = valid_leaders
-                .get(&leader)
-                .and_then(|(_, path)| path.clone());
+            let path = valid_leaders.get(&leader).and_then(|(_, path)| path.clone());
             let mut lock = self.leader.lock().await;
             if lock.term < term || lock.leader != Some(leader) {
                 lock.term = term;
@@ -535,9 +510,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
     async fn promote_if_needed(&self, observed_term: u64) {
         {
             let leader = self.leader.lock().await;
-            if leader.leader == Some(self.address)
-                && leader.path.as_deref() == Some(&[self.address])
-            {
+            if leader.leader == Some(self.address) && leader.path.as_deref() == Some(&[self.address]) {
                 return;
             }
         }
@@ -610,49 +583,42 @@ where
                 .collect::<Vec<_>>()
         };
 
-        for target in targets {
-            self.observe_peer(target).await;
-        }
+        let mut results = futures_util::stream::iter(targets.into_iter())
+            .map(|target| self.observe_peer(target))
+            .buffered(8);
+
+        while results.next().await.is_some() {}
     }
 
     async fn observe_peer(&self, target: I::Address) {
         self.mark_connect_attempt(target).await;
 
-        let started = now_ms();
         let Ok(Ok(conn)) = tokio::time::timeout(RPC_TIMEOUT, self.io.connect(&target)).await else {
             self.mark_connect_fail(target).await;
             return;
         };
 
         let (_addr, write, mut read) = conn.client_channels::<D>(self.io_settings.clone());
-        if !send_expect_ok(
-            &write,
-            &mut read,
-            SyncRequest::ProtocolVersion(PROTOCOL_VERSION),
-        )
-        .await
-        {
+
+        if !send_expect_ok(&write, &mut read, SyncRequest::ProtocolVersion(PROTOCOL_VERSION)).await {
             self.mark_connect_fail(target).await;
             return;
         }
-        if !send_expect_ok(
-            &write,
-            &mut read,
-            SyncRequest::MyAddress(self.inner.address),
-        )
-        .await
-        {
+
+        if !send_expect_ok(&write, &mut read, SyncRequest::MyAddress(self.inner.address)).await {
             self.mark_connect_fail(target).await;
             return;
         }
+
+        let started = now_ms();
         if write.send(SyncRequest::Ping(started)).await.is_err() {
             self.mark_connect_fail(target).await;
             return;
         }
+
         match recv_timeout(&mut read).await {
             Some(SyncResponse::Pong(id)) if id == started => {
-                self.mark_connected(target, now_ms().saturating_sub(started))
-                    .await;
+                self.mark_connected(target, now_ms().saturating_sub(started)).await;
             }
             _ => {
                 self.mark_connect_fail(target).await;
@@ -708,9 +674,7 @@ where
         candidates.sort_by_key(|(addr, details)| {
             let tier = if Some(*addr) == leader {
                 0u8
-            } else if leader.is_some()
-                && details.last_observation.as_ref().and_then(|o| o.leader) == leader
-            {
+            } else if leader.is_some() && details.last_observation.as_ref().and_then(|o| o.leader) == leader {
                 1
             } else if details.can_lead {
                 2
@@ -739,23 +703,12 @@ where
         };
 
         let (remote, write, mut read) = conn.client_channels::<D>(self.io_settings.clone());
-        if !send_expect_ok(
-            &write,
-            &mut read,
-            SyncRequest::ProtocolVersion(PROTOCOL_VERSION),
-        )
-        .await
-        {
+        if !send_expect_ok(&write, &mut read, SyncRequest::ProtocolVersion(PROTOCOL_VERSION)).await {
             self.mark_connect_fail(target).await;
             return;
         }
-        if !send_expect_ok(
-            &write,
-            &mut read,
-            SyncRequest::MyAddress(self.inner.address),
-        )
-        .await
-        {
+
+        if !send_expect_ok(&write, &mut read, SyncRequest::MyAddress(self.inner.address)).await {
             self.mark_connect_fail(target).await;
             return;
         }
@@ -777,10 +730,12 @@ where
             self.mark_connect_fail(target).await;
             return;
         };
+
         let Some(path) = leader_info.path.clone() else {
             self.mark_connect_fail(target).await;
             return;
         };
+
         if !valid_remote_leader_path(Some(leader), &path, self.inner.address) {
             self.mark_connect_fail(target).await;
             return;
@@ -795,18 +750,8 @@ where
             }
         }
 
-        let details = self
-            .inner
-            .state
-            .lock()
-            .await
-            .recoverable_state_details()
-            .await;
-        if write
-            .send(SyncRequest::SubscribeRecovery(details))
-            .await
-            .is_err()
-        {
+        let details = self.inner.state.lock().await.recoverable_state_details().await;
+        if write.send(SyncRequest::SubscribeRecovery(details)).await.is_err() {
             self.mark_connect_fail(target).await;
             return;
         }
@@ -854,11 +799,7 @@ where
         self.spawn_follow_reader(target, read, cancel);
     }
 
-    fn spawn_action_forward(
-        &self,
-        write: mpsc::Sender<SyncRequest<I::Address, D>>,
-        cancel: CancellationToken,
-    ) {
+    fn spawn_action_forward(&self, write: mpsc::Sender<SyncRequest<I::Address, D>>, cancel: CancellationToken) {
         let mut actions = self.inner.actions_tx.subscribe();
 
         tokio::spawn(async move {
@@ -871,11 +812,7 @@ where
                     break;
                 };
 
-                if write
-                    .send(SyncRequest::Action { source, action })
-                    .await
-                    .is_err()
-                {
+                if write.send(SyncRequest::Action { source, action }).await.is_err() {
                     break;
                 }
             }
@@ -912,8 +849,7 @@ where
                     Some(SyncResponse::LeaderPath(path)) => {
                         if let Some(leader_addr) = path.first().copied() {
                             if valid_remote_leader_path(Some(leader_addr), &path, inner.address) {
-                                inner.leader.lock().await.path =
-                                    Some(append_path(path, inner.address));
+                                inner.leader.lock().await.path = Some(append_path(path, inner.address));
                             }
                         }
                     }
@@ -995,18 +931,13 @@ where
                 }
                 SyncRequest::SharePeers(peers) => {
                     self.inner.discover_peers(peers.into_iter()).await;
-                    if !self
-                        .send(SyncResponse::Peers(self.inner.peer_snapshot().await))
-                        .await
-                    {
+                    if !self.send(SyncResponse::Peers(self.inner.peer_snapshot().await)).await {
                         break;
                     }
                 }
                 SyncRequest::WhoIsLeader => {
                     if !self
-                        .send(SyncResponse::LeaderInfo(
-                            self.inner.leader_info_message().await,
-                        ))
+                        .send(SyncResponse::LeaderInfo(self.inner.leader_info_message().await))
                         .await
                     {
                         break;
@@ -1039,13 +970,7 @@ where
                     let path = self.inner.leader.lock().await.path.clone();
                     let resp = match path {
                         None => SyncResponse::NoPathToLeader,
-                        Some(path)
-                            if valid_local_leader_path(
-                                path.first().copied(),
-                                &path,
-                                self.inner.address,
-                            ) =>
-                        {
+                        Some(path) if valid_local_leader_path(path.first().copied(), &path, self.inner.address) => {
                             SyncResponse::LeaderPath(path)
                         }
                         Some(_) => SyncResponse::NoPathToLeader,
@@ -1083,11 +1008,7 @@ where
         let write = self.write.clone();
         tokio::spawn(async move {
             while let Ok((seq, action)) = feed.recv().await {
-                if write
-                    .send(SyncResponse::AuthorityAction(seq, action))
-                    .await
-                    .is_err()
-                {
+                if write.send(SyncResponse::AuthorityAction(seq, action)).await.is_err() {
                     break;
                 }
             }
@@ -1098,17 +1019,8 @@ where
         true
     }
 
-    async fn subscribe_recovery(
-        &self,
-        details: crate::state::recoverable_state::RecoverableStateDetails,
-    ) -> bool {
-        let leader_state = self
-            .inner
-            .state
-            .lock()
-            .await
-            .recoverable_state_details()
-            .await;
+    async fn subscribe_recovery(&self, details: crate::state::recoverable_state::RecoverableStateDetails) -> bool {
+        let leader_state = self.inner.state.lock().await.recoverable_state_details().await;
 
         if !leader_state.can_recover_follower(&details) {
             return self.send(SyncResponse::RecoveryFailed(leader_state)).await;
@@ -1130,11 +1042,7 @@ where
         let write = self.write.clone();
         tokio::spawn(async move {
             while let Ok((seq, action)) = feed.recv().await {
-                if write
-                    .send(SyncResponse::AuthorityAction(seq, action))
-                    .await
-                    .is_err()
-                {
+                if write.send(SyncResponse::AuthorityAction(seq, action)).await.is_err() {
                     break;
                 }
             }
@@ -1226,11 +1134,7 @@ where
 
         async {
             if self.write.send(msg).await.is_err() {
-                tracing::warn!(
-                    "failed to send response to peer {}:{}",
-                    caller.file(),
-                    caller.line()
-                );
+                tracing::warn!("failed to send response to peer {}:{}", caller.file(), caller.line());
                 false
             } else {
                 true
@@ -1255,17 +1159,12 @@ where
     matches!(recv_timeout(read).await, Some(SyncResponse::Ok))
 }
 
-async fn recv_timeout<A, D>(
-    read: &mut mpsc::Receiver<SyncResponse<A, D>>,
-) -> Option<SyncResponse<A, D>>
+async fn recv_timeout<A, D>(read: &mut mpsc::Receiver<SyncResponse<A, D>>) -> Option<SyncResponse<A, D>>
 where
     A: SyncIOAddress,
     D: DeterministicState,
 {
-    tokio::time::timeout(RPC_TIMEOUT, read.recv())
-        .await
-        .ok()
-        .flatten()
+    tokio::time::timeout(RPC_TIMEOUT, read.recv()).await.ok().flatten()
 }
 
 fn valid_remote_leader_path<A: SyncIOAddress>(leader: Option<A>, path: &[A], local: A) -> bool {
