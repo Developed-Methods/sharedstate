@@ -615,10 +615,15 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             let Some(leader) = observation.leader else {
                 continue;
             };
-            if let Some(path) = &observation.leader_path {
-                if !valid_remote_leader_path(Some(leader), path, self.address) {
+            let Some(path) = &observation.leader_path else {
+                continue;
+            };
+            if observation.observer == self.address && leader == self.address {
+                if !valid_local_leader_path(Some(leader), path, self.address) {
                     continue;
                 }
+            } else if !valid_remote_leader_path(Some(leader), path, self.address) {
+                continue;
             }
 
             *counts.entry((observation.term, leader)).or_insert(0) += 1;
@@ -650,7 +655,8 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                         || peer_details
                             .get(addr)
                             .and_then(|d| d.as_ref())
-                            .map(|d| d.connected || d.last_activity.is_some())
+                            .and_then(|d| d.last_activity)
+                            .map(|ts| now.saturating_sub(ts.get()) <= OBSERVATION_STALE_MS)
                             .unwrap_or(false)
                 })
                 .next()
@@ -1027,7 +1033,15 @@ where
 
             if let Some(follow) = inner.follow.lock().await.take() {
                 if follow.remote == target {
+                    let follow_path = follow.leader_path.clone();
                     follow.cancel.cancel();
+                    let mut leader = inner.leader.lock().await;
+                    if leader.leader != Some(inner.address)
+                        && leader.path.as_deref() == Some(follow_path.as_slice())
+                    {
+                        leader.leader = None;
+                        leader.path = None;
+                    }
                 } else {
                     let _ = inner.follow.lock().await.replace(follow);
                 }
