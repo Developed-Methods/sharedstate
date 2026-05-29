@@ -441,9 +441,18 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             .await
             .as_ref()
             .map(|follow| follow.leader_path.clone());
+        let (leader_addr, path) = match leader.leader {
+            Some(addr) if addr == self.address => (Some(addr), leader.path),
+            Some(addr) => match follow_path {
+                Some(path) => (Some(addr), Some(path)),
+                None => (None, None),
+            },
+            None => (None, None),
+        };
+
         LeaderInfoMessage {
-            leader: leader.leader,
-            path: leader.path.or(follow_path),
+            leader: leader_addr,
+            path,
             term: leader.term,
         }
     }
@@ -518,6 +527,20 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
 
     async fn local_observation(&self) -> ElectionObservation<A> {
         let leader = self.leader.lock().await.clone();
+        let follow_path = self
+            .follow
+            .lock()
+            .await
+            .as_ref()
+            .map(|follow| follow.leader_path.clone());
+        let (leader_addr, leader_path) = match leader.leader {
+            Some(addr) if addr == self.address => (Some(addr), leader.path),
+            Some(addr) => match follow_path {
+                Some(path) => (Some(addr), Some(path)),
+                None => (None, None),
+            },
+            None => (None, None),
+        };
         let reachable_can_lead = {
             let peers = self.peers.lock().await;
             peers
@@ -536,8 +559,8 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         ElectionObservation {
             observer: self.address,
             term: leader.term,
-            leader: leader.leader,
-            leader_path: leader.path,
+            leader: leader_addr,
+            leader_path,
             can_lead: self.can_lead,
             reachable_can_lead,
         }
@@ -1012,8 +1035,16 @@ where
                         let mut leader = inner.leader.lock().await;
                         if leader.term <= info.term {
                             leader.term = info.term;
-                            leader.leader = info.leader;
-                            leader.path = info.path;
+                            let path = match (info.leader, info.path) {
+                                (Some(leader_addr), Some(path))
+                                    if valid_remote_leader_path(Some(leader_addr), &path, inner.address) =>
+                                {
+                                    Some((leader_addr, append_path(path, inner.address)))
+                                }
+                                _ => None,
+                            };
+                            leader.leader = path.as_ref().map(|(leader_addr, _)| *leader_addr);
+                            leader.path = path.map(|(_, path)| path);
                         }
                     }
                     Some(SyncResponse::LeaderPath(path)) => {
@@ -1033,12 +1064,9 @@ where
 
             if let Some(follow) = inner.follow.lock().await.take() {
                 if follow.remote == target {
-                    let follow_path = follow.leader_path.clone();
                     follow.cancel.cancel();
                     let mut leader = inner.leader.lock().await;
-                    if leader.leader != Some(inner.address)
-                        && leader.path.as_deref() == Some(follow_path.as_slice())
-                    {
+                    if leader.leader != Some(inner.address) {
                         leader.leader = None;
                         leader.path = None;
                     }
@@ -1059,9 +1087,11 @@ where
     async fn mark_connect_fail(&self, target: I::Address) {
         let mut peers = self.inner.peers.lock().await;
         if let Some(Some(details)) = peers.get_mut(&target) {
+            details.last_activity = None;
             details.last_connect_fail = NonZeroU64::new(now_ms());
             details.repeat_connect_fails = details.repeat_connect_fails.saturating_add(1);
             details.connected = false;
+            details.last_observation = None;
         }
     }
 
@@ -1525,5 +1555,22 @@ mod test {
         assert_eq!(leader.leader, Some(2));
         assert_eq!(leader.path, Some(vec![2]));
         assert!(0 < leader.term);
+    }
+
+    #[tokio::test]
+    async fn local_observation_does_not_advertise_remote_leader_without_follow_path() {
+        let node = node(2, true).await;
+
+        {
+            let mut leader = node.inner.leader.lock().await;
+            leader.leader = Some(1);
+            leader.path = Some(vec![1]);
+            leader.term = 4;
+        }
+
+        let observation = node.inner.local_observation().await;
+        assert_eq!(observation.leader, None);
+        assert_eq!(observation.leader_path, None);
+        assert_eq!(observation.term, 4);
     }
 }
