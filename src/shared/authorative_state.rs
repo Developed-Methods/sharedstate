@@ -3,7 +3,7 @@ use std::time::Duration;
 use sequenced_broadcast::{
     SequencedBroadcast, SequencedReceiver, SequencedRecvError, SequencedSender, SubscribeError,
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::state::{
@@ -16,7 +16,7 @@ pub struct AuthorativeState<D: DeterministicState> {
     authority_broadcast: SequencedBroadcast<RecoverableStateAction<D::AuthorityAction>>,
     authority_tx: SequencedSender<RecoverableStateAction<D::AuthorityAction>>,
     state_reader: SharedStateReader<RecoverableState<D>>,
-    state_handle: SharedStateHandle<RecoverableState<D>>,
+    state_handle: Mutex<SharedStateHandle<RecoverableState<D>>>,
     cancel: CancellationToken,
     state_join: Option<JoinHandle<SharedState<RecoverableState<D>>>>,
 }
@@ -47,44 +47,55 @@ impl<D: DeterministicState> AuthorativeState<D> {
             authority_broadcast,
             authority_tx,
             state_reader,
-            state_handle,
+            state_handle: Mutex::new(state_handle),
             cancel,
             state_join: Some(tokio::spawn(worker.run())),
         }
     }
 
-    pub fn state_clone(&mut self) -> RecoverableState<D> {
-        let cloned = self.state_handle.read().clone();
-        self.state_handle.quiescent();
+    pub async fn state_clone(&self) -> RecoverableState<D> {
+        let mut handle = self.state_handle.lock().await;
+
+        let cloned = handle.read().clone();
+        handle.quiescent();
+
         cloned
     }
 
-    pub fn recoverable_state_details(&mut self) -> RecoverableStateDetails {
-        let details = self.state_handle.read().details().clone();
-        self.state_handle.quiescent();
+    pub async fn recoverable_state_details(&self) -> RecoverableStateDetails {
+        let mut handle = self.state_handle.lock().await;
+
+        let details = handle.read().details().clone();
+        handle.quiescent();
+
         details
     }
 
     pub async fn subscribe(
-        &mut self,
+        &self,
     ) -> (
         RecoverableState<D>,
         SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
     ) {
         for _ in 0..16 {
-            let state_borrow = self.state_handle.read();
+            let mut handle = self.state_handle.lock().await;
+
+            let state_borrow = handle.read();
 
             let Ok(sub) = self
                 .authority_broadcast
                 .subscribe_from(state_borrow.accept_seq())
                 .await
             else {
+                handle.quiescent();
+                drop(handle);
+
                 tokio::time::sleep(Duration::from_millis(1)).await;
                 continue;
             };
 
             let state = state_borrow.clone();
-            self.state_handle.quiescent();
+            handle.quiescent();
 
             return (state, sub);
         }
@@ -93,7 +104,7 @@ impl<D: DeterministicState> AuthorativeState<D> {
     }
 
     pub async fn subscribe_at(
-        &mut self,
+        &self,
         seq: u64,
     ) -> Result<SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>, SubscribeError> {
         self.authority_broadcast.subscribe_from(seq).await
@@ -185,7 +196,15 @@ impl<D: DeterministicState> StateMaintainWorker<D> {
             };
 
             state.queue_updates(std::iter::once((seq, action)));
-            state.queue_updates(std::iter::from_fn(|| actions_rx.try_recv().ok()));
+
+            let mut remaining = 512u32;
+            state.queue_updates(std::iter::from_fn(|| {
+                remaining = remaining.saturating_sub(1);
+                if remaining == 0 {
+                    return None;
+                }
+                actions_rx.try_recv().ok()
+            }));
         }
 
         state

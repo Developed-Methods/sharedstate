@@ -1,59 +1,85 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, num::NonZeroU64};
 
 use message_encoding::MessageEncoding;
 
 use crate::{
-    net::sync_io::SyncIO,
+    net::sync_io::SyncIOAddress,
     state::{
         determinstic_state::DeterministicState,
         recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
     },
-    utils::unknown_id_err,
+    utils::{unknown_id_err, unknown_version_err},
 };
 
-pub enum SyncRequest<I: SyncIO, D: DeterministicState> {
+pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
     ProtocolVersion(u64),
-    MyAddress(I::Address),
+    MyAddress(A),
     Ping(u64),
     SubscribeFresh,
     ShareLeaderPath,
-    SendMePeers,
-    NoticePeers(Vec<I::Address>),
+    SharePeers(Vec<SharePeerDetails<A>>),
     SubscribeRecovery(RecoverableStateDetails),
-    Action {
-        source: I::Address,
-        action: D::Action,
-    },
+    Action { source: A, action: D::Action },
+    LeaderStatus { address: A, status: LeaderStatus },
 }
 
-impl<I: SyncIO, D: DeterministicState> Debug for SyncRequest<I, D> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ProtocolVersion(v) => write!(f, "ProtocolVersion({v})"),
-            Self::MyAddress(address) => write!(f, "MyAddress({address:?})"),
-            Self::Ping(num) => write!(f, "Ping({})", num),
-            Self::SubscribeFresh => write!(f, "SubscribeFresh"),
-            Self::ShareLeaderPath => write!(f, "ShareLeaderPath"),
-            Self::SendMePeers => write!(f, "SendMePeers"),
-            Self::NoticePeers(peers) => write!(f, "NoticePeers({:?})", peers),
-            Self::SubscribeRecovery(details) => write!(f, "SubscribeRecovery({:?})", details),
-            Self::Action { source, .. } => write!(f, "Action(source: {:?})", source),
+#[derive(Debug)]
+pub enum LeaderStatus {
+    Promoted,
+    Offline,
+    Voted,
+}
+
+#[derive(Debug)]
+pub struct SharePeerDetails<A: SyncIOAddress> {
+    pub address: A,
+    pub can_be_leader: Option<bool>,
+    pub last_global_activity: Option<NonZeroU64>,
+}
+
+impl<A: SyncIOAddress> From<A> for SharePeerDetails<A> {
+    fn from(value: A) -> Self {
+        SharePeerDetails {
+            address: value,
+            can_be_leader: None,
+            last_global_activity: None,
         }
     }
 }
 
-pub enum SyncResponse<I: SyncIO, D: DeterministicState> {
-    Pong(u64),
-    RecoveryAccepted(u64),
-    FreshState(RecoverableState<D>),
-    AuthorityAction(u64, RecoverableStateAction<D::AuthorityAction>),
-    LeaderPath(Vec<I::Address>),
-    Peers(Vec<I::Address>),
+impl<A: SyncIOAddress, D: DeterministicState> Debug for SyncRequest<A, D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProtocolVersion(v) => write!(f, "ProtocolVersion({v})"),
+            Self::MyAddress(address) => write!(f, "MyAddress({address:?})"),
+            Self::Ping(num) => write!(f, "Ping({num})"),
+            Self::SubscribeFresh => write!(f, "SubscribeFresh"),
+            Self::ShareLeaderPath => write!(f, "ShareLeaderPath"),
+            Self::SharePeers(peers) => write!(f, "NoticePeers({peers:?})"),
+            Self::SubscribeRecovery(details) => write!(f, "SubscribeRecovery({details:?})"),
+            Self::Action { source, .. } => write!(f, "Action(source: {source:?})"),
+            Self::LeaderStatus { address, status } => {
+                write!(f, "LeaderStatus({address:?} {status:?})")
+            }
+        }
+    }
 }
 
-impl<I: SyncIO, D: DeterministicState> MessageEncoding for SyncRequest<I, D>
+pub enum SyncResponse<A: SyncIOAddress, D: DeterministicState> {
+    Pong(u64),
+    Accepted(u64),
+    RecoveryFailed(RecoverableStateDetails),
+    FreshState(RecoverableState<D>),
+    AuthorityAction(u64, RecoverableStateAction<D::AuthorityAction>),
+    LeaderPath(Vec<A>),
+    NoPathToLeader,
+    Peers(Vec<SharePeerDetails<A>>),
+    Ok,
+    ActionStreamClosed,
+}
+
+impl<A: SyncIOAddress, D: DeterministicState> MessageEncoding for SyncRequest<A, D>
 where
-    I::Address: MessageEncoding,
     D::Action: MessageEncoding,
 {
     fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
@@ -69,8 +95,7 @@ where
             }
             Self::SubscribeFresh => 3u16.write_to(out)?,
             Self::ShareLeaderPath => 4u16.write_to(out)?,
-            Self::SendMePeers => 5u16.write_to(out)?,
-            Self::NoticePeers(peers) => {
+            Self::SharePeers(peers) => {
                 sum += 6u16.write_to(out)?;
                 write_vec(peers, out)?
             }
@@ -87,6 +112,11 @@ where
                 sum += 9u16.write_to(out)?;
                 version.write_to(out)?
             }
+            Self::LeaderStatus { address, status } => {
+                sum += 10u16.write_to(out)?;
+                sum += address.write_to(out)?;
+                status.write_to(out)?
+            }
         };
 
         Ok(sum)
@@ -98,22 +128,75 @@ where
             1 => Self::Ping(MessageEncoding::read_from(read)?),
             3 => Self::SubscribeFresh,
             4 => Self::ShareLeaderPath,
-            5 => Self::SendMePeers,
-            6 => Self::NoticePeers(read_vec(read)?),
+            6 => Self::SharePeers(read_vec(read)?),
             7 => Self::SubscribeRecovery(MessageEncoding::read_from(read)?),
             8 => Self::Action {
                 source: MessageEncoding::read_from(read)?,
                 action: MessageEncoding::read_from(read)?,
             },
             9 => Self::ProtocolVersion(MessageEncoding::read_from(read)?),
+            10 => Self::LeaderStatus {
+                address: MessageEncoding::read_from(read)?,
+                status: MessageEncoding::read_from(read)?,
+            },
             other => return Err(unknown_id_err(other, "SyncRequest")),
         })
     }
 }
 
-impl<I: SyncIO, D: DeterministicState> MessageEncoding for SyncResponse<I, D>
+impl MessageEncoding for LeaderStatus {
+    fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
+        let num = match self {
+            LeaderStatus::Offline => 0u16,
+            LeaderStatus::Promoted => 1u16,
+            LeaderStatus::Voted => 2u16,
+        };
+        num.write_to(out)
+    }
+
+    fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
+        match u16::read_from(read)? {
+            0 => Ok(LeaderStatus::Offline),
+            1 => Ok(LeaderStatus::Promoted),
+            2 => Ok(LeaderStatus::Voted),
+            id => Err(unknown_id_err(id, "LeaderStatus")),
+        }
+    }
+}
+
+impl<A> MessageEncoding for SharePeerDetails<A>
 where
-    I::Address: MessageEncoding,
+    A: SyncIOAddress,
+{
+    fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
+        let mut sum = 0;
+        sum += 1u16.write_to(out)?;
+        sum += self.address.write_to(out)?;
+        sum += self.can_be_leader.write_to(out)?;
+        sum += self
+            .last_global_activity
+            .map(|v| v.get())
+            .unwrap_or(0)
+            .write_to(out)?;
+        Ok(sum)
+    }
+
+    fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
+        let version = u16::read_from(read)?;
+        if version != 1 {
+            return Err(unknown_version_err(version, "SharePeerDetails"));
+        }
+
+        Ok(Self {
+            address: MessageEncoding::read_from(read)?,
+            can_be_leader: MessageEncoding::read_from(read)?,
+            last_global_activity: NonZeroU64::new(u64::read_from(read)?),
+        })
+    }
+}
+
+impl<A: SyncIOAddress, D: DeterministicState> MessageEncoding for SyncResponse<A, D>
+where
     D::AuthorityAction: MessageEncoding,
     D: MessageEncoding,
 {
@@ -124,7 +207,7 @@ where
                 sum += 1u16.write_to(out)?;
                 num.write_to(out)?
             }
-            Self::RecoveryAccepted(next_seq) => {
+            Self::Accepted(next_seq) => {
                 sum += 2u16.write_to(out)?;
                 next_seq.write_to(out)?
             }
@@ -145,6 +228,13 @@ where
                 sum += 6u16.write_to(out)?;
                 write_vec(peers, out)?
             }
+            Self::Ok => 7u16.write_to(out)?,
+            Self::ActionStreamClosed => 8u16.write_to(out)?,
+            Self::RecoveryFailed(seq) => {
+                sum += 9u16.write_to(out)?;
+                seq.write_to(out)?
+            }
+            Self::NoPathToLeader => 10u16.write_to(out)?,
         };
 
         Ok(sum)
@@ -153,7 +243,7 @@ where
     fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
         Ok(match u16::read_from(read)? {
             1 => Self::Pong(MessageEncoding::read_from(read)?),
-            2 => Self::RecoveryAccepted(MessageEncoding::read_from(read)?),
+            2 => Self::Accepted(MessageEncoding::read_from(read)?),
             3 => Self::FreshState(MessageEncoding::read_from(read)?),
             4 => Self::AuthorityAction(
                 MessageEncoding::read_from(read)?,
@@ -161,6 +251,10 @@ where
             ),
             5 => Self::LeaderPath(read_vec(read)?),
             6 => Self::Peers(read_vec(read)?),
+            7 => Self::Ok,
+            8 => Self::ActionStreamClosed,
+            9 => Self::RecoveryFailed(MessageEncoding::read_from(read)?),
+            10 => Self::NoPathToLeader,
             other => return Err(unknown_id_err(other, "SyncResponse")),
         })
     }
