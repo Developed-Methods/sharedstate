@@ -26,28 +26,19 @@ use crate::{
     utils::now_ms,
 };
 
-pub trait NodeTypes: 'static {
-    type Io: SyncIO + Clone;
-    type State: DeterministicState<Action: MessageEncoding + Clone, AuthorityAction: MessageEncoding>
-        + MessageEncoding;
-}
-
 // pub mod connecting_state;
 
-pub struct NodeState<N: NodeTypes> {
-    inner: Arc<Inner<N>>,
+pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
+    inner: Arc<Inner<A, D>>,
     io_settings: NetIoSettings,
 }
 
-struct Inner<N: NodeTypes> {
-    address: <N::Io as SyncIO>::Address,
-    leader: Mutex<LeaderInfo<<N::Io as SyncIO>::Address>>,
-    peers: Mutex<HashMap<<N::Io as SyncIO>::Address, Option<PeerDetails>>>,
-    state: AuthorativeState<N::State>,
-    actions_tx: broadcast::Sender<(
-        <N::Io as SyncIO>::Address,
-        <N::State as DeterministicState>::Action,
-    )>,
+struct Inner<A: SyncIOAddress, D: DeterministicState> {
+    address: A,
+    leader: Mutex<LeaderInfo<A>>,
+    peers: Mutex<HashMap<A, Option<PeerDetails>>>,
+    state: AuthorativeState<D>,
+    actions_tx: broadcast::Sender<(A, D::Action)>,
 }
 
 struct LeaderInfo<A: SyncIOAddress> {
@@ -65,10 +56,13 @@ struct PeerDetails {
     connected: bool,
 }
 
-impl<N: NodeTypes> NodeState<N> {
+impl<A: SyncIOAddress, D: DeterministicState> NodeState<A, D>
+where
+    D::Action: Clone,
+{
     pub async fn new(
-        address: <N::Io as SyncIO>::Address,
-        init_state: RecoverableState<N::State>,
+        address: A,
+        init_state: RecoverableState<D>,
         can_lead: bool,
         io_settings: NetIoSettings,
     ) -> Self {
@@ -105,15 +99,23 @@ impl<N: NodeTypes> NodeState<N> {
         }
     }
 
-    pub async fn discover_peers(&self, peers: impl Iterator<Item = <N::Io as SyncIO>::Address>) {
+    pub async fn discover_peers(&self, peers: impl Iterator<Item = A>) {
         self.inner.discover_peers(peers).await;
     }
 
-    pub async fn handle_client(&self, conn: SyncConnection<N::Io>) -> JoinHandle<()> {
+    pub async fn handle_client<I: SyncIO<Address = A>>(
+        &self,
+        conn: SyncConnection<I>,
+    ) -> JoinHandle<()>
+    where
+        D: MessageEncoding,
+        D::Action: MessageEncoding + Clone,
+        D::AuthorityAction: MessageEncoding,
+    {
         let (addr, write, read) = conn.server_channels(self.io_settings.clone());
 
         tokio::spawn(
-            PeerWorker::<N> {
+            PeerWorker::<A, D> {
                 addr,
                 inner: self.inner.clone(),
                 write,
@@ -124,10 +126,10 @@ impl<N: NodeTypes> NodeState<N> {
     }
 }
 
-impl<N: NodeTypes> Inner<N> {
+impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
     pub async fn discover_peers(
         &self,
-        peers: impl Iterator<Item = impl Into<SharePeerDetails<<N::Io as SyncIO>::Address>>>,
+        peers: impl Iterator<Item = impl Into<SharePeerDetails<A>>>,
     ) {
         let mut peers_lock = self.peers.lock().await;
 
@@ -176,14 +178,14 @@ impl<N: NodeTypes> Inner<N> {
     }
 }
 
-struct PeerWorker<N: NodeTypes> {
-    addr: <N::Io as SyncIO>::Address,
-    inner: Arc<Inner<N>>,
-    read: mpsc::Receiver<SyncRequest<<N::Io as SyncIO>::Address, N::State>>,
-    write: mpsc::Sender<SyncResponse<<N::Io as SyncIO>::Address, N::State>>,
+struct PeerWorker<A: SyncIOAddress, D: DeterministicState> {
+    addr: A,
+    inner: Arc<Inner<A, D>>,
+    read: mpsc::Receiver<SyncRequest<A, D>>,
+    write: mpsc::Sender<SyncResponse<A, D>>,
 }
 
-impl<N: NodeTypes> PeerWorker<N> {
+impl<A: SyncIOAddress, D: DeterministicState> PeerWorker<A, D> {
     async fn run(mut self) {
         while let Some(msg) = self.read.recv().await {
             match msg {
@@ -341,7 +343,7 @@ impl<N: NodeTypes> PeerWorker<N> {
     #[track_caller]
     fn send(
         &self,
-        msg: SyncResponse<<N::Io as SyncIO>::Address, N::State>,
+        msg: SyncResponse<A, D>,
     ) -> impl Future<Output = bool> + '_ {
         let caller = Location::caller();
 
