@@ -15,7 +15,7 @@ use std::{
 use futures_util::StreamExt;
 use message_encoding::MessageEncoding;
 use tokio::{
-    sync::{broadcast, mpsc, Mutex},
+    sync::{mpsc, Mutex},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -49,6 +49,22 @@ pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
     io_settings: NetIoSettings,
 }
 
+#[derive(Debug)]
+pub enum SendActionError {
+    Closed,
+}
+
+#[derive(Clone)]
+pub struct NodeActionSender<Action> {
+    tx: mpsc::Sender<Action>,
+}
+
+impl<Action> NodeActionSender<Action> {
+    pub async fn send(&self, action: Action) -> Result<(), SendActionError> {
+        self.tx.send(action).await.map_err(|_| SendActionError::Closed)
+    }
+}
+
 struct Inner<A: SyncIOAddress, D: DeterministicState> {
     address: A,
     can_lead: bool,
@@ -56,7 +72,8 @@ struct Inner<A: SyncIOAddress, D: DeterministicState> {
     peers: Mutex<HashMap<A, Option<PeerDetails<A>>>>,
     state: Mutex<AuthorativeState<D>>,
     state_reader: SharedStateReader<RecoverableState<D>>,
-    actions_tx: broadcast::Sender<(A, D::Action)>,
+    local_actions_tx: mpsc::Sender<D::Action>,
+    local_actions_rx: Mutex<Option<mpsc::Receiver<D::Action>>>,
     follow: Mutex<Option<FollowConnection<A, D>>>,
     election: Mutex<ElectionState<A>>,
 }
@@ -100,7 +117,7 @@ where
     D::Action: Clone,
 {
     pub async fn new(address: A, init_state: RecoverableState<D>, can_lead: bool, io_settings: NetIoSettings) -> Self {
-        let (actions_tx, _) = broadcast::channel(2048);
+        let (local_actions_tx, local_actions_rx) = mpsc::channel(1024);
         let state = AuthorativeState::new(init_state).await;
         let state_reader = state.state_reader();
 
@@ -134,7 +151,8 @@ where
                 }),
                 state: Mutex::new(state),
                 state_reader,
-                actions_tx,
+                local_actions_tx,
+                local_actions_rx: Mutex::new(Some(local_actions_rx)),
                 follow: Mutex::new(None),
                 election: Mutex::new(ElectionState {
                     term: 0,
@@ -165,6 +183,12 @@ where
         self.inner.state_reader.create_handle()
     }
 
+    pub fn action_sender(&self) -> NodeActionSender<D::Action> {
+        NodeActionSender {
+            tx: self.inner.local_actions_tx.clone(),
+        }
+    }
+
     pub async fn start_client<I>(&self, io: Arc<I>) -> JoinHandle<()>
     where
         I: SyncIO<Address = A>,
@@ -172,6 +196,8 @@ where
         D::Action: MessageEncoding + Clone,
         D::AuthorityAction: MessageEncoding,
     {
+        self.inner.start_local_action_pump().await;
+
         tokio::spawn(
             ClientWorker::<I, D> {
                 inner: self.inner.clone(),
@@ -237,6 +263,60 @@ where
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
+    async fn start_local_action_pump(self: &Arc<Self>)
+    where
+        D::Action: Send,
+    {
+        let Some(mut rx) = self.local_actions_rx.lock().await.take() else {
+            return;
+        };
+        let inner = self.clone();
+
+        tokio::spawn(async move {
+            while let Some(mut action) = rx.recv().await {
+                loop {
+                    let is_leader = inner.leader.lock().await.leader == Some(inner.address);
+                    if is_leader {
+                        let authority = {
+                            let state = inner.state.lock().await;
+                            let state_clone = state.state_clone().await;
+                            state_clone.state().authority(action)
+                        };
+                        inner
+                            .state
+                            .lock()
+                            .await
+                            .apply_authority(RecoverableStateAction::StateAction { action: authority })
+                            .await;
+                        break;
+                    }
+
+                    let follow_tx = inner.follow.lock().await.as_ref().map(|follow| follow.to_peer.clone());
+
+                    if let Some(follow_tx) = follow_tx {
+                        match follow_tx
+                            .send(SyncRequest::Action {
+                                source: inner.address,
+                                action,
+                            })
+                            .await
+                        {
+                            Ok(()) => break,
+                            Err(error) => {
+                                action = match error.0 {
+                                    SyncRequest::Action { action, .. } => action,
+                                    _ => unreachable!("sent action request"),
+                                };
+                            }
+                        }
+                    }
+
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        });
+    }
+
     pub async fn discover_peers(&self, peers: impl Iterator<Item = impl Into<SharePeerDetails<A>>>) {
         let mut peers_lock = self.peers.lock().await;
         let mut election = self.election.lock().await;
@@ -795,28 +875,7 @@ where
         }
 
         self.mark_connected(target, 0).await;
-        self.spawn_action_forward(write.clone(), cancel.clone());
         self.spawn_follow_reader(target, read, cancel);
-    }
-
-    fn spawn_action_forward(&self, write: mpsc::Sender<SyncRequest<I::Address, D>>, cancel: CancellationToken) {
-        let mut actions = self.inner.actions_tx.subscribe();
-
-        tokio::spawn(async move {
-            loop {
-                let recv = tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    recv = actions.recv() => recv,
-                };
-                let Ok((source, action)) = recv else {
-                    break;
-                };
-
-                if write.send(SyncRequest::Action { source, action }).await.is_err() {
-                    break;
-                }
-            }
-        });
     }
 
     fn spawn_follow_reader(
@@ -1082,7 +1141,7 @@ where
             return;
         }
 
-        let _ = self.inner.actions_tx.send((source, action));
+        tracing::warn!(?source, "dropping remote action because no leader path is available");
     }
 
     async fn handle_leader_status(&self, address: A, status: LeaderStatus<A>) {

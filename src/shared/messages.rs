@@ -272,11 +272,7 @@ where
         sum += 1u16.write_to(out)?;
         sum += self.address.write_to(out)?;
         sum += self.can_be_leader.write_to(out)?;
-        sum += self
-            .last_global_activity
-            .map(|v| v.get())
-            .unwrap_or(0)
-            .write_to(out)?;
+        sum += self.last_global_activity.map(|v| v.get()).unwrap_or(0).write_to(out)?;
         Ok(sum)
     }
 
@@ -352,10 +348,7 @@ where
             1 => Self::Pong(MessageEncoding::read_from(read)?),
             2 => Self::Accepted(MessageEncoding::read_from(read)?),
             3 => Self::FreshState(MessageEncoding::read_from(read)?),
-            4 => Self::AuthorityAction(
-                MessageEncoding::read_from(read)?,
-                MessageEncoding::read_from(read)?,
-            ),
+            4 => Self::AuthorityAction(MessageEncoding::read_from(read)?, MessageEncoding::read_from(read)?),
             5 => Self::LeaderPath(read_vec(read)?),
             6 => Self::Peers(read_vec(read)?),
             7 => Self::Ok,
@@ -369,10 +362,7 @@ where
     }
 }
 
-fn write_vec<T: MessageEncoding, W: std::io::Write>(
-    v: &[T],
-    out: &mut W,
-) -> std::io::Result<usize> {
+fn write_vec<T: MessageEncoding, W: std::io::Write>(v: &[T], out: &mut W) -> std::io::Result<usize> {
     let mut sum = (v.len() as u64).write_to(out)?;
     for i in v {
         sum += i.write_to(out)?;
@@ -389,10 +379,7 @@ fn read_vec<T: MessageEncoding, R: std::io::Read>(read: &mut R) -> std::io::Resu
     Ok(vec)
 }
 
-fn write_opt_vec<T: MessageEncoding, W: std::io::Write>(
-    v: &Option<Vec<T>>,
-    out: &mut W,
-) -> std::io::Result<usize> {
+fn write_opt_vec<T: MessageEncoding, W: std::io::Write>(v: &Option<Vec<T>>, out: &mut W) -> std::io::Result<usize> {
     let mut sum = v.is_some().write_to(out)?;
     if let Some(v) = v {
         sum += write_vec(v, out)?;
@@ -400,9 +387,7 @@ fn write_opt_vec<T: MessageEncoding, W: std::io::Write>(
     Ok(sum)
 }
 
-fn read_opt_vec<T: MessageEncoding, R: std::io::Read>(
-    read: &mut R,
-) -> std::io::Result<Option<Vec<T>>> {
+fn read_opt_vec<T: MessageEncoding, R: std::io::Read>(read: &mut R) -> std::io::Result<Option<Vec<T>>> {
     if bool::read_from(read)? {
         Ok(Some(read_vec(read)?))
     } else {

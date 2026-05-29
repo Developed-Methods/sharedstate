@@ -16,19 +16,8 @@ pub trait SyncIOAddress:
 {
 }
 
-impl<
-        T: Debug
-            + Clone
-            + Copy
-            + Send
-            + Sync
-            + PartialEq
-            + Eq
-            + Ord
-            + Hash
-            + MessageEncoding
-            + 'static,
-    > SyncIOAddress for T
+impl<T: Debug + Clone + Copy + Send + Sync + PartialEq + Eq + Ord + Hash + MessageEncoding + 'static> SyncIOAddress
+    for T
 {
 }
 
@@ -37,10 +26,7 @@ pub trait SyncIO: Sized + Send + Sync + 'static {
     type Read: AsyncRead + Send + Unpin + 'static;
     type Write: AsyncWrite + Send + Unpin + 'static;
 
-    fn connect(
-        &self,
-        remote: &Self::Address,
-    ) -> impl Future<Output = std::io::Result<SyncConnection<Self>>> + Send;
+    fn connect(&self, remote: &Self::Address) -> impl Future<Output = std::io::Result<SyncConnection<Self>>> + Send;
 }
 
 pub trait SyncIOListener: SyncIO {
@@ -57,11 +43,7 @@ impl<I: SyncIO> SyncConnection<I> {
     pub fn client_channels<D: DeterministicState>(
         self,
         settings: NetIoSettings,
-    ) -> (
-        I::Address,
-        Sender<SyncRequest<I::Address, D>>,
-        Receiver<SyncResponse<I::Address, D>>,
-    )
+    ) -> (I::Address, Sender<SyncRequest<I::Address, D>>, Receiver<SyncResponse<I::Address, D>>)
     where
         D: MessageEncoding,
         D::Action: MessageEncoding,
@@ -73,11 +55,7 @@ impl<I: SyncIO> SyncConnection<I> {
     pub fn server_channels<D: DeterministicState>(
         self,
         settings: NetIoSettings,
-    ) -> (
-        I::Address,
-        Sender<SyncResponse<I::Address, D>>,
-        Receiver<SyncRequest<I::Address, D>>,
-    )
+    ) -> (I::Address, Sender<SyncResponse<I::Address, D>>, Receiver<SyncRequest<I::Address, D>>)
     where
         D: MessageEncoding,
         D::Action: MessageEncoding,
@@ -86,10 +64,7 @@ impl<I: SyncIO> SyncConnection<I> {
         self.channels(settings)
     }
 
-    fn channels<
-        W: MessageEncoding + Send + Sync + 'static,
-        R: MessageEncoding + Send + Sync + 'static,
-    >(
+    fn channels<W: MessageEncoding + Send + Sync + 'static, R: MessageEncoding + Send + Sync + 'static>(
         self,
         settings: NetIoSettings,
     ) -> (I::Address, Sender<W>, Receiver<R>) {
