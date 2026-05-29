@@ -1,11 +1,12 @@
 use std::{
     collections::BTreeMap,
-    io::{Error, ErrorKind, Result, Write},
+    io::{Error, ErrorKind, Result},
     sync::Arc,
 };
 
 use clap::Parser;
 use message_encoding::MessageEncoding;
+use rustyline::{error::ReadlineError, DefaultEditor};
 use sharedstate::{
     net::{
         message_channel::NetIoSettings,
@@ -14,12 +15,9 @@ use sharedstate::{
     shared::node::{NodeActionSender, NodeDebugInfo, NodeState, SendActionError},
     state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
 };
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpListener, TcpStream,
-    },
+use tokio::net::{
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+    TcpListener, TcpStream,
 };
 
 #[derive(Parser, Debug)]
@@ -201,20 +199,22 @@ async fn main() -> Result<()> {
 
     let actions = node.action_sender();
     let mut handle = node.create_state_handle();
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+    let mut editor = DefaultEditor::new()
+        .map_err(|error| Error::new(ErrorKind::Other, format!("failed to initialize terminal editor: {error}")))?;
 
     loop {
-        print!("kv> ");
-        std::io::stdout().flush()?;
-
-        let Some(line) = lines.next_line().await? else {
-            break;
+        let line = match editor.readline("kv> ") {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+            Err(error) => {
+                return Err(Error::new(ErrorKind::Other, format!("failed to read terminal input: {error}")));
+            }
         };
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
+        let _ = editor.add_history_entry(line);
 
         let mut parts = line.splitn(2, char::is_whitespace);
         let command = parts.next().unwrap_or_default();
