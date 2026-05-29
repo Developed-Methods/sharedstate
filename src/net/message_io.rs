@@ -79,15 +79,11 @@ impl From<ReadMessageError> for std::io::Error {
     fn from(value: ReadMessageError) -> Self {
         match value {
             ReadMessageError::MessageReadTimeout | ReadMessageError::NextMessageTimeout(_) => {
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "timeout reading remaining message data",
-                )
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout reading remaining message data")
             }
-            ReadMessageError::Closed => std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "end of file reading message",
-            ),
+            ReadMessageError::Closed => {
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "end of file reading message")
+            }
             ReadMessageError::SizeReadError(e)
             | ReadMessageError::MessageReadError(e)
             | ReadMessageError::EncodingError(e) => e,
@@ -96,8 +92,7 @@ impl From<ReadMessageError> for std::io::Error {
 }
 
 pub async fn send_zero_message<W: AsyncWrite + Unpin>(out: &mut W) -> std::io::Result<()> {
-    out.write_all(&(0 as MessageSizeHeader).to_be_bytes())
-        .await?;
+    out.write_all(&(0 as MessageSizeHeader).to_be_bytes()).await?;
     out.flush().await
 }
 
@@ -120,23 +115,15 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
     assert_eq!(buffer.len(), MESSAGE_HEADER_SIZE);
 
     let bytes_written = message.write_to(buffer)?;
-    assert_eq!(
-        bytes_written + MESSAGE_HEADER_SIZE,
-        buffer.len(),
-        "M::write_to returned incorrect number of bytes"
-    );
+    assert_eq!(bytes_written + MESSAGE_HEADER_SIZE, buffer.len(), "M::write_to returned incorrect number of bytes");
 
     /* if static size is known, we've already written size with MAX_SIZE var */
     if let Some(size) = M::STATIC_SIZE {
-        assert_eq!(
-            size, bytes_written,
-            "M::STATIC_SIZE does not match M::write_to"
-        );
+        assert_eq!(size, bytes_written, "M::STATIC_SIZE does not match M::write_to");
     }
     /* write size to start of buffer */
     else {
-        buffer[..MESSAGE_HEADER_SIZE]
-            .copy_from_slice(&(bytes_written as MessageSizeHeader).to_be_bytes());
+        buffer[..MESSAGE_HEADER_SIZE].copy_from_slice(&(bytes_written as MessageSizeHeader).to_be_bytes());
     }
 
     /* note: send in batches with timeout to ensure connection isn't hanging and we also can
@@ -148,12 +135,7 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
                 written += bytes;
             }
             Ok(Err(error)) => return Err(error),
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "timeout writing data",
-                ))
-            }
+            Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout writing data")),
         }
     }
 

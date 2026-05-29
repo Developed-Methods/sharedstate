@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use sequenced_broadcast::{
-    SequencedBroadcast, SequencedReceiver, SequencedRecvError, SequencedSender, SubscribeError,
-};
+use sequenced_broadcast::{SequencedBroadcast, SequencedReceiver, SequencedRecvError, SequencedSender, SubscribeError};
 use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -25,8 +23,7 @@ impl<D: DeterministicState> AuthorativeState<D> {
     pub async fn new(state: RecoverableState<D>) -> Self {
         let next_seq = state.accept_seq();
 
-        let (authority_broadcast, authority_tx) =
-            SequencedBroadcast::new(next_seq, Default::default()).unwrap();
+        let (authority_broadcast, authority_tx) = SequencedBroadcast::new(next_seq, Default::default()).unwrap();
 
         let shared_state = SharedState::new(state);
         let state_reader = shared_state.create_reader();
@@ -73,20 +70,13 @@ impl<D: DeterministicState> AuthorativeState<D> {
 
     pub async fn subscribe(
         &self,
-    ) -> (
-        RecoverableState<D>,
-        SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
-    ) {
+    ) -> (RecoverableState<D>, SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>) {
         for _ in 0..16 {
             let mut handle = self.state_handle.lock().await;
 
             let state_borrow = handle.read();
 
-            let Ok(sub) = self
-                .authority_broadcast
-                .subscribe_from(state_borrow.accept_seq())
-                .await
-            else {
+            let Ok(sub) = self.authority_broadcast.subscribe_from(state_borrow.accept_seq()).await else {
                 handle.quiescent();
                 drop(handle);
 
@@ -121,20 +111,14 @@ impl<D: DeterministicState> AuthorativeState<D> {
     pub async fn reset(&mut self, state: RecoverableState<D>) {
         self.authority_tx.close();
 
-        let join_handle = self
-            .state_join
-            .take()
-            .expect("state worker handle is missing");
+        let join_handle = self.state_join.take().expect("state worker handle is missing");
 
-        let mut shared_state = join_handle
-            .await
-            .expect("state worker got error, cannot receive state");
+        let mut shared_state = join_handle.await.expect("state worker got error, cannot receive state");
 
         let next_seq = state.accept_seq();
         shared_state.reset(state);
 
-        let (authority_broadcast, authority_tx) =
-            SequencedBroadcast::new(next_seq, Default::default()).unwrap();
+        let (authority_broadcast, authority_tx) = SequencedBroadcast::new(next_seq, Default::default()).unwrap();
 
         let worker = StateMaintainWorker {
             actions_rx: authority_broadcast

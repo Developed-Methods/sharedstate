@@ -175,7 +175,7 @@ impl MessageEncoding for KvStore {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = tracing_subscriber::fmt::try_init();
+    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     let args = Args::parse();
     let io = Arc::new(LocalhostIo::bind(args.port).await?);
     let node = NodeState::new(

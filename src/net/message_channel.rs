@@ -99,22 +99,11 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
                 Some(msg) => {
                     tokio::time::timeout(
                         self.settings.process_timeout,
-                        send_message(
-                            &mut buffer,
-                            &msg,
-                            &mut self.output,
-                            self.settings.process_timeout,
-                        ),
+                        send_message(&mut buffer, &msg, &mut self.output, self.settings.process_timeout),
                     )
                     .await
                 }
-                None => {
-                    tokio::time::timeout(
-                        self.settings.process_timeout,
-                        send_zero_message(&mut self.output),
-                    )
-                    .await
-                }
+                None => tokio::time::timeout(self.settings.process_timeout, send_zero_message(&mut self.output)).await,
             };
 
             if let Err(error) = send_res {

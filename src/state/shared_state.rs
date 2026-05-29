@@ -57,9 +57,7 @@ impl<D: DeterministicState> SharedState<D> {
     }
 
     pub fn reset(&mut self, state: D) {
-        self.inner
-            .hot
-            .queue_update(HotSharedStateUpdate::Reset(state));
+        self.inner.hot.queue_update(HotSharedStateUpdate::Reset(state));
     }
 
     pub fn maintain_state(&self) {
@@ -96,10 +94,7 @@ struct HotState<D: DeterministicState> {
 
 #[derive(Clone)]
 enum HotSharedStateUpdate<D: DeterministicState> {
-    Authority {
-        seq: u64,
-        action: D::AuthorityAction,
-    },
+    Authority { seq: u64, action: D::AuthorityAction },
     Reset(D),
 }
 

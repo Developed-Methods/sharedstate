@@ -109,8 +109,7 @@ impl RecoverableStateDetails {
 
         /* if in same generation, follow cannot be ahead of leader */
         if self.generation == follower.generation {
-            return self.id == follower.id
-                && follower.inner_state_next_seq <= self.inner_state_next_seq;
+            return self.id == follower.id && follower.inner_state_next_seq <= self.inner_state_next_seq;
         }
 
         let depth = (self.generation - follower.generation) as usize;
@@ -167,9 +166,7 @@ impl<D: DeterministicState> DeterministicState for RecoverableState<D> {
             RecoverableStateAction::StateAction { action } => RecoverableStateAction::StateAction {
                 action: self.state.authority(action),
             },
-            RecoverableStateAction::BumpGeneration { new_id } => {
-                RecoverableStateAction::BumpGeneration { new_id }
-            }
+            RecoverableStateAction::BumpGeneration { new_id } => RecoverableStateAction::BumpGeneration { new_id },
         }
     }
 
