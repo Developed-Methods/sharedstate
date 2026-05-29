@@ -39,10 +39,46 @@ use crate::{
 
 static PROMOTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const PROTOCOL_VERSION: u64 = 1;
-const OBSERVATION_STALE_MS: u64 = 15_000;
-const OBSERVATION_INTERVAL: Duration = Duration::from_secs(3);
-const FOLLOW_RETRY_INTERVAL: Duration = Duration::from_secs(1);
-const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(not(test))]
+fn observation_stale_ms() -> u64 {
+    15_000
+}
+
+#[cfg(test)]
+fn observation_stale_ms() -> u64 {
+    300
+}
+
+#[cfg(not(test))]
+fn observation_interval() -> Duration {
+    Duration::from_secs(3)
+}
+
+#[cfg(test)]
+fn observation_interval() -> Duration {
+    Duration::from_millis(50)
+}
+
+#[cfg(not(test))]
+fn follow_retry_interval() -> Duration {
+    Duration::from_secs(1)
+}
+
+#[cfg(test)]
+fn follow_retry_interval() -> Duration {
+    Duration::from_millis(50)
+}
+
+#[cfg(not(test))]
+fn rpc_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+#[cfg(test)]
+fn rpc_timeout() -> Duration {
+    Duration::from_millis(150)
+}
 
 pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
     inner: Arc<Inner<A, D>>,
@@ -566,9 +602,29 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         }
     }
 
-    async fn record_observation(&self, observation: ElectionObservation<A>) {
+    async fn record_observation(&self, mut observation: ElectionObservation<A>) {
         if observation.can_lead {
             self.election.lock().await.known_can_lead.insert(observation.observer);
+        }
+
+        if let Some(leader) = observation.leader {
+            if leader != observation.observer {
+                let leader_is_failed = self
+                    .peers
+                    .lock()
+                    .await
+                    .get(&leader)
+                    .and_then(|details| details.as_ref())
+                    .map(|details| {
+                        !details.connected && details.last_activity.is_none() && details.last_connect_fail.is_some()
+                    })
+                    .unwrap_or(false);
+
+                if leader_is_failed {
+                    observation.leader = None;
+                    observation.leader_path = None;
+                }
+            }
         }
 
         self.election
@@ -630,7 +686,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                 let Some(last_activity) = details.last_activity else {
                     continue;
                 };
-                if OBSERVATION_STALE_MS < now.saturating_sub(last_activity.get()) {
+                if observation_stale_ms() < now.saturating_sub(last_activity.get()) {
                     continue;
                 }
             }
@@ -679,7 +735,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                             .get(addr)
                             .and_then(|d| d.as_ref())
                             .and_then(|d| d.last_activity)
-                            .map(|ts| now.saturating_sub(ts.get()) <= OBSERVATION_STALE_MS)
+                            .map(|ts| now.saturating_sub(ts.get()) <= observation_stale_ms())
                             .unwrap_or(false)
                 })
                 .next()
@@ -698,7 +754,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                         .get(addr)
                         .and_then(|d| d.as_ref())
                         .and_then(|d| d.last_activity)
-                        .map(|ts| now.saturating_sub(ts.get()) <= OBSERVATION_STALE_MS)
+                        .map(|ts| now.saturating_sub(ts.get()) <= observation_stale_ms())
                         .unwrap_or(false)
             })
             .count();
@@ -713,6 +769,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         if leader != self.address {
             let path = valid_leaders.get(&leader).and_then(|(_, path)| path.clone());
             if path.is_none() {
+                self.clear_remote_leader_if(leader).await;
                 return;
             }
             let mut lock = self.leader.lock().await;
@@ -758,6 +815,22 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             follow.cancel.cancel();
         }
     }
+
+    async fn clear_remote_leader_if(&self, leader_addr: A) {
+        let mut leader = self.leader.lock().await;
+        if leader.leader == Some(leader_addr) && leader.leader != Some(self.address) {
+            leader.leader = None;
+            leader.path = None;
+        }
+    }
+
+    async fn clear_remote_leader(&self) {
+        let mut leader = self.leader.lock().await;
+        if leader.leader.is_some() && leader.leader != Some(self.address) {
+            leader.leader = None;
+            leader.path = None;
+        }
+    }
 }
 
 struct ClientWorker<I: SyncIO, D: DeterministicState> {
@@ -778,7 +851,7 @@ where
             self.observe_can_lead_peers().await;
             self.inner.apply_election().await;
             self.ensure_follow_connection().await;
-            tokio::time::sleep(OBSERVATION_INTERVAL).await;
+            tokio::time::sleep(observation_interval()).await;
         }
     }
 
@@ -810,7 +883,7 @@ where
     async fn observe_peer(&self, target: I::Address) {
         self.mark_connect_attempt(target).await;
 
-        let Ok(Ok(conn)) = tokio::time::timeout(RPC_TIMEOUT, self.io.connect(&target)).await else {
+        let Ok(Ok(conn)) = tokio::time::timeout(rpc_timeout(), self.io.connect(&target)).await else {
             self.mark_connect_fail(target).await;
             return;
         };
@@ -869,7 +942,7 @@ where
         }
 
         let Some(target) = self.select_follow_target(leader).await else {
-            tokio::time::sleep(FOLLOW_RETRY_INTERVAL).await;
+            tokio::time::sleep(follow_retry_interval()).await;
             return;
         };
 
@@ -914,7 +987,7 @@ where
     async fn connect_follow(&self, target: I::Address, selected_leader: Option<I::Address>) {
         self.mark_connect_attempt(target).await;
 
-        let Ok(Ok(conn)) = tokio::time::timeout(RPC_TIMEOUT, self.io.connect(&target)).await else {
+        let Ok(Ok(conn)) = tokio::time::timeout(rpc_timeout(), self.io.connect(&target)).await else {
             self.mark_connect_fail(target).await;
             return;
         };
@@ -1068,11 +1141,7 @@ where
             if let Some(follow) = inner.follow.lock().await.take() {
                 if follow.remote == target {
                     follow.cancel.cancel();
-                    let mut leader = inner.leader.lock().await;
-                    if leader.leader != Some(inner.address) {
-                        leader.leader = None;
-                        leader.path = None;
-                    }
+                    inner.clear_remote_leader().await;
                 } else {
                     let _ = inner.follow.lock().await.replace(follow);
                 }
@@ -1088,14 +1157,35 @@ where
     }
 
     async fn mark_connect_fail(&self, target: I::Address) {
-        let mut peers = self.inner.peers.lock().await;
-        if let Some(Some(details)) = peers.get_mut(&target) {
-            details.last_activity = None;
-            details.last_connect_fail = NonZeroU64::new(now_ms());
-            details.repeat_connect_fails = details.repeat_connect_fails.saturating_add(1);
-            details.connected = false;
-            details.last_observation = None;
+        {
+            let mut peers = self.inner.peers.lock().await;
+            if let Some(Some(details)) = peers.get_mut(&target) {
+                details.last_activity = None;
+                details.last_connect_fail = NonZeroU64::new(now_ms());
+                details.repeat_connect_fails = details.repeat_connect_fails.saturating_add(1);
+                details.connected = false;
+                details.last_observation = None;
+            }
+
+            for details in peers.values_mut().filter_map(Option::as_mut) {
+                if details
+                    .last_observation
+                    .as_ref()
+                    .and_then(|observation| observation.leader)
+                    == Some(target)
+                {
+                    details.last_observation = None;
+                }
+            }
         }
+
+        self.inner
+            .election
+            .lock()
+            .await
+            .observations
+            .retain(|observer, observation| *observer != target && observation.leader != Some(target));
+        self.inner.clear_remote_leader_if(target).await;
     }
 
     async fn mark_connected(&self, target: I::Address, latency_ms: u64) {
@@ -1375,7 +1465,7 @@ where
     A: SyncIOAddress,
     D: DeterministicState,
 {
-    tokio::time::timeout(RPC_TIMEOUT, read.recv()).await.ok().flatten()
+    tokio::time::timeout(rpc_timeout(), read.recv()).await.ok().flatten()
 }
 
 fn valid_remote_leader_path<A: SyncIOAddress>(leader: Option<A>, path: &[A], local: A) -> bool {
@@ -1431,16 +1521,31 @@ fn generation_id<A: SyncIOAddress>(address: A) -> u64 {
 mod test {
     use super::*;
     use crate::net::message_channel::NetIoSettings;
+    use std::{
+        collections::BTreeMap,
+        pin::Pin,
+        sync::{Arc as StdArc, Mutex as StdMutex},
+        task::{Context, Poll},
+    };
+    use tokio::{
+        io::{duplex, split, AsyncRead, AsyncWrite, DuplexStream, ReadBuf, ReadHalf, WriteHalf},
+        sync::oneshot,
+    };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct TestState {
         seq: u64,
-        value: u64,
+        values: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum TestAction {
+        Set { key: String, value: String },
     }
 
     impl DeterministicState for TestState {
-        type Action = u64;
-        type AuthorityAction = u64;
+        type Action = TestAction;
+        type AuthorityAction = TestAction;
 
         fn accept_seq(&self) -> u64 {
             self.seq
@@ -1451,32 +1556,362 @@ mod test {
         }
 
         fn update(&mut self, action: &Self::AuthorityAction) {
-            self.value += *action;
+            match action {
+                TestAction::Set { key, value } => {
+                    self.values.insert(key.clone(), value.clone());
+                }
+            }
             self.seq += 1;
+        }
+    }
+
+    impl MessageEncoding for TestAction {
+        fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
+            let mut sum = 0;
+            sum += match self {
+                Self::Set { key, value } => {
+                    sum += 1u16.write_to(out)?;
+                    sum += key.write_to(out)?;
+                    value.write_to(out)?
+                }
+            };
+            Ok(sum)
+        }
+
+        fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
+            match u16::read_from(read)? {
+                1 => Ok(Self::Set {
+                    key: MessageEncoding::read_from(read)?,
+                    value: MessageEncoding::read_from(read)?,
+                }),
+                id => Err(crate::utils::unknown_id_err(id, "TestAction")),
+            }
         }
     }
 
     impl MessageEncoding for TestState {
         fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
-            Ok(self.seq.write_to(out)? + self.value.write_to(out)?)
+            let mut sum = 0;
+            sum += self.seq.write_to(out)?;
+            sum += (self.values.len() as u64).write_to(out)?;
+            for (key, value) in &self.values {
+                sum += key.write_to(out)?;
+                sum += value.write_to(out)?;
+            }
+            Ok(sum)
         }
 
         fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
-            Ok(Self {
-                seq: MessageEncoding::read_from(read)?,
-                value: MessageEncoding::read_from(read)?,
-            })
+            let seq = MessageEncoding::read_from(read)?;
+            let len = u64::read_from(read)? as usize;
+            let mut values = BTreeMap::new();
+            for _ in 0..len {
+                values.insert(MessageEncoding::read_from(read)?, MessageEncoding::read_from(read)?);
+            }
+            Ok(Self { seq, values })
         }
     }
 
     async fn node(address: u64, can_lead: bool) -> NodeState<u64, TestState> {
         NodeState::new(
             address,
-            RecoverableState::new(address, TestState { seq: 1, value: 0 }),
+            RecoverableState::new(
+                address,
+                TestState {
+                    seq: 1,
+                    values: BTreeMap::new(),
+                },
+            ),
             can_lead,
             NetIoSettings::default(),
         )
         .await
+    }
+
+    struct TestIncoming {
+        remote: u64,
+        read: KillableIo<ReadHalf<DuplexStream>>,
+        write: KillableIo<WriteHalf<DuplexStream>>,
+    }
+
+    #[derive(Clone)]
+    struct TestNet {
+        inner: Arc<Mutex<TestNetInner>>,
+    }
+
+    struct TestNetInner {
+        listeners: HashMap<u64, mpsc::Sender<TestIncoming>>,
+        active_connections: HashMap<u64, Vec<KillHandle>>,
+        blocked_nodes: HashSet<u64>,
+        blocked_edges: HashSet<(u64, u64)>,
+    }
+
+    impl TestNet {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(TestNetInner {
+                    listeners: HashMap::new(),
+                    active_connections: HashMap::new(),
+                    blocked_nodes: HashSet::new(),
+                    blocked_edges: HashSet::new(),
+                })),
+            }
+        }
+
+        async fn start_io(&self, address: u64) -> Arc<TestIo> {
+            let (tx, rx) = mpsc::channel(128);
+            self.inner.lock().await.listeners.insert(address, tx);
+            Arc::new(TestIo {
+                address,
+                net: self.clone(),
+                incoming: Arc::new(Mutex::new(rx)),
+            })
+        }
+
+        async fn stop_node(&self, address: u64) {
+            let handles = {
+                let mut inner = self.inner.lock().await;
+                inner.listeners.remove(&address);
+                inner.active_connections.remove(&address).unwrap_or_default()
+            };
+
+            for handle in handles {
+                handle.kill();
+            }
+        }
+
+        fn edge_key(a: u64, b: u64) -> (u64, u64) {
+            if a < b {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestIo {
+        address: u64,
+        net: TestNet,
+        incoming: Arc<Mutex<mpsc::Receiver<TestIncoming>>>,
+    }
+
+    impl SyncIO for TestIo {
+        type Address = u64;
+        type Read = KillableIo<ReadHalf<DuplexStream>>;
+        type Write = KillableIo<WriteHalf<DuplexStream>>;
+
+        async fn connect(&self, remote: &Self::Address) -> std::io::Result<SyncConnection<Self>> {
+            let (tx, handles) = {
+                let mut net = self.net.inner.lock().await;
+                if net.blocked_nodes.contains(&self.address)
+                    || net.blocked_nodes.contains(remote)
+                    || net.blocked_edges.contains(&TestNet::edge_key(self.address, *remote))
+                {
+                    return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "connection blocked"));
+                }
+                let tx = net.listeners.get(remote).cloned();
+                let handles = [
+                    KillHandle::new(),
+                    KillHandle::new(),
+                    KillHandle::new(),
+                    KillHandle::new(),
+                ];
+                let active = net.active_connections.entry(self.address).or_default();
+                active.extend(handles.iter().map(|(handle, _)| handle.clone()));
+                let active = net.active_connections.entry(*remote).or_default();
+                active.extend(handles.iter().map(|(handle, _)| handle.clone()));
+                (tx, handles)
+            };
+
+            let Some(tx) = tx else {
+                return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "remote offline"));
+            };
+
+            let (client, server) = duplex(64 * 1024);
+            let (client_read, client_write) = split(client);
+            let (server_read, server_write) = split(server);
+            let [(client_read_handle, client_read_kill), (client_write_handle, client_write_kill), (server_read_handle, server_read_kill), (server_write_handle, server_write_kill)] =
+                handles;
+            drop((client_read_handle, client_write_handle, server_read_handle, server_write_handle));
+
+            tx.send(TestIncoming {
+                remote: self.address,
+                read: KillableIo::new(server_read, server_read_kill),
+                write: KillableIo::new(server_write, server_write_kill),
+            })
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotConnected, "remote listener closed"))?;
+
+            Ok(SyncConnection {
+                remote: *remote,
+                read: KillableIo::new(client_read, client_read_kill),
+                write: KillableIo::new(client_write, client_write_kill),
+            })
+        }
+    }
+
+    impl SyncIOListener for TestIo {
+        async fn next_client(&self) -> std::io::Result<SyncConnection<Self>> {
+            let incoming = self
+                .incoming
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "listener closed"))?;
+            Ok(SyncConnection {
+                remote: incoming.remote,
+                read: incoming.read,
+                write: incoming.write,
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct KillHandle(StdArc<StdMutex<Option<oneshot::Sender<()>>>>);
+
+    impl KillHandle {
+        fn new() -> (Self, oneshot::Receiver<()>) {
+            let (tx, rx) = oneshot::channel();
+            (Self(StdArc::new(StdMutex::new(Some(tx)))), rx)
+        }
+
+        fn kill(&self) {
+            if let Some(tx) = self.0.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    struct KillableIo<I> {
+        inner: I,
+        kill: oneshot::Receiver<()>,
+        killed: bool,
+    }
+
+    impl<I> KillableIo<I> {
+        fn new(inner: I, kill: oneshot::Receiver<()>) -> Self {
+            Self {
+                inner,
+                kill,
+                killed: false,
+            }
+        }
+
+        fn poll_kill(&mut self, cx: &mut Context<'_>) -> Option<Poll<std::io::Result<()>>> {
+            if self.killed {
+                return Some(Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection killed",
+                ))));
+            }
+
+            match Pin::new(&mut self.kill).poll(cx) {
+                Poll::Ready(_) => {
+                    self.killed = true;
+                    Some(Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection killed"))))
+                }
+                Poll::Pending => None,
+            }
+        }
+    }
+
+    impl<I: AsyncRead + Unpin> AsyncRead for KillableIo<I> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(kill) = self.poll_kill(cx) {
+                return kill;
+            }
+
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<I: AsyncWrite + Unpin> AsyncWrite for KillableIo<I> {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            if let Some(kill) = self.poll_kill(cx) {
+                return match kill {
+                    Poll::Ready(Ok(())) => unreachable!(),
+                    Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                    Poll::Pending => Poll::Pending,
+                };
+            }
+
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if let Some(kill) = self.poll_kill(cx) {
+                return kill;
+            }
+
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if let Some(kill) = self.poll_kill(cx) {
+                return kill;
+            }
+
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    struct TestClusterNode {
+        address: u64,
+        node: NodeState<u64, TestState>,
+        listener: JoinHandle<()>,
+        client: JoinHandle<()>,
+        actions: NodeActionSender<TestAction>,
+    }
+
+    impl TestClusterNode {
+        async fn stop(self, net: &TestNet) {
+            self.listener.abort();
+            self.client.abort();
+            net.stop_node(self.address).await;
+        }
+    }
+
+    async fn start_cluster_node(net: &TestNet, address: u64, can_lead: bool, peers: &[u64]) -> TestClusterNode {
+        let io = net.start_io(address).await;
+        let node = node(address, can_lead).await;
+        node.discover_peers(peers.iter().copied()).await;
+        let listener = node.start_listener(io.clone()).await;
+        let client = node.start_client(io.clone()).await;
+        let actions = node.action_sender();
+        TestClusterNode {
+            address,
+            node,
+            listener,
+            client,
+            actions,
+        }
+    }
+
+    async fn wait_until<F, Fut>(timeout: Duration, mut check: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if check().await {
+                return true;
+            }
+            if deadline <= tokio::time::Instant::now() {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_leader(node: &NodeState<u64, TestState>, expected: Option<u64>, timeout: Duration) -> bool {
+        wait_until(timeout, || async { node.debug_info().await.leader == expected }).await
     }
 
     #[test]
@@ -1575,5 +2010,76 @@ mod test {
         assert_eq!(observation.leader, None);
         assert_eq!(observation.leader_path, None);
         assert_eq!(observation.term, 4);
+    }
+
+    #[tokio::test]
+    async fn leader_rejoin_then_second_failover_promotes_available_candidate() {
+        let net = TestNet::new();
+
+        let node7001 = start_cluster_node(&net, 7001, true, &[7002, 7003]).await;
+        let mut node7002 = Some(start_cluster_node(&net, 7002, true, &[7001, 7003]).await);
+        let node7003 = start_cluster_node(&net, 7003, false, &[7001, 7002]).await;
+
+        assert!(wait_for_leader(&node7001.node, Some(7001), Duration::from_secs(3)).await);
+        assert!(
+            wait_until(Duration::from_secs(3), || async {
+                let leader = node7002.as_ref().unwrap().node.debug_info().await.leader;
+                leader == Some(7001)
+            })
+            .await
+        );
+        assert!(wait_for_leader(&node7003.node, Some(7001), Duration::from_secs(3)).await);
+
+        node7001.stop(&net).await;
+
+        assert!(
+            wait_until(Duration::from_secs(3), || async {
+                let leader = node7002.as_ref().unwrap().node.debug_info().await.leader;
+                leader == Some(7002)
+            })
+            .await
+        );
+        assert!(wait_for_leader(&node7003.node, Some(7002), Duration::from_secs(3)).await);
+
+        node7002.take().unwrap().stop(&net).await;
+        assert!(wait_for_leader(&node7003.node, None, Duration::from_secs(3)).await);
+
+        let node7001 = start_cluster_node(&net, 7001, true, &[7002, 7003]).await;
+        assert!(wait_for_leader(&node7001.node, Some(7001), Duration::from_secs(3)).await);
+        assert!(wait_for_leader(&node7003.node, Some(7001), Duration::from_secs(3)).await);
+
+        let node7002_restarted = start_cluster_node(&net, 7002, true, &[7001, 7003]).await;
+        assert!(wait_for_leader(&node7002_restarted.node, Some(7001), Duration::from_secs(3)).await);
+
+        node7001.stop(&net).await;
+
+        if !wait_for_leader(&node7002_restarted.node, Some(7002), Duration::from_secs(3)).await {
+            panic!("{:#?}", node7002_restarted.node.debug_info().await);
+        }
+        let debug = node7002_restarted.node.debug_info().await;
+        assert_eq!(debug.leader_path, Some(vec![7002]));
+        assert_eq!(debug.follow_remote, None);
+
+        node7002_restarted
+            .actions
+            .send(TestAction::Set {
+                key: "after_failover".to_owned(),
+                value: "ok".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(3), || async {
+                let mut handle = node7002_restarted.node.create_state_handle();
+                let value = handle.read().state().values.get("after_failover").cloned();
+                handle.quiescent();
+                value.as_deref() == Some("ok")
+            })
+            .await
+        );
+
+        node7002_restarted.stop(&net).await;
+        node7003.stop(&net).await;
     }
 }
