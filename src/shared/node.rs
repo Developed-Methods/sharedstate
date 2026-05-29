@@ -690,8 +690,6 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             return;
         };
 
-        let known_count = known_can_lead.len().max(usize::from(self.can_lead));
-        let majority = known_count / 2 + 1;
         let reachable_count = known_can_lead
             .iter()
             .filter(|addr| {
@@ -704,6 +702,8 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                         .unwrap_or(false)
             })
             .count();
+        let active_can_lead_count = reachable_count.max(usize::from(self.can_lead));
+        let majority = active_can_lead_count / 2 + 1;
 
         if leader == self.address && self.can_lead && majority <= reachable_count {
             self.promote_if_needed(term).await;
@@ -712,6 +712,9 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
 
         if leader != self.address {
             let path = valid_leaders.get(&leader).and_then(|(_, path)| path.clone());
+            if path.is_none() {
+                return;
+            }
             let mut lock = self.leader.lock().await;
             if lock.term < term || lock.leader != Some(leader) {
                 lock.term = term;
@@ -1492,7 +1495,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn can_lead_node_does_not_promote_without_majority() {
+    async fn can_lead_node_promotes_when_other_can_lead_peers_are_inactive() {
         let node = node(2, true).await;
 
         node.inner
@@ -1516,8 +1519,8 @@ mod test {
         node.inner.apply_election().await;
 
         let leader = node.inner.leader.lock().await;
-        assert_eq!(leader.leader, None);
-        assert_eq!(leader.path, None);
+        assert_eq!(leader.leader, Some(2));
+        assert_eq!(leader.path, Some(vec![2]));
     }
 
     #[tokio::test]
