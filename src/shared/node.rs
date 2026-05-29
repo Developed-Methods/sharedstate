@@ -65,6 +65,39 @@ impl<Action> NodeActionSender<Action> {
     }
 }
 
+#[derive(Debug)]
+pub struct NodeDebugInfo<A: SyncIOAddress> {
+    pub address: A,
+    pub can_lead: bool,
+    pub leader: Option<A>,
+    pub leader_path: Option<Vec<A>>,
+    pub term: u64,
+    pub follow_remote: Option<A>,
+    pub follow_leader_path: Option<Vec<A>>,
+    pub known_can_lead: Vec<A>,
+    pub last_promoted_leader: Option<A>,
+    pub observations: Vec<ElectionObservation<A>>,
+    pub peers: Vec<PeerDebugInfo<A>>,
+}
+
+#[derive(Debug)]
+pub struct PeerDebugInfo<A: SyncIOAddress> {
+    pub address: A,
+    pub known: bool,
+    pub can_lead: Option<bool>,
+    pub connected: Option<bool>,
+    pub latency_ms: Option<u64>,
+    pub repeat_connect_fails: Option<u64>,
+    pub last_activity_ms_ago: Option<u64>,
+    pub last_global_activity_ms_ago: Option<u64>,
+    pub last_connect_attempt_ms_ago: Option<u64>,
+    pub last_connect_fail_ms_ago: Option<u64>,
+    pub observed_leader: Option<A>,
+    pub observed_term: Option<u64>,
+    pub observed_leader_path: Option<Vec<A>>,
+    pub observed_reachable_can_lead: Option<Vec<A>>,
+}
+
 struct Inner<A: SyncIOAddress, D: DeterministicState> {
     address: A,
     can_lead: bool,
@@ -187,6 +220,10 @@ where
         NodeActionSender {
             tx: self.inner.local_actions_tx.clone(),
         }
+    }
+
+    pub async fn debug_info(&self) -> NodeDebugInfo<A> {
+        self.inner.debug_info().await
     }
 
     pub async fn start_client<I>(&self, io: Arc<I>) -> JoinHandle<()>
@@ -408,6 +445,74 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             leader: leader.leader,
             path: leader.path.or(follow_path),
             term: leader.term,
+        }
+    }
+
+    async fn debug_info(&self) -> NodeDebugInfo<A> {
+        let now = now_ms();
+        let leader = self.leader.lock().await.clone();
+        let follow = self
+            .follow
+            .lock()
+            .await
+            .as_ref()
+            .map(|follow| (follow.remote, follow.leader_path.clone()));
+        let election = self.election.lock().await;
+        let peers = self.peers.lock().await;
+
+        let mut peer_debug = peers
+            .iter()
+            .map(|(address, details)| {
+                let observation = details.as_ref().and_then(|details| details.last_observation.clone());
+                PeerDebugInfo {
+                    address: *address,
+                    known: details.is_some(),
+                    can_lead: details.as_ref().map(|details| details.can_lead),
+                    connected: details.as_ref().map(|details| details.connected),
+                    latency_ms: details.as_ref().and_then(|details| details.latency_ms),
+                    repeat_connect_fails: details.as_ref().map(|details| details.repeat_connect_fails),
+                    last_activity_ms_ago: details
+                        .as_ref()
+                        .and_then(|details| details.last_activity)
+                        .map(|ts| now.saturating_sub(ts.get())),
+                    last_global_activity_ms_ago: details
+                        .as_ref()
+                        .and_then(|details| details.last_global_activity)
+                        .map(|ts| now.saturating_sub(ts.get())),
+                    last_connect_attempt_ms_ago: details
+                        .as_ref()
+                        .and_then(|details| details.last_connect_attempt)
+                        .map(|ts| now.saturating_sub(ts.get())),
+                    last_connect_fail_ms_ago: details
+                        .as_ref()
+                        .and_then(|details| details.last_connect_fail)
+                        .map(|ts| now.saturating_sub(ts.get())),
+                    observed_leader: observation.as_ref().and_then(|observation| observation.leader),
+                    observed_term: observation.as_ref().map(|observation| observation.term),
+                    observed_leader_path: observation
+                        .as_ref()
+                        .and_then(|observation| observation.leader_path.clone()),
+                    observed_reachable_can_lead: observation.map(|observation| observation.reachable_can_lead),
+                }
+            })
+            .collect::<Vec<_>>();
+        peer_debug.sort_by_key(|peer| peer.address);
+
+        let mut observations = election.observations.values().cloned().collect::<Vec<_>>();
+        observations.sort_by_key(|observation| observation.observer);
+
+        NodeDebugInfo {
+            address: self.address,
+            can_lead: self.can_lead,
+            leader: leader.leader,
+            leader_path: leader.path,
+            term: leader.term,
+            follow_remote: follow.as_ref().map(|(remote, _)| *remote),
+            follow_leader_path: follow.map(|(_, path)| path),
+            known_can_lead: election.known_can_lead.iter().copied().collect(),
+            last_promoted_leader: election.last_promoted_leader,
+            observations,
+            peers: peer_debug,
         }
     }
 

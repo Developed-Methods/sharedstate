@@ -11,7 +11,7 @@ use sharedstate::{
         message_channel::NetIoSettings,
         sync_io::{SyncConnection, SyncIO, SyncIOListener},
     },
-    shared::node::{NodeActionSender, NodeState, SendActionError},
+    shared::node::{NodeActionSender, NodeDebugInfo, NodeState, SendActionError},
     state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
 };
 use tokio::{
@@ -225,6 +225,7 @@ async fn main() -> Result<()> {
             "get" => handle_get(rest, &mut handle),
             "delete" => handle_delete(rest, &actions).await,
             "print" => handle_print(&mut handle),
+            "debug" => handle_debug(&node).await,
             "help" => print_help(),
             "quit" | "exit" => break,
             _ => println!("unknown command: {command}"),
@@ -301,6 +302,61 @@ fn handle_print(handle: &mut sharedstate::state::shared_state::SharedStateHandle
     }
 }
 
+async fn handle_debug(node: &NodeState<u16, KvStore>) {
+    print_debug(node.debug_info().await);
+}
+
+fn print_debug(debug: NodeDebugInfo<u16>) {
+    println!("node:");
+    println!("  address: {}", debug.address);
+    println!("  can_lead: {}", debug.can_lead);
+    println!("  term: {}", debug.term);
+    println!("  leader: {:?}", debug.leader);
+    println!("  leader_path: {:?}", debug.leader_path);
+    println!("  follow_remote: {:?}", debug.follow_remote);
+    println!("  follow_leader_path: {:?}", debug.follow_leader_path);
+    println!("  known_can_lead: {:?}", debug.known_can_lead);
+    println!("  last_promoted_leader: {:?}", debug.last_promoted_leader);
+
+    println!("peers:");
+    if debug.peers.is_empty() {
+        println!("  (none)");
+    }
+    for peer in debug.peers {
+        println!(
+            "  {} known={} can_lead={:?} connected={:?} latency_ms={:?} fails={:?}",
+            peer.address, peer.known, peer.can_lead, peer.connected, peer.latency_ms, peer.repeat_connect_fails
+        );
+        println!(
+            "    activity_ms_ago={:?} global_activity_ms_ago={:?} connect_attempt_ms_ago={:?} connect_fail_ms_ago={:?}",
+            peer.last_activity_ms_ago,
+            peer.last_global_activity_ms_ago,
+            peer.last_connect_attempt_ms_ago,
+            peer.last_connect_fail_ms_ago
+        );
+        println!(
+            "    observed_leader={:?} observed_term={:?} observed_path={:?} observed_reachable_can_lead={:?}",
+            peer.observed_leader, peer.observed_term, peer.observed_leader_path, peer.observed_reachable_can_lead
+        );
+    }
+
+    println!("observations:");
+    if debug.observations.is_empty() {
+        println!("  (none)");
+    }
+    for observation in debug.observations {
+        println!(
+            "  observer={} can_lead={} term={} leader={:?} path={:?} reachable_can_lead={:?}",
+            observation.observer,
+            observation.can_lead,
+            observation.term,
+            observation.leader,
+            observation.leader_path,
+            observation.reachable_can_lead
+        );
+    }
+}
+
 fn report_send(result: std::result::Result<(), SendActionError>) {
     match result {
         Ok(()) => println!("queued"),
@@ -309,5 +365,5 @@ fn report_send(result: std::result::Result<(), SendActionError>) {
 }
 
 fn print_help() {
-    println!("commands: set <key> <value>, get <key>, delete <key>, print, help, quit");
+    println!("commands: set <key> <value>, get <key>, delete <key>, print, debug, help, quit");
 }
