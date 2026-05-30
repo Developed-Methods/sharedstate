@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{duplex, split, AsyncRead, AsyncWrite, DuplexStream, ReadBuf, ReadHalf, WriteHalf},
     sync::{mpsc, oneshot, Mutex},
@@ -27,7 +27,7 @@ struct SimulatedNetInner {
     blocked_edges: HashSet<(u64, u64)>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SimulatedTopologySnapshot {
     pub online: BTreeSet<u64>,
     pub blocked_nodes: BTreeSet<u64>,

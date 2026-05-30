@@ -11,6 +11,56 @@ export interface SnapshotResponse {
   topology: SimulatedTopologySnapshot;
 }
 
+export interface OrchestratorRecording {
+  version: number;
+  events: RecordedOrchestratorEvent[];
+}
+
+export interface RecordedOrchestratorEvent {
+  before: SnapshotResponse;
+  before_checkpoint: ReplayCheckpoint;
+  action: OrchestratorAction;
+}
+
+export type OrchestratorAction =
+  | { type: "addNode"; address: number; can_lead: boolean; peers: number[] }
+  | { type: "startNode"; address: number }
+  | { type: "stopNode"; address: number }
+  | { type: "setNetworking"; address: number; disabled: boolean }
+  | { type: "setBlockedPeers"; address: number; blocked_peers: number[] }
+  | { type: "sendAction"; address: number; action: KvAction };
+
+export type KvAction =
+  | { type: "set"; key: string; value: string }
+  | { type: "delete"; key: string };
+
+export interface ReplayCheckpoint {
+  nodes: ReplayNodeCheckpoint[];
+  topology: ReplayTopologyCheckpoint;
+}
+
+export interface ReplayNodeCheckpoint {
+  address: number;
+  can_lead: boolean;
+  online: boolean;
+  networking_disabled: boolean;
+  blocked_peers: number[];
+  known_peers: number[];
+  leader: number | null;
+  leader_path: number[] | null;
+  follow_remote: number | null;
+  follow_leader_path: number[] | null;
+  known_can_lead: number[];
+  status: NodeStatus;
+  state: KvStore | null;
+}
+
+export interface ReplayTopologyCheckpoint {
+  online: number[];
+  blocked_nodes: number[];
+  blocked_edges: [number, number][];
+}
+
 export interface SimulatedTopologySnapshot {
   online: number[];
   blocked_nodes: number[];

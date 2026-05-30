@@ -1,4 +1,4 @@
-import type { AddNodeRequest, NodeView, SnapshotResponse } from "./types";
+import type { AddNodeRequest, NodeView, OrchestratorRecording, SnapshotResponse } from "./types";
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -29,6 +29,10 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
 export function getSnapshot(): Promise<SnapshotResponse> {
   return request<SnapshotResponse>("/api/snapshot");
+}
+
+export function getRecording(): Promise<OrchestratorRecording> {
+  return request<OrchestratorRecording>("/api/recording");
 }
 
 export function addNode(body: AddNodeRequest): Promise<NodeView> {

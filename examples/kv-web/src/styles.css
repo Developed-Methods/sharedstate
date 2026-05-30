@@ -76,8 +76,8 @@ label {
   border-bottom: 1px solid var(--line);
   background: rgba(13, 17, 20, 0.94);
   display: grid;
-  grid-template-columns: 1fr auto auto;
-  gap: 18px;
+  grid-template-columns: 1fr auto auto auto;
+  gap: 14px;
   align-items: center;
   padding: 0 22px;
 }
@@ -111,6 +111,25 @@ label {
   background: var(--panel);
   padding: 8px 12px;
   border-radius: 6px;
+}
+
+.header-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.header-error {
+  max-width: 280px;
+  border: 1px solid rgba(238, 107, 95, 0.45);
+  background: rgba(238, 107, 95, 0.12);
+  color: #ffbab4;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .primary-button,

@@ -1,12 +1,14 @@
-import { Plus, RadioTower } from "lucide-react";
+import { Download, Plus, RadioTower } from "lucide-react";
 import type { SnapshotResponse } from "../types";
 
 interface Props {
   snapshot: SnapshotResponse | null;
   onAddNode: () => void;
+  onSaveRecording: () => void;
+  recordingError: string | null;
 }
 
-export function TopHeader({ snapshot, onAddNode }: Props) {
+export function TopHeader({ snapshot, onAddNode, onSaveRecording, recordingError }: Props) {
   const nodes = snapshot?.nodes ?? [];
   const online = nodes.filter((node) => node.online).length;
   const leaders = nodes.filter((node) => node.status === "leading").length;
@@ -27,10 +29,17 @@ export function TopHeader({ snapshot, onAddNode }: Props) {
         <span>{leaders} leaders</span>
         <span>{isolated} isolated</span>
       </div>
-      <button className="primary-button" onClick={onAddNode}>
-        <Plus size={17} />
-        Add Node
-      </button>
+      {recordingError && <div className="header-error">{recordingError}</div>}
+      <div className="header-actions">
+        <button className="secondary-button" onClick={onSaveRecording}>
+          <Download size={17} />
+          Save Recording
+        </button>
+        <button className="primary-button" onClick={onAddNode}>
+          <Plus size={17} />
+          Add Node
+        </button>
+      </div>
     </header>
   );
 }
