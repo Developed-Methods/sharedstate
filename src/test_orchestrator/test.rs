@@ -116,6 +116,81 @@ fn config() -> SharedStateTestOrchestratorConfig<TestStore> {
     }
 }
 
+fn all_online_nodes_agree_on_one_online_leader(snapshot: &OrchestratorSnapshot<TestStore>) -> bool {
+    let online = snapshot.nodes.iter().filter(|node| node.online).collect::<Vec<_>>();
+    if online.is_empty() {
+        return false;
+    }
+
+    let Some(leader) = online[0].leader else {
+        return false;
+    };
+
+    if online.iter().any(|node| node.leader != Some(leader)) {
+        return false;
+    }
+
+    let Some(leader_node) = online.iter().find(|node| node.address == leader) else {
+        return false;
+    };
+
+    if !leader_node.can_lead
+        || leader_node.leader != Some(leader)
+        || leader_node.leader_path.as_deref() != Some(&[leader])
+        || leader_node.follow_remote.is_some()
+    {
+        return false;
+    }
+
+    online.iter().all(|node| {
+        let Some(path) = node.leader_path.as_ref() else {
+            return false;
+        };
+        !path.is_empty()
+            && path.first() == Some(&leader)
+            && path.iter().collect::<std::collections::BTreeSet<_>>().len() == path.len()
+    })
+}
+
+fn ready_to_stop_original_leader_for_indirect_recording(snapshot: &OrchestratorSnapshot<TestStore>) -> bool {
+    let nodes = snapshot
+        .nodes
+        .iter()
+        .map(|node| (node.address, node))
+        .collect::<BTreeMap<_, _>>();
+    let Some(node1) = nodes.get(&1) else {
+        return false;
+    };
+    if !node1.online || node1.leader != Some(1) || node1.leader_path.as_deref() != Some(&[1]) {
+        return false;
+    }
+
+    for address in 2..=8 {
+        let Some(node) = nodes.get(&address) else {
+            return false;
+        };
+        if !node.online || node.leader != Some(1) {
+            return false;
+        }
+        let Some(path) = node.leader_path.as_ref() else {
+            return false;
+        };
+        if path.is_empty()
+            || path.first() != Some(&1)
+            || path.last() != Some(&address)
+            || path.iter().collect::<std::collections::BTreeSet<_>>().len() != path.len()
+        {
+            return false;
+        }
+    }
+
+    nodes.get(&4).is_some_and(|node| {
+        node.can_lead && node.follow_remote.is_some() && node.leader_path.as_ref().is_some_and(|path| path.contains(&5))
+    }) && nodes.get(&5).is_some_and(|node| {
+        node.can_lead && node.follow_remote == Some(1) && node.leader_path.as_deref() == Some(&[1, 5])
+    })
+}
+
 async fn wait_until<F, Fut>(timeout: Duration, mut check: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -367,4 +442,38 @@ async fn failed_mutation_is_not_recorded() {
 
     assert!(orchestrator.stop_node(7001).await.is_err());
     assert!(orchestrator.recording().await.events.is_empty());
+}
+
+#[tokio::test]
+async fn replay_new_leader_indirect_converges_after_original_leader_stops() {
+    let recording: OrchestratorRecording<TestStore> =
+        serde_json::from_str(include_str!("../res/new-leader-indirect.json")).unwrap();
+    let orchestrator = SharedStateTestOrchestrator::new(config());
+    let options = ReplayOptions::default();
+    let event_count = recording.events.len();
+
+    for (event_index, event) in recording.events.into_iter().enumerate() {
+        if event_index + 1 == event_count {
+            assert!(
+                wait_until(Duration::from_secs(5), || async {
+                    ready_to_stop_original_leader_for_indirect_recording(&orchestrator.snapshot().await)
+                })
+                .await,
+                "{:#?}",
+                orchestrator.snapshot().await
+            );
+        } else {
+            wait_for_checkpoint(&orchestrator, &event.before_checkpoint, event_index, &options)
+                .await
+                .unwrap();
+        }
+        orchestrator.apply_action(event.action, false).await.unwrap();
+    }
+
+    let converged = wait_until(Duration::from_secs(5), || async {
+        all_online_nodes_agree_on_one_online_leader(&orchestrator.snapshot().await)
+    })
+    .await;
+
+    assert!(converged, "{:#?}", orchestrator.snapshot().await);
 }

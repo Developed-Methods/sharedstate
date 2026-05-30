@@ -842,6 +842,24 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         }
     }
 
+    async fn clear_follow_to(&self, remote: A) -> bool {
+        let follow = {
+            let mut lock = self.follow.lock().await;
+            if lock.as_ref().is_some_and(|follow| follow.remote == remote) {
+                lock.take()
+            } else {
+                None
+            }
+        };
+
+        if let Some(follow) = follow {
+            follow.cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     async fn clear_remote_leader_if(&self, leader_addr: A) {
         let changed = {
             let mut leader = self.leader.lock().await;
@@ -1196,20 +1214,25 @@ where
                     Some(SyncResponse::AuthorityAction(_, action)) => {
                         inner.state.lock().await.apply_authority(action).await;
                     }
-                    Some(SyncResponse::LeaderInfo(info)) => {
-                        if let (Some(leader_addr), Some(path)) = (info.leader, info.path) {
-                            if valid_remote_leader_path(Some(leader_addr), &path, inner.address) {
-                                inner
-                                    .set_remote_leader_path(
-                                        leader_addr,
-                                        Some(info.term),
-                                        append_path(path, inner.address),
-                                        Some(target),
-                                    )
-                                    .await;
+                    Some(SyncResponse::LeaderInfo(info)) => match (info.leader, info.path) {
+                        (Some(leader_addr), Some(path))
+                            if valid_remote_leader_path(Some(leader_addr), &path, inner.address) =>
+                        {
+                            inner
+                                .set_remote_leader_path(
+                                    leader_addr,
+                                    Some(info.term),
+                                    append_path(path, inner.address),
+                                    Some(target),
+                                )
+                                .await;
+                        }
+                        _ => {
+                            if inner.clear_follow_to(target).await {
+                                inner.clear_remote_leader().await;
                             }
                         }
-                    }
+                    },
                     Some(SyncResponse::LeaderPath(path)) => {
                         if let Some(leader_addr) = path.first().copied() {
                             if valid_remote_leader_path(Some(leader_addr), &path, inner.address) {
@@ -1222,6 +1245,11 @@ where
                                     )
                                     .await;
                             }
+                        }
+                    }
+                    Some(SyncResponse::NoPathToLeader) => {
+                        if inner.clear_follow_to(target).await {
+                            inner.clear_remote_leader().await;
                         }
                     }
                     Some(SyncResponse::Peers(peers)) => {
