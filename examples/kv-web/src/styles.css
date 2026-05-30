@@ -172,17 +172,49 @@ label {
 }
 
 .flow-node {
-  width: 162px;
+  width: 178px;
   border-radius: 7px;
   border: 2px solid var(--line);
-  background: #10171c;
+  background: #10171c !important;
   color: #e8f1f3;
   box-shadow: 0 14px 28px rgba(0, 0, 0, 0.28);
+  padding: 0 !important;
   transition:
+    background 140ms ease,
     border-color 140ms ease,
     box-shadow 140ms ease,
     filter 140ms ease,
     transform 140ms ease;
+}
+
+.flow-node.follower-node {
+  background:
+    linear-gradient(180deg, rgba(20, 33, 40, 0.96), rgba(12, 18, 22, 0.98)) !important;
+}
+
+.flow-node.can-lead-node {
+  background:
+    linear-gradient(180deg, rgba(30, 36, 22, 0.98), rgba(13, 20, 17, 0.98)) !important;
+}
+
+.flow-node.status-leading {
+  background:
+    linear-gradient(180deg, rgba(31, 78, 53, 0.98), rgba(10, 28, 22, 0.99)) !important;
+}
+
+.flow-node.status-noLeader {
+  background:
+    linear-gradient(180deg, rgba(67, 30, 30, 0.98), rgba(23, 15, 17, 0.99)) !important;
+}
+
+.flow-node.status-isolated {
+  background:
+    linear-gradient(180deg, rgba(66, 49, 18, 0.98), rgba(25, 20, 13, 0.99)) !important;
+}
+
+.flow-node.status-offline {
+  background:
+    linear-gradient(180deg, rgba(35, 39, 42, 0.9), rgba(17, 19, 21, 0.94)) !important;
 }
 
 .flow-node.selected-node {
@@ -228,24 +260,84 @@ label {
 
 .node-shell {
   text-align: left;
-  padding: 4px;
+  padding: 12px 13px 11px;
+}
+
+.node-topline {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 9px;
 }
 
 .node-address {
-  font-size: 21px;
+  font-size: 24px;
+  line-height: 1;
   font-weight: 800;
+  color: #f3f7f8;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.4);
 }
 
-.node-line,
-.node-status {
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.node-status {
-  margin-top: 5px;
-  color: #d8e2e6;
+.node-role {
+  border: 1px solid rgba(216, 226, 230, 0.18);
+  border-radius: 999px;
+  color: #dce8eb;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 5px 7px;
   text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.leader-capable {
+  background: rgba(89, 214, 140, 0.15);
+  border-color: rgba(89, 214, 140, 0.42);
+  color: #9af0bd;
+}
+
+.follower-role {
+  background: rgba(53, 198, 213, 0.11);
+  border-color: rgba(53, 198, 213, 0.34);
+  color: #94dce6;
+}
+
+.node-line {
+  font-size: 11px;
+  color: #b7c8ce;
+  font-weight: 650;
+}
+
+.node-status {
+  margin-top: 9px;
+  color: #ecf4f5;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.status-leading .node-status {
+  color: #a8f4c6;
+}
+
+.status-connected .node-status {
+  color: #95e7ef;
+}
+
+.status-noLeader .node-status {
+  color: #ffafa8;
+}
+
+.status-isolated .node-status {
+  color: #f4cc71;
+}
+
+.status-offline .node-status,
+.status-offline .node-line,
+.status-offline .node-address {
+  color: #9aa4aa;
 }
 
 .active-edge path {

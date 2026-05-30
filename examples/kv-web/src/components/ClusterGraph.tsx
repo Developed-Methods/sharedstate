@@ -32,13 +32,22 @@ export function ClusterGraph({ nodes, connections, selectedAddress, onSelect }: 
     position: layout(index, nodes.length),
     sourcePosition: Position.Right,
     targetPosition: Position.Left,
-    className: `flow-node status-${node.status} ${selectedAddress === node.address ? "selected-node" : ""}`,
+    className: [
+      "flow-node",
+      `status-${node.status}`,
+      node.can_lead ? "can-lead-node" : "follower-node",
+      selectedAddress === node.address ? "selected-node" : ""
+    ].join(" "),
     data: {
       label: (
         <div className="node-shell">
-          <div className="node-address">{node.address}</div>
-          <div className="node-line">can_lead: {node.can_lead ? "yes" : "no"}</div>
-          <div className="node-line">leader: {node.leader ?? "none"}</div>
+          <div className="node-topline">
+            <div className="node-address">{node.address}</div>
+            <div className={`node-role ${node.can_lead ? "leader-capable" : "follower-role"}`}>
+              {node.can_lead ? "can lead" : "follower"}
+            </div>
+          </div>
+          <div className="node-line">leader {node.leader ?? "none"}</div>
           <div className="node-status">{statusLabels[node.status]}</div>
         </div>
       )
