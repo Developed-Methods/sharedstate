@@ -83,7 +83,11 @@ impl MessageEncoding for TestState {
 }
 
 async fn node(address: u64, can_lead: bool) -> NodeState<u64, TestState> {
-    NodeState::new(
+    node_with_timing(address, can_lead, NodeTiming::default()).await
+}
+
+async fn node_with_timing(address: u64, can_lead: bool, timing: NodeTiming) -> NodeState<u64, TestState> {
+    NodeState::new_with_timing(
         address,
         RecoverableState::new(
             address,
@@ -94,6 +98,7 @@ async fn node(address: u64, can_lead: bool) -> NodeState<u64, TestState> {
         ),
         can_lead,
         NetIoSettings::default(),
+        timing,
     )
     .await
 }
@@ -115,8 +120,32 @@ impl TestClusterNode {
 }
 
 async fn start_cluster_node(net: &SimulatedNet, address: u64, can_lead: bool, peers: &[u64]) -> TestClusterNode {
+    start_cluster_node_with_timing(net, address, can_lead, peers, NodeTiming::default(), NetIoSettings::default()).await
+}
+
+async fn start_cluster_node_with_timing(
+    net: &SimulatedNet,
+    address: u64,
+    can_lead: bool,
+    peers: &[u64],
+    timing: NodeTiming,
+    io_settings: NetIoSettings,
+) -> TestClusterNode {
     let io = net.start_io(address).await;
-    let node = node(address, can_lead).await;
+    let node = NodeState::new_with_timing(
+        address,
+        RecoverableState::new(
+            address,
+            TestState {
+                seq: 1,
+                values: BTreeMap::new(),
+            },
+        ),
+        can_lead,
+        io_settings,
+        timing,
+    )
+    .await;
     node.discover_peers(peers.iter().copied()).await;
     let listener = node.start_listener(io.clone()).await;
     let client = node.start_client(io.clone()).await;
@@ -421,7 +450,7 @@ async fn non_leader_does_not_periodically_observe_known_non_leader_peers() {
     assert!(wait_for_leader(&node3.node, Some(1), Duration::from_secs(3)).await);
     assert!(wait_for_leader(&node4.node, Some(1), Duration::from_secs(3)).await);
 
-    tokio::time::sleep(observation_interval() * 2).await;
+    tokio::time::sleep(NodeTiming::default().observation_interval * 2).await;
 
     let debug = node2.node.debug_info().await;
     let peer1 = debug.peers.iter().find(|peer| peer.address == 1).unwrap();
@@ -473,6 +502,75 @@ async fn non_leader_falls_back_to_non_leader_relay_when_can_lead_peers_are_unrea
     node2.stop(&net).await;
     node3.stop(&net).await;
     node4.stop(&net).await;
+}
+
+#[tokio::test]
+async fn high_latency_cluster_converges_with_configured_timing() {
+    let net = SimulatedNet::new();
+    for (a, b) in [(1, 2), (1, 3), (2, 3)] {
+        net.set_edge_latency(a, b, Some(Duration::from_millis(500))).await;
+    }
+
+    let timing = NodeTiming {
+        observation_stale_after: Duration::from_secs(30),
+        observation_interval: Duration::from_millis(250),
+        follow_retry_interval: Duration::from_millis(250),
+        rpc_timeout: Duration::from_secs(10),
+    };
+    let io_settings = NetIoSettings {
+        process_timeout: Duration::from_secs(5),
+        message_timeout: Duration::from_secs(20),
+    };
+
+    let node1 = start_cluster_node_with_timing(&net, 1, true, &[2, 3], timing.clone(), io_settings.clone()).await;
+    let node2 = start_cluster_node_with_timing(&net, 2, true, &[1, 3], timing.clone(), io_settings.clone()).await;
+    let node3 = start_cluster_node_with_timing(&net, 3, false, &[1, 2], timing, io_settings).await;
+
+    assert!(
+        wait_until(Duration::from_secs(25), || async {
+            let debug1 = node1.node.debug_info().await;
+            let debug2 = node2.node.debug_info().await;
+            let debug3 = node3.node.debug_info().await;
+            let Some(leader) = debug1.leader else {
+                return false;
+            };
+            debug2.leader == Some(leader) && debug3.leader == Some(leader)
+        })
+        .await,
+        "node1={:#?}\nnode2={:#?}\nnode3={:#?}",
+        node1.node.debug_info().await,
+        node2.node.debug_info().await,
+        node3.node.debug_info().await
+    );
+
+    node3
+        .actions
+        .send(TestAction::Set {
+            key: "slow".to_owned(),
+            value: "ok".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            [&node1.node, &node2.node, &node3.node].into_iter().all(|node| {
+                let mut handle = node.create_state_handle();
+                let value = handle.read().state().values.get("slow").cloned();
+                handle.quiescent();
+                value.as_deref() == Some("ok")
+            })
+        })
+        .await,
+        "node1={:#?}\nnode2={:#?}\nnode3={:#?}",
+        node1.node.debug_info().await,
+        node2.node.debug_info().await,
+        node3.node.debug_info().await
+    );
+
+    node1.stop(&net).await;
+    node2.stop(&net).await;
+    node3.stop(&net).await;
 }
 
 #[tokio::test]

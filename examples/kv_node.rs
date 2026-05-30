@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     io::{Error, ErrorKind, Result},
     sync::Arc,
+    time::Duration,
 };
 
 use clap::Parser;
@@ -12,7 +13,7 @@ use sharedstate::{
         message_channel::NetIoSettings,
         sync_io::{SyncConnection, SyncIO, SyncIOListener},
     },
-    shared::node::{NodeActionSender, NodeDebugInfo, NodeState, SendActionError},
+    shared::node::{NodeActionSender, NodeDebugInfo, NodeState, NodeTiming, SendActionError},
     state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
 };
 use tokio::net::{
@@ -30,6 +31,18 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     can_lead: bool,
+
+    #[arg(long, default_value_t = 3000)]
+    observation_interval_ms: u64,
+
+    #[arg(long, default_value_t = 1000)]
+    follow_retry_interval_ms: u64,
+
+    #[arg(long, default_value_t = 15000)]
+    observation_stale_ms: u64,
+
+    #[arg(long, default_value_t = 5000)]
+    rpc_timeout_ms: u64,
 }
 
 #[derive(Clone)]
@@ -176,7 +189,13 @@ async fn main() -> Result<()> {
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     let args = Args::parse();
     let io = Arc::new(LocalhostIo::bind(args.port).await?);
-    let node = NodeState::new(
+    let timing = NodeTiming {
+        observation_stale_after: Duration::from_millis(args.observation_stale_ms),
+        observation_interval: Duration::from_millis(args.observation_interval_ms),
+        follow_retry_interval: Duration::from_millis(args.follow_retry_interval_ms),
+        rpc_timeout: Duration::from_millis(args.rpc_timeout_ms),
+    };
+    let node = NodeState::new_with_timing(
         args.port,
         RecoverableState::new(
             args.port as u64,
@@ -187,6 +206,7 @@ async fn main() -> Result<()> {
         ),
         args.can_lead,
         NetIoSettings::default(),
+        timing,
     )
     .await;
 

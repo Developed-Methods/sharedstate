@@ -104,6 +104,7 @@ fn orchestrator() -> SharedStateTestOrchestrator<TestStore> {
 fn config() -> SharedStateTestOrchestratorConfig<TestStore> {
     SharedStateTestOrchestratorConfig {
         io_settings: NetIoSettings::default(),
+        node_timing: NodeTiming::default(),
         initial_state: Arc::new(|address| {
             RecoverableState::new(
                 address,

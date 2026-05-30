@@ -52,7 +52,7 @@ use election::{
 };
 use follow_policy::{sort_follow_candidates, FollowCandidate};
 use paths::{append_path, valid_local_leader_path, valid_remote_leader_path};
-use timing::{follow_retry_interval, observation_interval, observation_stale_ms, rpc_timeout};
+pub use timing::NodeTiming;
 
 pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
     inner: Arc<Inner<A, D>>,
@@ -111,6 +111,7 @@ pub struct PeerDebugInfo<A: SyncIOAddress> {
 struct Inner<A: SyncIOAddress, D: DeterministicState> {
     address: A,
     can_lead: bool,
+    timing: NodeTiming,
     leader: Mutex<LeaderInfo<A>>,
     peers: Mutex<HashMap<A, Option<PeerDetails<A>>>>,
     state: Mutex<AuthorativeState<D>>,
@@ -154,6 +155,16 @@ where
     D::Action: Clone,
 {
     pub async fn new(address: A, init_state: RecoverableState<D>, can_lead: bool, io_settings: NetIoSettings) -> Self {
+        Self::new_with_timing(address, init_state, can_lead, io_settings, NodeTiming::default()).await
+    }
+
+    pub async fn new_with_timing(
+        address: A,
+        init_state: RecoverableState<D>,
+        can_lead: bool,
+        io_settings: NetIoSettings,
+        timing: NodeTiming,
+    ) -> Self {
         let (local_actions_tx, local_actions_rx) = mpsc::channel(1024);
         let (leader_updates, _) = watch::channel(LeaderInfoMessage {
             leader: None,
@@ -167,6 +178,7 @@ where
             inner: Arc::new(Inner {
                 address,
                 can_lead,
+                timing,
                 leader: Mutex::new(LeaderInfo {
                     leader: None,
                     path: None,
@@ -704,7 +716,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             peer_reachability,
             election_term: local_term,
             now_ms: now,
-            stale_after_ms: observation_stale_ms(),
+            stale_after_ms: self.timing.observation_stale_ms(),
         }) {
             ElectionDecision::PromoteSelf { observed_term } => {
                 self.promote_if_needed(observed_term).await;
@@ -893,7 +905,7 @@ where
             self.observe_election_peers().await;
             self.inner.apply_election().await;
             self.ensure_follow_connection().await;
-            tokio::time::sleep(observation_interval()).await;
+            tokio::time::sleep(self.inner.timing.observation_interval).await;
         }
     }
 
@@ -939,19 +951,28 @@ where
     async fn observe_peer(&self, target: I::Address) {
         self.mark_connect_attempt(target).await;
 
-        let Ok(Ok(conn)) = tokio::time::timeout(rpc_timeout(), self.io.connect(&target)).await else {
+        let Ok(Ok(conn)) = tokio::time::timeout(self.inner.timing.rpc_timeout, self.io.connect(&target)).await else {
             self.mark_connect_fail(target).await;
             return;
         };
 
         let (_addr, write, mut read) = conn.client_channels::<D>(self.io_settings.clone());
 
-        if !send_expect_ok(&write, &mut read, SyncRequest::ProtocolVersion(PROTOCOL_VERSION)).await {
+        if !send_expect_ok(
+            &write,
+            &mut read,
+            SyncRequest::ProtocolVersion(PROTOCOL_VERSION),
+            self.inner.timing.rpc_timeout,
+        )
+        .await
+        {
             self.mark_connect_fail(target).await;
             return;
         }
 
-        if !send_expect_ok(&write, &mut read, SyncRequest::MyAddress(self.inner.address)).await {
+        if !send_expect_ok(&write, &mut read, SyncRequest::MyAddress(self.inner.address), self.inner.timing.rpc_timeout)
+            .await
+        {
             self.mark_connect_fail(target).await;
             return;
         }
@@ -962,7 +983,7 @@ where
             return;
         }
 
-        match recv_timeout(&mut read).await {
+        match recv_timeout(&mut read, self.inner.timing.rpc_timeout).await {
             Some(SyncResponse::Pong(id)) if id == started => {
                 self.mark_connected(target, now_ms().saturating_sub(started)).await;
             }
@@ -974,13 +995,15 @@ where
 
         let peers = self.inner.peer_snapshot().await;
         if write.send(SyncRequest::SharePeers(peers)).await.is_ok() {
-            if let Some(SyncResponse::Peers(peers)) = recv_timeout(&mut read).await {
+            if let Some(SyncResponse::Peers(peers)) = recv_timeout(&mut read, self.inner.timing.rpc_timeout).await {
                 self.inner.discover_peers(peers.into_iter()).await;
             }
         }
 
         if write.send(SyncRequest::ShareElection).await.is_ok() {
-            if let Some(SyncResponse::Election(observation)) = recv_timeout(&mut read).await {
+            if let Some(SyncResponse::Election(observation)) =
+                recv_timeout(&mut read, self.inner.timing.rpc_timeout).await
+            {
                 self.inner.record_observation(observation).await;
             }
         }
@@ -998,7 +1021,7 @@ where
         }
 
         let Some(target) = self.select_follow_target(leader).await else {
-            tokio::time::sleep(follow_retry_interval()).await;
+            tokio::time::sleep(self.inner.timing.follow_retry_interval).await;
             return;
         };
 
@@ -1046,24 +1069,33 @@ where
     async fn connect_follow(&self, target: I::Address, selected_leader: Option<I::Address>) {
         self.mark_connect_attempt(target).await;
 
-        let Ok(Ok(conn)) = tokio::time::timeout(rpc_timeout(), self.io.connect(&target)).await else {
+        let Ok(Ok(conn)) = tokio::time::timeout(self.inner.timing.rpc_timeout, self.io.connect(&target)).await else {
             self.mark_connect_fail(target).await;
             return;
         };
 
         let (remote, write, mut read) = conn.client_channels::<D>(self.io_settings.clone());
-        if !send_expect_ok(&write, &mut read, SyncRequest::ProtocolVersion(PROTOCOL_VERSION)).await {
+        if !send_expect_ok(
+            &write,
+            &mut read,
+            SyncRequest::ProtocolVersion(PROTOCOL_VERSION),
+            self.inner.timing.rpc_timeout,
+        )
+        .await
+        {
             self.mark_connect_fail(target).await;
             return;
         }
 
-        if !send_expect_ok(&write, &mut read, SyncRequest::MyAddress(self.inner.address)).await {
+        if !send_expect_ok(&write, &mut read, SyncRequest::MyAddress(self.inner.address), self.inner.timing.rpc_timeout)
+            .await
+        {
             self.mark_connect_fail(target).await;
             return;
         }
 
         let leader_info = if write.send(SyncRequest::WhoIsLeader).await.is_ok() {
-            match recv_timeout(&mut read).await {
+            match recv_timeout(&mut read, self.inner.timing.rpc_timeout).await {
                 Some(SyncResponse::LeaderInfo(info)) => info,
                 _ => {
                     self.mark_connect_fail(target).await;
@@ -1101,14 +1133,14 @@ where
             return;
         }
 
-        let first_state_msg = match recv_timeout(&mut read).await {
+        let first_state_msg = match recv_timeout(&mut read, self.inner.timing.rpc_timeout).await {
             Some(SyncResponse::Accepted(_seq)) => None,
             Some(SyncResponse::RecoveryFailed(_)) => {
                 if write.send(SyncRequest::SubscribeFresh).await.is_err() {
                     self.mark_connect_fail(target).await;
                     return;
                 }
-                match recv_timeout(&mut read).await {
+                match recv_timeout(&mut read, self.inner.timing.rpc_timeout).await {
                     Some(SyncResponse::FreshState(state)) => Some(state),
                     _ => {
                         self.mark_connect_fail(target).await;
@@ -1611,6 +1643,7 @@ async fn send_expect_ok<A, D>(
     write: &mpsc::Sender<SyncRequest<A, D>>,
     read: &mut mpsc::Receiver<SyncResponse<A, D>>,
     msg: SyncRequest<A, D>,
+    timeout: Duration,
 ) -> bool
 where
     A: SyncIOAddress,
@@ -1620,15 +1653,18 @@ where
         return false;
     }
 
-    matches!(recv_timeout(read).await, Some(SyncResponse::Ok))
+    matches!(recv_timeout(read, timeout).await, Some(SyncResponse::Ok))
 }
 
-async fn recv_timeout<A, D>(read: &mut mpsc::Receiver<SyncResponse<A, D>>) -> Option<SyncResponse<A, D>>
+async fn recv_timeout<A, D>(
+    read: &mut mpsc::Receiver<SyncResponse<A, D>>,
+    timeout: Duration,
+) -> Option<SyncResponse<A, D>>
 where
     A: SyncIOAddress,
     D: DeterministicState,
 {
-    tokio::time::timeout(rpc_timeout(), read.recv()).await.ok().flatten()
+    tokio::time::timeout(timeout, read.recv()).await.ok().flatten()
 }
 
 fn generation_id<A: SyncIOAddress>(address: A) -> u64 {

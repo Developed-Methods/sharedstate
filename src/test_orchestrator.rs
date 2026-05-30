@@ -14,7 +14,7 @@ use crate::{
         message_channel::NetIoSettings,
         simulated::{SimulatedIo, SimulatedNet, SimulatedTopologySnapshot},
     },
-    shared::node::{NodeActionSender, NodeDebugInfo, NodeState, PeerDebugInfo},
+    shared::node::{NodeActionSender, NodeDebugInfo, NodeState, NodeTiming, PeerDebugInfo},
     state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
 };
 
@@ -22,6 +22,7 @@ const RECORDING_VERSION: u64 = 1;
 
 pub struct SharedStateTestOrchestratorConfig<D: DeterministicState> {
     pub io_settings: NetIoSettings,
+    pub node_timing: NodeTiming,
     pub initial_state: Arc<dyn Fn(u64) -> RecoverableState<D> + Send + Sync>,
 }
 
@@ -29,6 +30,7 @@ impl<D: DeterministicState> Clone for SharedStateTestOrchestratorConfig<D> {
     fn clone(&self) -> Self {
         Self {
             io_settings: self.io_settings.clone(),
+            node_timing: self.node_timing.clone(),
             initial_state: self.initial_state.clone(),
         }
     }
@@ -586,9 +588,14 @@ where
 
     async fn create_runtime(&self, address: u64, can_lead: bool, known_peers: &BTreeSet<u64>) -> NodeRuntime<D> {
         let io = self.net.start_io(address).await;
-        let node =
-            NodeState::new(address, (self.config.initial_state)(address), can_lead, self.config.io_settings.clone())
-                .await;
+        let node = NodeState::new_with_timing(
+            address,
+            (self.config.initial_state)(address),
+            can_lead,
+            self.config.io_settings.clone(),
+            self.config.node_timing.clone(),
+        )
+        .await;
         node.discover_peers(known_peers.iter().copied()).await;
         let listener = node.start_listener(io.clone()).await;
         let client = node.start_client(io.clone()).await;

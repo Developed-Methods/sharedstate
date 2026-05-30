@@ -4,6 +4,7 @@ use std::{
     pin::Pin,
     sync::{Arc as StdArc, Mutex as StdMutex},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,7 @@ struct SimulatedNetInner {
     active_connection_edges: HashMap<(u64, u64), Vec<KillHandle>>,
     blocked_nodes: HashSet<u64>,
     blocked_edges: HashSet<(u64, u64)>,
+    edge_latencies: HashMap<(u64, u64), Duration>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +45,7 @@ impl SimulatedNet {
                 active_connection_edges: HashMap::new(),
                 blocked_nodes: HashSet::new(),
                 blocked_edges: HashSet::new(),
+                edge_latencies: HashMap::new(),
             })),
         }
     }
@@ -89,6 +92,19 @@ impl SimulatedNet {
 
     pub async fn clear_edge_blocks(&self) {
         self.inner.lock().await.blocked_edges.clear();
+    }
+
+    pub async fn set_edge_latency(&self, a: u64, b: u64, latency: Option<Duration>) {
+        let edge = Self::edge_key(a, b);
+        let mut inner = self.inner.lock().await;
+        match latency {
+            Some(latency) if !latency.is_zero() => {
+                inner.edge_latencies.insert(edge, latency);
+            }
+            _ => {
+                inner.edge_latencies.remove(&edge);
+            }
+        }
     }
 
     pub async fn set_node_blocked(&self, address: u64, blocked: bool) {
@@ -155,17 +171,17 @@ impl SyncIO for SimulatedIo {
     type Write = KillableIo<WriteHalf<DuplexStream>>;
 
     async fn connect(&self, remote: &Self::Address) -> std::io::Result<SyncConnection<Self>> {
-        let (tx, handles) = {
+        let (tx, handles, latency) = {
             let mut net = self.net.inner.lock().await;
+            let edge = SimulatedNet::edge_key(self.address, *remote);
             if net.blocked_nodes.contains(&self.address)
                 || net.blocked_nodes.contains(remote)
-                || net
-                    .blocked_edges
-                    .contains(&SimulatedNet::edge_key(self.address, *remote))
+                || net.blocked_edges.contains(&edge)
             {
                 return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "connection blocked"));
             }
             let tx = net.listeners.get(remote).cloned();
+            let latency = net.edge_latencies.get(&edge).copied().unwrap_or_default();
             let handles = [
                 KillHandle::new(),
                 KillHandle::new(),
@@ -176,12 +192,9 @@ impl SyncIO for SimulatedIo {
             active.extend(handles.iter().map(|(handle, _)| handle.clone()));
             let active = net.active_connections.entry(*remote).or_default();
             active.extend(handles.iter().map(|(handle, _)| handle.clone()));
-            let active = net
-                .active_connection_edges
-                .entry(SimulatedNet::edge_key(self.address, *remote))
-                .or_default();
+            let active = net.active_connection_edges.entry(edge).or_default();
             active.extend(handles.iter().map(|(handle, _)| handle.clone()));
-            (tx, handles)
+            (tx, handles, latency)
         };
 
         let Some(tx) = tx else {
@@ -197,16 +210,16 @@ impl SyncIO for SimulatedIo {
 
         tx.send(SimulatedIncoming {
             remote: self.address,
-            read: KillableIo::new(server_read, server_read_kill),
-            write: KillableIo::new(server_write, server_write_kill),
+            read: KillableIo::new(server_read, server_read_kill, latency),
+            write: KillableIo::new(server_write, server_write_kill, latency),
         })
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotConnected, "remote listener closed"))?;
 
         Ok(SyncConnection {
             remote: *remote,
-            read: KillableIo::new(client_read, client_read_kill),
-            write: KillableIo::new(client_write, client_write_kill),
+            read: KillableIo::new(client_read, client_read_kill, latency),
+            write: KillableIo::new(client_write, client_write_kill, latency),
         })
     }
 }
@@ -248,14 +261,18 @@ pub struct KillableIo<I> {
     inner: I,
     kill: oneshot::Receiver<()>,
     killed: bool,
+    latency: Duration,
+    delay: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<I> KillableIo<I> {
-    fn new(inner: I, kill: oneshot::Receiver<()>) -> Self {
+    fn new(inner: I, kill: oneshot::Receiver<()>, latency: Duration) -> Self {
         Self {
             inner,
             kill,
             killed: false,
+            latency,
+            delay: None,
         }
     }
 
@@ -272,12 +289,34 @@ impl<I> KillableIo<I> {
             Poll::Pending => None,
         }
     }
+
+    fn poll_latency(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.latency.is_zero() {
+            return Poll::Ready(());
+        }
+
+        if self.delay.is_none() {
+            self.delay = Some(Box::pin(tokio::time::sleep(self.latency)));
+        }
+
+        match self.delay.as_mut().expect("delay initialized").as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                self.delay = None;
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 impl<I: AsyncRead + Unpin> AsyncRead for KillableIo<I> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         if let Some(kill) = self.poll_kill(cx) {
             return kill;
+        }
+
+        if self.poll_latency(cx).is_pending() {
+            return Poll::Pending;
         }
 
         Pin::new(&mut self.inner).poll_read(cx, buf)
@@ -311,5 +350,34 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for KillableIo<I> {
         }
 
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn edge_latency_delays_reads() {
+        let net = SimulatedNet::new();
+        let io1 = net.start_io(1).await;
+        let io2 = net.start_io(2).await;
+        net.set_edge_latency(1, 2, Some(Duration::from_millis(100))).await;
+
+        let server = tokio::spawn(async move {
+            let mut conn = io2.next_client().await.unwrap();
+            let started = tokio::time::Instant::now();
+            let mut buf = [0u8; 1];
+            conn.read.read_exact(&mut buf).await.unwrap();
+            (started.elapsed(), buf[0])
+        });
+
+        let mut client = io1.connect(&2).await.unwrap();
+        client.write.write_all(&[42]).await.unwrap();
+
+        let (elapsed, byte) = server.await.unwrap();
+        assert_eq!(byte, 42);
+        assert!(elapsed >= Duration::from_millis(80), "elapsed={elapsed:?}");
     }
 }

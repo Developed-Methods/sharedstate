@@ -4,6 +4,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -18,6 +19,7 @@ use message_encoding::MessageEncoding;
 use serde::{Deserialize, Serialize};
 use sharedstate::{
     net::message_channel::NetIoSettings,
+    shared::node::NodeTiming,
     state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
     test_orchestrator::{
         AddNodeRequest, NodeView, OrchestratorError, OrchestratorRecording, OrchestratorSnapshot,
@@ -35,6 +37,18 @@ struct Args {
 
     #[arg(long, default_value = "examples/kv-web/dist")]
     static_dir: PathBuf,
+
+    #[arg(long, default_value_t = 3000)]
+    observation_interval_ms: u64,
+
+    #[arg(long, default_value_t = 1000)]
+    follow_retry_interval_ms: u64,
+
+    #[arg(long, default_value_t = 15000)]
+    observation_stale_ms: u64,
+
+    #[arg(long, default_value_t = 5000)]
+    rpc_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -174,8 +188,15 @@ impl From<OrchestratorError> for ApiError {
 async fn main() -> Result<()> {
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     let args = Args::parse();
+    let node_timing = NodeTiming {
+        observation_stale_after: Duration::from_millis(args.observation_stale_ms),
+        observation_interval: Duration::from_millis(args.observation_interval_ms),
+        follow_retry_interval: Duration::from_millis(args.follow_retry_interval_ms),
+        rpc_timeout: Duration::from_millis(args.rpc_timeout_ms),
+    };
     let state = Arc::new(SharedStateTestOrchestrator::new(SharedStateTestOrchestratorConfig {
         io_settings: NetIoSettings::default(),
+        node_timing,
         initial_state: Arc::new(|address| {
             RecoverableState::new(
                 address,
