@@ -1,6 +1,6 @@
 use std::{
     collections::hash_map::DefaultHasher,
-    collections::{hash_map, BTreeSet, HashMap, HashSet},
+    collections::{hash_map, BTreeSet, HashMap},
     future::Future,
     hash::Hasher,
     num::NonZeroU64,
@@ -40,45 +40,19 @@ use crate::{
 static PROMOTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const PROTOCOL_VERSION: u64 = 1;
 
-#[cfg(not(test))]
-fn observation_stale_ms() -> u64 {
-    15_000
-}
+mod client_policy;
+mod election;
+mod follow_policy;
+mod paths;
+mod timing;
 
-#[cfg(test)]
-fn observation_stale_ms() -> u64 {
-    300
-}
-
-#[cfg(not(test))]
-fn observation_interval() -> Duration {
-    Duration::from_secs(3)
-}
-
-#[cfg(test)]
-fn observation_interval() -> Duration {
-    Duration::from_millis(50)
-}
-
-#[cfg(not(test))]
-fn follow_retry_interval() -> Duration {
-    Duration::from_secs(1)
-}
-
-#[cfg(test)]
-fn follow_retry_interval() -> Duration {
-    Duration::from_millis(50)
-}
-
-#[cfg(not(test))]
-fn rpc_timeout() -> Duration {
-    Duration::from_secs(5)
-}
-
-#[cfg(test)]
-fn rpc_timeout() -> Duration {
-    Duration::from_millis(150)
-}
+use client_policy::{observation_targets, ObservationTargetInput, PeerKind};
+use election::{
+    decide_election, ElectionDecision, ElectionInput, ElectionState, PeerReachability, TimedPeerObservation,
+};
+use follow_policy::{sort_follow_candidates, FollowCandidate};
+use paths::{append_path, valid_local_leader_path, valid_remote_leader_path};
+use timing::{follow_retry_interval, observation_interval, observation_stale_ms, rpc_timeout};
 
 pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
     inner: Arc<Inner<A, D>>,
@@ -166,21 +140,6 @@ struct PeerDetails<A: SyncIOAddress> {
     can_lead: bool,
     connected: bool,
     last_observation: Option<ElectionObservation<A>>,
-}
-
-struct ElectionState<A: SyncIOAddress> {
-    term: u64,
-    known_can_lead: BTreeSet<A>,
-    observations: HashMap<A, ElectionObservation<A>>,
-    last_promoted_leader: Option<A>,
-}
-
-struct CandidateEvidence<A: SyncIOAddress> {
-    leader: A,
-    agreement_count: u64,
-    max_term: u64,
-    max_state_accept_seq: u64,
-    best_path: Option<Vec<A>>,
 }
 
 struct FollowConnection<A: SyncIOAddress, D: DeterministicState> {
@@ -701,144 +660,75 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             (election.known_can_lead.clone(), election.observations.clone(), election.term)
         };
         let peer_details = self.peers.lock().await.clone();
-
-        let mut candidates: HashMap<A, CandidateEvidence<A>> = HashMap::new();
-        let mut max_seen_term = local_observation.term;
-
-        for observation in std::iter::once(local_observation).chain(observations.into_values()) {
-            max_seen_term = max_seen_term.max(observation.term);
-            if observation.observer != self.address {
-                let Some(Some(details)) = peer_details.get(&observation.observer) else {
-                    continue;
-                };
-                let Some(last_activity) = details.last_activity else {
-                    continue;
-                };
-                if observation_stale_ms() < now.saturating_sub(last_activity.get()) {
-                    continue;
-                }
-            }
-
-            let Some(leader) = observation.leader else {
-                continue;
-            };
-            let Some(path) = &observation.leader_path else {
-                continue;
-            };
-            if observation.observer == self.address {
-                if !valid_local_leader_path(Some(leader), path, self.address) {
-                    continue;
-                }
-            } else if !valid_remote_leader_path(Some(leader), path, self.address) {
-                continue;
-            }
-            let local_path = if observation.observer == self.address {
-                path.clone()
-            } else {
-                append_path(path.clone(), self.address)
-            };
-
-            candidates
-                .entry(leader)
-                .and_modify(|candidate| {
-                    candidate.agreement_count += 1;
-                    let replace_path = candidate.best_path.as_ref().is_none_or(|best_path| {
-                        observation
-                            .state_accept_seq
-                            .cmp(&candidate.max_state_accept_seq)
-                            .then(observation.term.cmp(&candidate.max_term))
-                            .then_with(|| best_path.len().cmp(&local_path.len()))
-                            .then_with(|| candidate.leader.cmp(&leader))
-                            .is_gt()
-                    });
-                    candidate.max_term = candidate.max_term.max(observation.term);
-                    candidate.max_state_accept_seq = candidate.max_state_accept_seq.max(observation.state_accept_seq);
-                    if replace_path {
-                        candidate.best_path = Some(local_path.clone());
-                    }
-                })
-                .or_insert_with(|| CandidateEvidence {
-                    leader,
-                    agreement_count: 1,
-                    max_term: observation.term,
-                    max_state_accept_seq: observation.state_accept_seq,
-                    best_path: Some(local_path),
-                });
-        }
+        let max_seen_term = std::iter::once(&local_observation)
+            .chain(observations.values())
+            .map(|observation| observation.term)
+            .max()
+            .unwrap_or(local_term);
 
         self.observe_term(max_seen_term).await;
 
-        let mut selected = candidates
+        let peer_observations = observations
             .into_iter()
-            .map(|(_, candidate)| candidate)
-            .max_by(|a, b| {
-                a.agreement_count
-                    .cmp(&b.agreement_count)
-                    .then(a.max_term.cmp(&b.max_term))
-                    .then(a.max_state_accept_seq.cmp(&b.max_state_accept_seq))
-                    .then_with(|| b.leader.cmp(&a.leader))
+            .map(|(observer, observation)| TimedPeerObservation {
+                observer,
+                last_activity_ms: peer_details
+                    .get(&observer)
+                    .and_then(|details| details.as_ref())
+                    .and_then(|details| details.last_activity)
+                    .map(|ts| ts.get()),
+                observation,
             })
-            .map(|candidate| (candidate.max_term, candidate.leader, candidate.best_path));
-
-        if selected.is_none() {
-            selected = known_can_lead
-                .iter()
-                .filter(|addr| {
-                    **addr == self.address
-                        || peer_details
-                            .get(addr)
-                            .and_then(|d| d.as_ref())
-                            .and_then(|d| d.last_activity)
-                            .map(|ts| now.saturating_sub(ts.get()) <= observation_stale_ms())
-                            .unwrap_or(false)
-                })
-                .next()
-                .map(|leader| (local_term, *leader, None));
-        }
-
-        let Some((term, leader, path)) = selected else {
-            return;
-        };
-
-        let reachable_count = known_can_lead
+            .collect::<Vec<_>>();
+        let peer_reachability = peer_details
             .iter()
-            .filter(|addr| {
-                **addr == self.address
-                    || peer_details
-                        .get(addr)
-                        .and_then(|d| d.as_ref())
-                        .and_then(|d| d.last_activity)
-                        .map(|ts| now.saturating_sub(ts.get()) <= observation_stale_ms())
-                        .unwrap_or(false)
+            .filter_map(|(addr, details)| {
+                Some((
+                    *addr,
+                    PeerReachability {
+                        last_activity_ms: details
+                            .as_ref()
+                            .and_then(|details| details.last_activity)
+                            .map(|ts| ts.get()),
+                    },
+                ))
             })
-            .count();
-        let active_can_lead_count = reachable_count.max(usize::from(self.can_lead));
-        let majority = active_can_lead_count / 2 + 1;
+            .collect::<HashMap<_, _>>();
 
-        if leader == self.address && self.can_lead && majority <= reachable_count {
-            self.promote_if_needed(term).await;
-            return;
-        }
-
-        if leader != self.address {
-            if path.is_none() {
-                self.clear_remote_leader_if(leader).await;
-                return;
+        match decide_election(ElectionInput {
+            local_address: self.address,
+            can_lead: self.can_lead,
+            known_can_lead,
+            local_observation,
+            peer_observations,
+            peer_reachability,
+            election_term: local_term,
+            now_ms: now,
+            stale_after_ms: observation_stale_ms(),
+        }) {
+            ElectionDecision::PromoteSelf { observed_term } => {
+                self.promote_if_needed(observed_term).await;
             }
-            let changed = {
-                let mut lock = self.leader.lock().await;
-                if lock.term < term || lock.leader != Some(leader) || lock.path != path {
-                    lock.term = term;
-                    lock.leader = Some(leader);
-                    lock.path = path;
-                    true
-                } else {
-                    false
+            ElectionDecision::FollowRemote { leader, term, path } => {
+                let changed = {
+                    let mut lock = self.leader.lock().await;
+                    if lock.term < term || lock.leader != Some(leader) || lock.path != Some(path.clone()) {
+                        lock.term = term;
+                        lock.leader = Some(leader);
+                        lock.path = Some(path);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if changed {
+                    self.publish_leader_info().await;
                 }
-            };
-            if changed {
-                self.publish_leader_info().await;
             }
+            ElectionDecision::ClearRemoteLeader { leader } => {
+                self.clear_remote_leader_if(leader).await;
+            }
+            ElectionDecision::NoChange => {}
         }
     }
 
@@ -1023,29 +913,27 @@ where
         let has_usable_path = leader.is_some() && (leader == Some(self.inner.address) || follow_remote.is_some());
 
         let peers = self.inner.peers.lock().await;
-        let mut targets = BTreeSet::new();
-
-        for (addr, details) in peers.iter() {
-            if *addr == self.inner.address {
-                continue;
-            }
-
-            if self.inner.can_lead {
-                targets.insert(*addr);
-                continue;
-            }
-
-            let should_observe = Some(*addr) == leader && *addr != self.inner.address
-                || Some(*addr) == follow_remote
-                || details.as_ref().is_some_and(|details| details.can_lead)
-                || details.is_none() && !has_usable_path;
-
-            if should_observe {
-                targets.insert(*addr);
-            }
-        }
-
-        targets.into_iter().collect()
+        observation_targets(ObservationTargetInput {
+            local: self.inner.address,
+            can_lead: self.inner.can_lead,
+            leader,
+            follow_remote,
+            has_usable_path,
+            peers: peers
+                .iter()
+                .map(|(addr, details)| {
+                    (
+                        *addr,
+                        details
+                            .as_ref()
+                            .map(|details| PeerKind::Known {
+                                can_lead: details.can_lead,
+                            })
+                            .unwrap_or(PeerKind::Unknown),
+                    )
+                })
+                .collect(),
+        })
     }
 
     async fn observe_peer(&self, target: I::Address) {
@@ -1119,44 +1007,29 @@ where
 
     async fn select_follow_target(&self, leader: Option<I::Address>) -> Option<I::Address> {
         let peers = self.inner.peers.lock().await;
-        let mut candidates = peers
+        let candidates = peers
             .iter()
             .filter_map(|(addr, details)| {
                 if *addr == self.inner.address {
                     return None;
                 }
-                Some((*addr, details.as_ref()?))
+                let details = details.as_ref()?;
+                Some(FollowCandidate {
+                    address: *addr,
+                    connected: details.connected,
+                    latency_ms: details.latency_ms,
+                    repeat_connect_fails: details.repeat_connect_fails,
+                    last_connect_fail_ms: details.last_connect_fail.map(|v| v.get()),
+                    failed_without_activity: details.last_activity.is_none() && details.last_connect_fail.is_some(),
+                    can_lead: details.can_lead,
+                    observed_leader: details.last_observation.as_ref().and_then(|o| o.leader),
+                })
             })
             .collect::<Vec<_>>();
 
-        candidates.sort_by_key(|(addr, details)| {
-            let failed_without_activity = details.last_activity.is_none() && details.last_connect_fail.is_some();
-            let tier = if Some(*addr) == leader {
-                if failed_without_activity {
-                    5u8
-                } else {
-                    0
-                }
-            } else if failed_without_activity {
-                5
-            } else if leader.is_some() && details.last_observation.as_ref().and_then(|o| o.leader) == leader {
-                1
-            } else if details.can_lead {
-                3
-            } else {
-                4
-            };
-            (
-                tier,
-                !details.connected,
-                details.latency_ms.unwrap_or(u64::MAX),
-                details.repeat_connect_fails,
-                details.last_connect_fail.map(|v| v.get()).unwrap_or(0),
-                *addr,
-            )
-        });
-
-        candidates.first().map(|(addr, _)| *addr)
+        sort_follow_candidates(leader, candidates)
+            .first()
+            .map(|candidate| candidate.address)
     }
 
     async fn connect_follow(&self, target: I::Address, selected_leader: Option<I::Address>) {
@@ -1745,49 +1618,6 @@ where
     D: DeterministicState,
 {
     tokio::time::timeout(rpc_timeout(), read.recv()).await.ok().flatten()
-}
-
-fn valid_remote_leader_path<A: SyncIOAddress>(leader: Option<A>, path: &[A], local: A) -> bool {
-    let Some(leader) = leader else {
-        return false;
-    };
-    if path.is_empty() || path[0] != leader {
-        return false;
-    }
-
-    let mut seen = HashSet::new();
-    for item in path {
-        if !seen.insert(*item) {
-            return false;
-        }
-    }
-
-    !path.iter().skip(1).any(|step| *step == local)
-}
-
-fn valid_local_leader_path<A: SyncIOAddress>(leader: Option<A>, path: &[A], local: A) -> bool {
-    let Some(leader) = leader else {
-        return false;
-    };
-    if path.is_empty() || path[0] != leader {
-        return false;
-    }
-
-    let mut seen = HashSet::new();
-    for item in path {
-        if !seen.insert(*item) {
-            return false;
-        }
-    }
-
-    path.last().copied() == Some(local)
-}
-
-fn append_path<A: SyncIOAddress>(mut path: Vec<A>, local: A) -> Vec<A> {
-    if !path.contains(&local) {
-        path.push(local);
-    }
-    path
 }
 
 fn generation_id<A: SyncIOAddress>(address: A) -> u64 {
