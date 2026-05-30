@@ -130,6 +130,7 @@ export interface ElectionObservation {
   leader_path: number[] | null;
   can_lead: boolean;
   reachable_can_lead: number[];
+  state_accept_seq?: number;
 }
 
 export interface AddNodeRequest {

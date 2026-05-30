@@ -175,6 +175,14 @@ struct ElectionState<A: SyncIOAddress> {
     last_promoted_leader: Option<A>,
 }
 
+struct CandidateEvidence<A: SyncIOAddress> {
+    leader: A,
+    agreement_count: u64,
+    max_term: u64,
+    max_state_accept_seq: u64,
+    best_path: Option<Vec<A>>,
+}
+
 struct FollowConnection<A: SyncIOAddress, D: DeterministicState> {
     remote: A,
     leader_path: Vec<A>,
@@ -603,6 +611,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                 })
                 .collect::<Vec<_>>()
         };
+        let state_accept_seq = self.state.lock().await.state_clone().await.state().accept_seq();
 
         ElectionObservation {
             observer: self.address,
@@ -611,6 +620,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             leader_path,
             can_lead: self.can_lead,
             reachable_can_lead,
+            state_accept_seq,
         }
     }
 
@@ -692,8 +702,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         };
         let peer_details = self.peers.lock().await.clone();
 
-        let mut counts: HashMap<(u64, A), u64> = HashMap::new();
-        let mut valid_leaders: HashMap<A, (u64, Option<Vec<A>>)> = HashMap::new();
+        let mut candidates: HashMap<A, CandidateEvidence<A>> = HashMap::new();
         let mut max_seen_term = local_observation.term;
 
         for observation in std::iter::once(local_observation).chain(observations.into_values()) {
@@ -723,29 +732,53 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             } else if !valid_remote_leader_path(Some(leader), path, self.address) {
                 continue;
             }
+            let local_path = if observation.observer == self.address {
+                path.clone()
+            } else {
+                append_path(path.clone(), self.address)
+            };
 
-            *counts.entry((observation.term, leader)).or_insert(0) += 1;
-            valid_leaders
+            candidates
                 .entry(leader)
-                .and_modify(|existing| {
-                    if existing.0 < observation.term {
-                        *existing = (observation.term, observation.leader_path.clone());
+                .and_modify(|candidate| {
+                    candidate.agreement_count += 1;
+                    let replace_path = candidate.best_path.as_ref().is_none_or(|best_path| {
+                        observation
+                            .state_accept_seq
+                            .cmp(&candidate.max_state_accept_seq)
+                            .then(observation.term.cmp(&candidate.max_term))
+                            .then_with(|| best_path.len().cmp(&local_path.len()))
+                            .then_with(|| candidate.leader.cmp(&leader))
+                            .is_gt()
+                    });
+                    candidate.max_term = candidate.max_term.max(observation.term);
+                    candidate.max_state_accept_seq = candidate.max_state_accept_seq.max(observation.state_accept_seq);
+                    if replace_path {
+                        candidate.best_path = Some(local_path.clone());
                     }
                 })
-                .or_insert((observation.term, observation.leader_path.clone()));
+                .or_insert_with(|| CandidateEvidence {
+                    leader,
+                    agreement_count: 1,
+                    max_term: observation.term,
+                    max_state_accept_seq: observation.state_accept_seq,
+                    best_path: Some(local_path),
+                });
         }
 
         self.observe_term(max_seen_term).await;
 
-        let mut selected = counts
+        let mut selected = candidates
             .into_iter()
-            .max_by(|((a_term, a_leader), a_count), ((b_term, b_leader), b_count)| {
-                a_term
-                    .cmp(b_term)
-                    .then(a_count.cmp(b_count))
-                    .then_with(|| b_leader.cmp(a_leader))
+            .map(|(_, candidate)| candidate)
+            .max_by(|a, b| {
+                a.agreement_count
+                    .cmp(&b.agreement_count)
+                    .then(a.max_term.cmp(&b.max_term))
+                    .then(a.max_state_accept_seq.cmp(&b.max_state_accept_seq))
+                    .then_with(|| b.leader.cmp(&a.leader))
             })
-            .map(|((term, leader), _)| (term, leader));
+            .map(|candidate| (candidate.max_term, candidate.leader, candidate.best_path));
 
         if selected.is_none() {
             selected = known_can_lead
@@ -760,10 +793,10 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                             .unwrap_or(false)
                 })
                 .next()
-                .map(|leader| (local_term, *leader));
+                .map(|leader| (local_term, *leader, None));
         }
 
-        let Some((term, leader)) = selected else {
+        let Some((term, leader, path)) = selected else {
             return;
         };
 
@@ -788,7 +821,6 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         }
 
         if leader != self.address {
-            let path = valid_leaders.get(&leader).and_then(|(_, path)| path.clone());
             if path.is_none() {
                 self.clear_remote_leader_if(leader).await;
                 return;
@@ -984,11 +1016,8 @@ where
                     if *addr == self.inner.address {
                         return None;
                     }
-                    match details {
-                        Some(details) if details.can_lead => Some(*addr),
-                        None => Some(*addr),
-                        _ => None,
-                    }
+                    let _ = details;
+                    Some(*addr)
                 })
                 .collect::<Vec<_>>()
         };

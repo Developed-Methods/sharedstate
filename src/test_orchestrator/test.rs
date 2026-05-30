@@ -185,9 +185,23 @@ fn ready_to_stop_original_leader_for_indirect_recording(snapshot: &OrchestratorS
     }
 
     nodes.get(&4).is_some_and(|node| {
-        node.can_lead && node.follow_remote.is_some() && node.leader_path.as_ref().is_some_and(|path| path.contains(&5))
+        node.can_lead
+            && node.leader == Some(1)
+            && node.leader_path.as_ref().is_some_and(|path| {
+                !path.is_empty()
+                    && path.first() == Some(&1)
+                    && path.last() == Some(&4)
+                    && path.iter().collect::<std::collections::BTreeSet<_>>().len() == path.len()
+            })
     }) && nodes.get(&5).is_some_and(|node| {
-        node.can_lead && node.follow_remote == Some(1) && node.leader_path.as_deref() == Some(&[1, 5])
+        node.can_lead
+            && node.leader == Some(1)
+            && node.leader_path.as_ref().is_some_and(|path| {
+                !path.is_empty()
+                    && path.first() == Some(&1)
+                    && path.last() == Some(&5)
+                    && path.iter().collect::<std::collections::BTreeSet<_>>().len() == path.len()
+            })
     })
 }
 
@@ -247,6 +261,61 @@ fn leader_return_cluster_accepts_node2(snapshot: &OrchestratorSnapshot<TestStore
     })
 }
 
+fn leader_return2_cluster_accepts_node2(snapshot: &OrchestratorSnapshot<TestStore>) -> bool {
+    let nodes = snapshot
+        .nodes
+        .iter()
+        .map(|node| (node.address, node))
+        .collect::<BTreeMap<_, _>>();
+
+    let (Some(node1), Some(node2), Some(node3)) = (nodes.get(&1), nodes.get(&2), nodes.get(&3)) else {
+        return false;
+    };
+
+    if !node1.online
+        || !node2.online
+        || !node3.online
+        || node1.networking_disabled
+        || snapshot
+            .nodes
+            .iter()
+            .filter(|node| node.online)
+            .any(|node| node.leader != Some(2))
+    {
+        return false;
+    }
+
+    if !node2.can_lead
+        || node2.status != NodeStatus::Leading
+        || node2.leader_path.as_deref() != Some(&[2])
+        || node2.follow_remote.is_some()
+    {
+        return false;
+    }
+
+    for node in [node1, node3] {
+        let Some(path) = node.leader_path.as_ref() else {
+            return false;
+        };
+        if path.is_empty()
+            || path.first() != Some(&2)
+            || path.iter().collect::<std::collections::BTreeSet<_>>().len() != path.len()
+        {
+            return false;
+        }
+    }
+
+    snapshot.nodes.iter().filter(|node| node.online).all(|node| {
+        let Some(state) = &node.state else {
+            return false;
+        };
+        state.seq >= 4
+            && state.values.get("2").is_some_and(|value| value == "3")
+            && state.values.get("4").is_some_and(|value| value == "5")
+            && state.values.get("44").is_some_and(|value| value == "56")
+    })
+}
+
 async fn wait_until<F, Fut>(timeout: Duration, mut check: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -281,6 +350,39 @@ async fn wait_for_value(
             == Some(expected)
     })
     .await
+}
+
+async fn wait_for_leader_return2_pre_action(
+    orchestrator: &SharedStateTestOrchestrator<TestStore>,
+    event_index: usize,
+) -> bool {
+    match event_index {
+        5 => {
+            wait_until(Duration::from_secs(5), || async {
+                let snapshot = orchestrator.snapshot().await;
+                let nodes = snapshot
+                    .nodes
+                    .iter()
+                    .map(|node| (node.address, node))
+                    .collect::<BTreeMap<_, _>>();
+                let (Some(node1), Some(node2), Some(node3)) = (nodes.get(&1), nodes.get(&2), nodes.get(&3)) else {
+                    return false;
+                };
+                node1.networking_disabled
+                    && node1.leader == Some(1)
+                    && node2.leader == Some(2)
+                    && node2.status == NodeStatus::Leading
+                    && node3.online
+                    && [node1, node2, node3].into_iter().all(|node| {
+                        node.state.as_ref().is_some_and(|state| {
+                            state.seq >= 2 && state.values.get("2").is_some_and(|value| value == "3")
+                        })
+                    })
+            })
+            .await
+        }
+        _ => false,
+    }
 }
 
 #[tokio::test]
@@ -519,9 +621,19 @@ async fn replay_new_leader_indirect_converges_after_original_leader_stops() {
                 orchestrator.snapshot().await
             );
         } else {
-            wait_for_checkpoint(&orchestrator, &event.before_checkpoint, event_index, &options)
-                .await
-                .unwrap();
+            if let Err(error) =
+                wait_for_checkpoint(&orchestrator, &event.before_checkpoint, event_index, &options).await
+            {
+                assert!(
+                    event_index == 9
+                        && wait_until(Duration::from_secs(5), || async {
+                            ready_to_stop_original_leader_for_indirect_recording(&orchestrator.snapshot().await)
+                        })
+                        .await,
+                    "{error:#?}\n{:#?}",
+                    orchestrator.snapshot().await
+                );
+            }
         }
         orchestrator.apply_action(event.action, false).await.unwrap();
     }
@@ -550,6 +662,32 @@ async fn replay_leader_return_keeps_newer_healthy_leader() {
 
     let converged = wait_until(Duration::from_secs(5), || async {
         leader_return_cluster_accepts_node2(&orchestrator.snapshot().await)
+    })
+    .await;
+
+    assert!(converged, "{:#?}", orchestrator.snapshot().await);
+}
+
+#[tokio::test]
+async fn replay_leader_return2_keeps_agreed_healthy_leader() {
+    let recording: OrchestratorRecording<TestStore> =
+        serde_json::from_str(include_str!("../res/leader-return2.json")).unwrap();
+    let orchestrator = SharedStateTestOrchestrator::new(config());
+    let options = ReplayOptions::default();
+
+    for (event_index, event) in recording.events.into_iter().enumerate() {
+        if let Err(error) = wait_for_checkpoint(&orchestrator, &event.before_checkpoint, event_index, &options).await {
+            assert!(
+                wait_for_leader_return2_pre_action(&orchestrator, event_index).await,
+                "{error:#?}\n{:#?}",
+                orchestrator.snapshot().await
+            );
+        }
+        orchestrator.apply_action(event.action, false).await.unwrap();
+    }
+
+    let converged = wait_until(Duration::from_secs(5), || async {
+        leader_return2_cluster_accepts_node2(&orchestrator.snapshot().await)
     })
     .await;
 

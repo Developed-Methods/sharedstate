@@ -47,6 +47,7 @@ pub struct ElectionObservation<A: SyncIOAddress> {
     pub leader_path: Option<Vec<A>>,
     pub can_lead: bool,
     pub reachable_can_lead: Vec<A>,
+    pub state_accept_seq: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -236,19 +237,20 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderInfoMessage<A> {
 impl<A: SyncIOAddress> MessageEncoding for ElectionObservation<A> {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
-        sum += 1u16.write_to(out)?;
+        sum += 2u16.write_to(out)?;
         sum += self.observer.write_to(out)?;
         sum += self.term.write_to(out)?;
         sum += self.leader.write_to(out)?;
         sum += write_opt_vec(&self.leader_path, out)?;
         sum += self.can_lead.write_to(out)?;
         sum += write_vec(&self.reachable_can_lead, out)?;
+        sum += self.state_accept_seq.write_to(out)?;
         Ok(sum)
     }
 
     fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
         let version = u16::read_from(read)?;
-        if version != 1 {
+        if version != 2 {
             return Err(unknown_version_err(version, "ElectionObservation"));
         }
 
@@ -259,6 +261,7 @@ impl<A: SyncIOAddress> MessageEncoding for ElectionObservation<A> {
             leader_path: read_opt_vec(read)?,
             can_lead: MessageEncoding::read_from(read)?,
             reachable_can_lead: read_vec(read)?,
+            state_accept_seq: MessageEncoding::read_from(read)?,
         })
     }
 }

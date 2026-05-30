@@ -468,3 +468,153 @@ async fn promoted_leader_uses_higher_term_than_isolated_old_leader() {
     node2.stop(&net).await;
     node3.stop(&net).await;
 }
+
+#[tokio::test]
+async fn higher_term_rejoining_node_does_not_steal_from_higher_agreement_leader() {
+    let net = SimulatedNet::new();
+
+    let node1 = start_cluster_node(&net, 1, true, &[2, 3]).await;
+    let node2 = start_cluster_node(&net, 2, true, &[1, 3]).await;
+    let node3 = start_cluster_node(&net, 3, false, &[1, 2]).await;
+
+    assert!(wait_for_leader(&node1.node, Some(1), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node2.node, Some(1), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node3.node, Some(1), Duration::from_secs(3)).await);
+
+    node2
+        .actions
+        .send(TestAction::Set {
+            key: "first".to_owned(),
+            value: "one".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            [&node1.node, &node2.node, &node3.node].into_iter().all(|node| {
+                let mut handle = node.create_state_handle();
+                let value = handle.read().state().values.get("first").cloned();
+                handle.quiescent();
+                value.as_deref() == Some("one")
+            })
+        })
+        .await
+    );
+
+    net.set_node_blocked(1, true).await;
+
+    assert!(wait_for_leader(&node2.node, Some(2), Duration::from_secs(3)).await);
+
+    node2
+        .actions
+        .send(TestAction::Set {
+            key: "second".to_owned(),
+            value: "two".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            [&node2.node, &node3.node].into_iter().all(|node| {
+                let mut handle = node.create_state_handle();
+                let value = handle.read().state().values.get("second").cloned();
+                handle.quiescent();
+                value.as_deref() == Some("two")
+            })
+        })
+        .await
+    );
+
+    net.set_node_blocked(1, false).await;
+
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            let debug1 = node1.node.debug_info().await;
+            let debug2 = node2.node.debug_info().await;
+            let debug3 = node3.node.debug_info().await;
+            debug1.leader == Some(2)
+                && debug2.leader == Some(2)
+                && debug3.leader == Some(2)
+                && debug1.follow_remote.is_some()
+                && debug2.follow_remote.is_none()
+        })
+        .await,
+        "node1={:#?}\nnode2={:#?}\nnode3={:#?}",
+        node1.node.debug_info().await,
+        node2.node.debug_info().await,
+        node3.node.debug_info().await
+    );
+
+    net.set_node_blocked(1, true).await;
+
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            let debug1 = node1.node.debug_info().await;
+            let debug2 = node2.node.debug_info().await;
+            debug1.leader == Some(1) && debug1.term > debug2.term
+        })
+        .await,
+        "node1={:#?}\nnode2={:#?}",
+        node1.node.debug_info().await,
+        node2.node.debug_info().await
+    );
+
+    node2
+        .actions
+        .send(TestAction::Set {
+            key: "third".to_owned(),
+            value: "three".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            [&node2.node, &node3.node].into_iter().all(|node| {
+                let mut handle = node.create_state_handle();
+                let value = handle.read().state().values.get("third").cloned();
+                handle.quiescent();
+                value.as_deref() == Some("three")
+            })
+        })
+        .await
+    );
+
+    net.set_node_blocked(1, false).await;
+
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            let debug1 = node1.node.debug_info().await;
+            let debug2 = node2.node.debug_info().await;
+            let debug3 = node3.node.debug_info().await;
+            if debug1.leader != Some(2)
+                || debug2.leader != Some(2)
+                || debug3.leader != Some(2)
+                || debug1.follow_remote.is_none()
+                || debug2.follow_remote.is_some()
+            {
+                return false;
+            }
+
+            [&node1.node, &node2.node, &node3.node].into_iter().all(|node| {
+                let mut handle = node.create_state_handle();
+                let state = handle.read().state().clone();
+                handle.quiescent();
+                state.values.get("first").is_some_and(|value| value == "one")
+                    && state.values.get("second").is_some_and(|value| value == "two")
+                    && state.values.get("third").is_some_and(|value| value == "three")
+            })
+        })
+        .await,
+        "node1={:#?}\nnode2={:#?}\nnode3={:#?}",
+        node1.node.debug_info().await,
+        node2.node.debug_info().await,
+        node3.node.debug_info().await
+    );
+
+    node1.stop(&net).await;
+    node2.stop(&net).await;
+    node3.stop(&net).await;
+}

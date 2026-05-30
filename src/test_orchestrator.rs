@@ -157,6 +157,8 @@ pub struct ElectionObservationDto {
     pub leader_path: Option<Vec<u64>>,
     pub can_lead: bool,
     pub reachable_can_lead: Vec<u64>,
+    #[serde(default)]
+    pub state_accept_seq: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -817,6 +819,7 @@ fn node_debug_dto(debug: NodeDebugInfo<u64>) -> NodeDebugInfoDto {
                 leader_path: observation.leader_path,
                 can_lead: observation.can_lead,
                 reachable_can_lead: observation.reachable_can_lead,
+                state_accept_seq: observation.state_accept_seq,
             })
             .collect(),
         peers: debug.peers.into_iter().map(peer_debug_dto).collect(),
