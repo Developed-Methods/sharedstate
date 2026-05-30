@@ -408,6 +408,37 @@ async fn leader_path_update_propagates_to_downstream_followers() {
 }
 
 #[tokio::test]
+async fn non_leader_does_not_periodically_observe_known_non_leader_peers() {
+    let net = SimulatedNet::new();
+
+    let node1 = start_cluster_node(&net, 1, true, &[2, 3, 4]).await;
+    let node2 = start_cluster_node(&net, 2, false, &[1, 3, 4]).await;
+    let node3 = start_cluster_node(&net, 3, false, &[1, 2, 4]).await;
+    let node4 = start_cluster_node(&net, 4, false, &[1, 2, 3]).await;
+
+    assert!(wait_for_leader(&node1.node, Some(1), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node2.node, Some(1), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node3.node, Some(1), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node4.node, Some(1), Duration::from_secs(3)).await);
+
+    tokio::time::sleep(observation_interval() * 2).await;
+
+    let debug = node2.node.debug_info().await;
+    let peer1 = debug.peers.iter().find(|peer| peer.address == 1).unwrap();
+    let peer3 = debug.peers.iter().find(|peer| peer.address == 3).unwrap();
+    let peer4 = debug.peers.iter().find(|peer| peer.address == 4).unwrap();
+
+    assert_eq!(peer1.observed_leader, Some(1), "{debug:#?}");
+    assert_eq!(peer3.observed_leader, None, "{debug:#?}");
+    assert_eq!(peer4.observed_leader, None, "{debug:#?}");
+
+    node1.stop(&net).await;
+    node2.stop(&net).await;
+    node3.stop(&net).await;
+    node4.stop(&net).await;
+}
+
+#[tokio::test]
 async fn promoted_leader_uses_higher_term_than_isolated_old_leader() {
     let net = SimulatedNet::new();
 

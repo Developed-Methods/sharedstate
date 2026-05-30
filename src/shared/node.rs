@@ -1000,33 +1000,52 @@ where
 {
     async fn run(self) {
         loop {
-            self.observe_can_lead_peers().await;
+            self.observe_election_peers().await;
             self.inner.apply_election().await;
             self.ensure_follow_connection().await;
             tokio::time::sleep(observation_interval()).await;
         }
     }
 
-    async fn observe_can_lead_peers(&self) {
-        let targets = {
-            let peers = self.inner.peers.lock().await;
-            peers
-                .iter()
-                .filter_map(|(addr, details)| {
-                    if *addr == self.inner.address {
-                        return None;
-                    }
-                    let _ = details;
-                    Some(*addr)
-                })
-                .collect::<Vec<_>>()
-        };
+    async fn observe_election_peers(&self) {
+        let targets = self.observation_targets().await;
 
         let mut results = futures_util::stream::iter(targets.into_iter())
             .map(|target| self.observe_peer(target))
             .buffered(8);
 
         while results.next().await.is_some() {}
+    }
+
+    async fn observation_targets(&self) -> Vec<I::Address> {
+        let leader = self.inner.leader.lock().await.leader;
+        let follow_remote = self.inner.follow.lock().await.as_ref().map(|follow| follow.remote);
+        let has_usable_path = leader.is_some() && (leader == Some(self.inner.address) || follow_remote.is_some());
+
+        let peers = self.inner.peers.lock().await;
+        let mut targets = BTreeSet::new();
+
+        for (addr, details) in peers.iter() {
+            if *addr == self.inner.address {
+                continue;
+            }
+
+            if self.inner.can_lead {
+                targets.insert(*addr);
+                continue;
+            }
+
+            let should_observe = Some(*addr) == leader && *addr != self.inner.address
+                || Some(*addr) == follow_remote
+                || details.as_ref().is_some_and(|details| details.can_lead)
+                || details.is_none() && !has_usable_path;
+
+            if should_observe {
+                targets.insert(*addr);
+            }
+        }
+
+        targets.into_iter().collect()
     }
 
     async fn observe_peer(&self, target: I::Address) {
