@@ -406,3 +406,65 @@ async fn leader_path_update_propagates_to_downstream_followers() {
     node7003.stop(&net).await;
     node7004.stop(&net).await;
 }
+
+#[tokio::test]
+async fn promoted_leader_uses_higher_term_than_isolated_old_leader() {
+    let net = SimulatedNet::new();
+
+    let node1 = start_cluster_node(&net, 1, true, &[2, 3]).await;
+    let node2 = start_cluster_node(&net, 2, true, &[1, 3]).await;
+    let node3 = start_cluster_node(&net, 3, false, &[1, 2]).await;
+
+    assert!(wait_for_leader(&node1.node, Some(1), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node2.node, Some(1), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node3.node, Some(1), Duration::from_secs(3)).await);
+    let node1_term_before_isolation = node1.node.debug_info().await.term;
+
+    net.set_node_blocked(1, true).await;
+
+    assert!(wait_for_leader(&node2.node, Some(2), Duration::from_secs(3)).await);
+    assert!(node2.node.debug_info().await.term > node1_term_before_isolation);
+
+    node2
+        .actions
+        .send(TestAction::Set {
+            key: "after_promotion".to_owned(),
+            value: "ok".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            let mut handle = node2.node.create_state_handle();
+            let value = handle.read().state().values.get("after_promotion").cloned();
+            handle.quiescent();
+            value.as_deref() == Some("ok")
+        })
+        .await
+    );
+
+    net.set_node_blocked(1, false).await;
+
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            let debug1 = node1.node.debug_info().await;
+            let debug2 = node2.node.debug_info().await;
+            let debug3 = node3.node.debug_info().await;
+            debug1.leader == Some(2)
+                && debug2.leader == Some(2)
+                && debug3.leader == Some(2)
+                && debug1.follow_remote.is_some()
+                && debug2.follow_remote.is_none()
+        })
+        .await,
+        "node1={:#?}\nnode2={:#?}\nnode3={:#?}",
+        node1.node.debug_info().await,
+        node2.node.debug_info().await,
+        node3.node.debug_info().await
+    );
+
+    node1.stop(&net).await;
+    node2.stop(&net).await;
+    node3.stop(&net).await;
+}

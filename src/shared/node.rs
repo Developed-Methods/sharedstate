@@ -644,11 +644,11 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             }
         }
 
-        self.election
-            .lock()
-            .await
-            .observations
-            .insert(observation.observer, observation.clone());
+        {
+            let mut election = self.election.lock().await;
+            election.term = election.term.max(observation.term);
+            election.observations.insert(observation.observer, observation.clone());
+        }
 
         let mut peers = self.peers.lock().await;
         let details = peers
@@ -694,8 +694,10 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
 
         let mut counts: HashMap<(u64, A), u64> = HashMap::new();
         let mut valid_leaders: HashMap<A, (u64, Option<Vec<A>>)> = HashMap::new();
+        let mut max_seen_term = local_observation.term;
 
         for observation in std::iter::once(local_observation).chain(observations.into_values()) {
+            max_seen_term = max_seen_term.max(observation.term);
             if observation.observer != self.address {
                 let Some(Some(details)) = peer_details.get(&observation.observer) else {
                     continue;
@@ -732,6 +734,8 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                 })
                 .or_insert((observation.term, observation.leader_path.clone()));
         }
+
+        self.observe_term(max_seen_term).await;
 
         let mut selected = counts
             .into_iter()
@@ -814,9 +818,14 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             }
         }
 
+        let current_leader_term = self.leader.lock().await.term;
         let new_term = {
             let mut election = self.election.lock().await;
-            election.term = election.term.max(observed_term).saturating_add(1);
+            election.term = election
+                .term
+                .max(observed_term)
+                .max(current_leader_term)
+                .saturating_add(1);
             election.last_promoted_leader = Some(self.address);
             election.term
         };
@@ -840,6 +849,11 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         if let Some(follow) = self.follow.lock().await.take() {
             follow.cancel.cancel();
         }
+    }
+
+    async fn observe_term(&self, term: u64) {
+        let mut election = self.election.lock().await;
+        election.term = election.term.max(term);
     }
 
     async fn clear_follow_to(&self, remote: A) -> bool {
@@ -932,6 +946,9 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
 
         if changed_leader || changed_follow {
             self.publish_leader_info().await;
+        }
+        if let Some(term) = term {
+            self.observe_term(term).await;
         }
     }
 }
@@ -1590,8 +1607,10 @@ where
 
     async fn handle_leader_status(&self, address: A, status: LeaderStatus<A>) {
         let mut changed = false;
+        let mut observed_term = None;
         match status {
             LeaderStatus::Promoted { term, leader } => {
+                observed_term = Some(term);
                 let mut lock = self.inner.leader.lock().await;
                 if lock.term < term || (lock.term == term && Some(leader) < lock.leader) {
                     lock.term = term;
@@ -1607,6 +1626,7 @@ where
                 }
             }
             LeaderStatus::Offline { term, leader } => {
+                observed_term = Some(term);
                 let mut lock = self.inner.leader.lock().await;
                 if lock.term <= term && lock.leader == Some(leader) {
                     lock.leader = None;
@@ -1621,6 +1641,9 @@ where
         }
         if changed {
             self.inner.publish_leader_info().await;
+        }
+        if let Some(term) = observed_term {
+            self.inner.observe_term(term).await;
         }
     }
 

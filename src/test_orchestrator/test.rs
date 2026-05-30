@@ -191,6 +191,62 @@ fn ready_to_stop_original_leader_for_indirect_recording(snapshot: &OrchestratorS
     })
 }
 
+fn leader_return_cluster_accepts_node2(snapshot: &OrchestratorSnapshot<TestStore>) -> bool {
+    let nodes = snapshot
+        .nodes
+        .iter()
+        .map(|node| (node.address, node))
+        .collect::<BTreeMap<_, _>>();
+
+    let (Some(node1), Some(node2), Some(node3)) = (nodes.get(&1), nodes.get(&2), nodes.get(&3)) else {
+        return false;
+    };
+
+    if !node1.online
+        || !node2.online
+        || !node3.online
+        || node1.networking_disabled
+        || snapshot
+            .nodes
+            .iter()
+            .filter(|node| node.online)
+            .any(|node| node.leader != Some(2))
+    {
+        return false;
+    }
+
+    if !node2.can_lead
+        || node2.status != NodeStatus::Leading
+        || node2.leader_path.as_deref() != Some(&[2])
+        || node2.follow_remote.is_some()
+        || node2.term.is_none_or(|term| term < 2)
+    {
+        return false;
+    }
+
+    for node in [node1, node3] {
+        let Some(path) = node.leader_path.as_ref() else {
+            return false;
+        };
+        if path.is_empty()
+            || path.first() != Some(&2)
+            || path.iter().collect::<std::collections::BTreeSet<_>>().len() != path.len()
+        {
+            return false;
+        }
+    }
+
+    snapshot.nodes.iter().filter(|node| node.online).all(|node| {
+        let Some(state) = &node.state else {
+            return false;
+        };
+        state.seq >= 5
+            && state.values.get("1").is_some_and(|value| value == "2")
+            && state.values.get("2").is_some_and(|value| value == "22")
+            && state.values.get("3").is_some_and(|value| value == "4")
+    })
+}
+
 async fn wait_until<F, Fut>(timeout: Duration, mut check: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -472,6 +528,28 @@ async fn replay_new_leader_indirect_converges_after_original_leader_stops() {
 
     let converged = wait_until(Duration::from_secs(5), || async {
         all_online_nodes_agree_on_one_online_leader(&orchestrator.snapshot().await)
+    })
+    .await;
+
+    assert!(converged, "{:#?}", orchestrator.snapshot().await);
+}
+
+#[tokio::test]
+async fn replay_leader_return_keeps_newer_healthy_leader() {
+    let recording: OrchestratorRecording<TestStore> =
+        serde_json::from_str(include_str!("../res/leader-return.json")).unwrap();
+    let orchestrator = SharedStateTestOrchestrator::new(config());
+    let options = ReplayOptions::default();
+
+    for (event_index, event) in recording.events.into_iter().enumerate() {
+        wait_for_checkpoint(&orchestrator, &event.before_checkpoint, event_index, &options)
+            .await
+            .unwrap();
+        orchestrator.apply_action(event.action, false).await.unwrap();
+    }
+
+    let converged = wait_until(Duration::from_secs(5), || async {
+        leader_return_cluster_accepts_node2(&orchestrator.snapshot().await)
     })
     .await;
 
