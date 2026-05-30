@@ -45,14 +45,25 @@ export function ClusterGraph({ nodes, connections, selectedAddress, onSelect }: 
     }
   }));
 
-  const flowEdges: Edge[] = connections.map((connection) => ({
-    id: `${connection.source}-${connection.target}`,
-    source: String(connection.source),
-    target: String(connection.target),
-    animated: !connection.blocked,
-    className: connection.blocked ? "blocked-edge" : "active-edge",
-    label: connection.blocked ? "blocked" : undefined
-  }));
+  const flowEdges: Edge[] = connections.map((connection) => {
+    const relatedToSelection =
+      selectedAddress == null || connection.source === selectedAddress || connection.target === selectedAddress;
+    const classes = [connection.blocked ? "blocked-edge" : "active-edge"];
+    if (!relatedToSelection) {
+      classes.push("muted-edge");
+    } else if (selectedAddress != null) {
+      classes.push("selected-related-edge");
+    }
+
+    return {
+      id: `${connection.source}-${connection.target}`,
+      source: String(connection.source),
+      target: String(connection.target),
+      animated: !connection.blocked && relatedToSelection,
+      className: classes.join(" "),
+      label: connection.blocked ? "blocked" : undefined
+    };
+  });
 
   return (
     <div className="graph-surface">

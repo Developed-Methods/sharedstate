@@ -178,10 +178,31 @@ label {
   background: #10171c;
   color: #e8f1f3;
   box-shadow: 0 14px 28px rgba(0, 0, 0, 0.28);
+  transition:
+    border-color 140ms ease,
+    box-shadow 140ms ease,
+    filter 140ms ease,
+    transform 140ms ease;
 }
 
 .flow-node.selected-node {
-  box-shadow: 0 0 0 2px #eef6f7, 0 18px 34px rgba(0, 0, 0, 0.4);
+  border-color: #f3f7f8;
+  transform: translateY(-2px);
+  filter: saturate(1.25) brightness(1.12);
+  box-shadow:
+    0 0 0 2px #0d1114,
+    0 0 0 5px rgba(243, 247, 248, 0.94),
+    0 0 0 8px rgba(53, 198, 213, 0.34),
+    0 24px 48px rgba(0, 0, 0, 0.55);
+  z-index: 5;
+}
+
+.flow-node.selected-node .node-address {
+  color: #ffffff;
+}
+
+.flow-node.selected-node .node-status {
+  color: #f3f7f8;
 }
 
 .flow-node.status-leading {
@@ -236,6 +257,25 @@ label {
   stroke: var(--red);
   stroke-dasharray: 7 5;
   stroke-width: 2;
+}
+
+.selected-related-edge path {
+  stroke-width: 3;
+  filter: drop-shadow(0 0 7px rgba(53, 198, 213, 0.42));
+}
+
+.muted-edge {
+  opacity: 0.18;
+}
+
+.muted-edge path {
+  stroke: #52616a;
+  stroke-width: 1.4;
+  filter: none;
+}
+
+.muted-edge text {
+  opacity: 0.25;
 }
 
 .empty-graph {
