@@ -15,7 +15,7 @@ use std::{
 use futures_util::StreamExt;
 use message_encoding::MessageEncoding;
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{mpsc, watch, Mutex},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -145,6 +145,7 @@ struct Inner<A: SyncIOAddress, D: DeterministicState> {
     local_actions_rx: Mutex<Option<mpsc::Receiver<D::Action>>>,
     follow: Mutex<Option<FollowConnection<A, D>>>,
     election: Mutex<ElectionState<A>>,
+    leader_updates: watch::Sender<LeaderInfoMessage<A>>,
 }
 
 #[derive(Clone)]
@@ -187,6 +188,11 @@ where
 {
     pub async fn new(address: A, init_state: RecoverableState<D>, can_lead: bool, io_settings: NetIoSettings) -> Self {
         let (local_actions_tx, local_actions_rx) = mpsc::channel(1024);
+        let (leader_updates, _) = watch::channel(LeaderInfoMessage {
+            leader: None,
+            path: None,
+            term: 0,
+        });
         let state = AuthorativeState::new(init_state).await;
         let state_reader = state.state_reader();
 
@@ -235,6 +241,7 @@ where
                     observations: HashMap::new(),
                     last_promoted_leader: None,
                 }),
+                leader_updates,
             }),
             io_settings,
         }
@@ -491,6 +498,11 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             path,
             term: leader.term,
         }
+    }
+
+    async fn publish_leader_info(&self) {
+        let info = self.leader_info_message().await;
+        let _ = self.leader_updates.send(info);
     }
 
     async fn debug_info(&self) -> NodeDebugInfo<A> {
@@ -777,11 +789,19 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                 self.clear_remote_leader_if(leader).await;
                 return;
             }
-            let mut lock = self.leader.lock().await;
-            if lock.term < term || lock.leader != Some(leader) {
-                lock.term = term;
-                lock.leader = Some(leader);
-                lock.path = path;
+            let changed = {
+                let mut lock = self.leader.lock().await;
+                if lock.term < term || lock.leader != Some(leader) || lock.path != path {
+                    lock.term = term;
+                    lock.leader = Some(leader);
+                    lock.path = path;
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
+                self.publish_leader_info().await;
             }
         }
     }
@@ -807,6 +827,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             leader.path = Some(vec![self.address]);
             leader.term = new_term;
         }
+        self.publish_leader_info().await;
 
         let new_id = generation_id(self.address);
         let mut state = self.state.lock().await;
@@ -822,18 +843,77 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
     }
 
     async fn clear_remote_leader_if(&self, leader_addr: A) {
-        let mut leader = self.leader.lock().await;
-        if leader.leader == Some(leader_addr) && leader.leader != Some(self.address) {
-            leader.leader = None;
-            leader.path = None;
+        let changed = {
+            let mut leader = self.leader.lock().await;
+            if leader.leader == Some(leader_addr) && leader.leader != Some(self.address) {
+                leader.leader = None;
+                leader.path = None;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.publish_leader_info().await;
         }
     }
 
     async fn clear_remote_leader(&self) {
-        let mut leader = self.leader.lock().await;
-        if leader.leader.is_some() && leader.leader != Some(self.address) {
-            leader.leader = None;
-            leader.path = None;
+        let changed = {
+            let mut leader = self.leader.lock().await;
+            if leader.leader.is_some() && leader.leader != Some(self.address) {
+                leader.leader = None;
+                leader.path = None;
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.publish_leader_info().await;
+        }
+    }
+
+    async fn set_remote_leader_path(&self, leader_addr: A, term: Option<u64>, path: Vec<A>, follow_remote: Option<A>) {
+        let changed_leader = {
+            let mut leader = self.leader.lock().await;
+            if let Some(term) = term {
+                if leader.term > term {
+                    false
+                } else {
+                    let changed =
+                        leader.term != term || leader.leader != Some(leader_addr) || leader.path != Some(path.clone());
+                    leader.term = term;
+                    leader.leader = Some(leader_addr);
+                    leader.path = Some(path.clone());
+                    changed
+                }
+            } else {
+                let changed = leader.leader != Some(leader_addr) || leader.path != Some(path.clone());
+                leader.leader = Some(leader_addr);
+                leader.path = Some(path.clone());
+                changed
+            }
+        };
+
+        let changed_follow = if let Some(follow_remote) = follow_remote {
+            let mut follow = self.follow.lock().await;
+            if let Some(follow) = follow.as_mut().filter(|follow| follow.remote == follow_remote) {
+                if follow.leader_path != path {
+                    follow.leader_path = path;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if changed_leader || changed_follow {
+            self.publish_leader_info().await;
         }
     }
 }
@@ -967,12 +1047,15 @@ where
             .collect::<Vec<_>>();
 
         candidates.sort_by_key(|(addr, details)| {
+            let failed_without_activity = details.last_activity.is_none() && details.last_connect_fail.is_some();
             let tier = if Some(*addr) == leader {
-                if details.last_activity.is_none() && details.last_connect_fail.is_some() {
-                    2u8
+                if failed_without_activity {
+                    5u8
                 } else {
                     0
                 }
+            } else if failed_without_activity {
+                5
             } else if leader.is_some() && details.last_observation.as_ref().and_then(|o| o.leader) == leader {
                 1
             } else if details.can_lead {
@@ -1040,14 +1123,10 @@ where
             return;
         }
 
-        {
-            let mut leader_lock = self.inner.leader.lock().await;
-            if leader_lock.term <= leader_info.term {
-                leader_lock.term = leader_info.term;
-                leader_lock.leader = Some(leader);
-                leader_lock.path = Some(append_path(path.clone(), self.inner.address));
-            }
-        }
+        let local_path = append_path(path.clone(), self.inner.address);
+        self.inner
+            .set_remote_leader_path(leader, Some(leader_info.term), local_path.clone(), None)
+            .await;
 
         let details = self.inner.state.lock().await.recoverable_state_details().await;
         if write.send(SyncRequest::SubscribeRecovery(details)).await.is_err() {
@@ -1084,7 +1163,7 @@ where
         let cancel = CancellationToken::new();
         let follow = FollowConnection {
             remote,
-            leader_path: append_path(path, self.inner.address),
+            leader_path: local_path,
             to_peer: write.clone(),
             cancel: cancel.clone(),
         };
@@ -1094,6 +1173,7 @@ where
         }
 
         self.mark_connected(target, 0).await;
+        self.inner.publish_leader_info().await;
         self.spawn_follow_reader(target, read, cancel);
     }
 
@@ -1117,25 +1197,30 @@ where
                         inner.state.lock().await.apply_authority(action).await;
                     }
                     Some(SyncResponse::LeaderInfo(info)) => {
-                        let mut leader = inner.leader.lock().await;
-                        if leader.term <= info.term {
-                            leader.term = info.term;
-                            let path = match (info.leader, info.path) {
-                                (Some(leader_addr), Some(path))
-                                    if valid_remote_leader_path(Some(leader_addr), &path, inner.address) =>
-                                {
-                                    Some((leader_addr, append_path(path, inner.address)))
-                                }
-                                _ => None,
-                            };
-                            leader.leader = path.as_ref().map(|(leader_addr, _)| *leader_addr);
-                            leader.path = path.map(|(_, path)| path);
+                        if let (Some(leader_addr), Some(path)) = (info.leader, info.path) {
+                            if valid_remote_leader_path(Some(leader_addr), &path, inner.address) {
+                                inner
+                                    .set_remote_leader_path(
+                                        leader_addr,
+                                        Some(info.term),
+                                        append_path(path, inner.address),
+                                        Some(target),
+                                    )
+                                    .await;
+                            }
                         }
                     }
                     Some(SyncResponse::LeaderPath(path)) => {
                         if let Some(leader_addr) = path.first().copied() {
                             if valid_remote_leader_path(Some(leader_addr), &path, inner.address) {
-                                inner.leader.lock().await.path = Some(append_path(path, inner.address));
+                                inner
+                                    .set_remote_leader_path(
+                                        leader_addr,
+                                        None,
+                                        append_path(path, inner.address),
+                                        Some(target),
+                                    )
+                                    .await;
                             }
                         }
                     }
@@ -1147,7 +1232,8 @@ where
                 }
             }
 
-            if let Some(follow) = inner.follow.lock().await.take() {
+            let closed_follow = { inner.follow.lock().await.take() };
+            if let Some(follow) = closed_follow {
                 if follow.remote == target {
                     follow.cancel.cancel();
                     inner.clear_remote_leader().await;
@@ -1306,8 +1392,8 @@ where
                     }
                 }
                 SyncRequest::ShareLeaderPath => {
-                    let path = self.inner.leader.lock().await.path.clone();
-                    let resp = match path {
+                    let info = self.inner.leader_info_message().await;
+                    let resp = match info.path {
                         None => SyncResponse::NoPathToLeader,
                         Some(path) if valid_local_leader_path(path.first().copied(), &path, self.inner.address) => {
                             SyncResponse::LeaderPath(path)
@@ -1343,12 +1429,37 @@ where
         if !self.send(SyncResponse::FreshState(state)).await {
             return false;
         }
+        if !self
+            .send(SyncResponse::LeaderInfo(self.inner.leader_info_message().await))
+            .await
+        {
+            return false;
+        }
 
         let write = self.write.clone();
+        let mut leader_updates = self.inner.leader_updates.subscribe();
         tokio::spawn(async move {
-            while let Ok((seq, action)) = feed.recv().await {
-                if write.send(SyncResponse::AuthorityAction(seq, action)).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    action = feed.recv() => {
+                        match action {
+                            Ok((seq, action)) => {
+                                if write.send(SyncResponse::AuthorityAction(seq, action)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    changed = leader_updates.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let info = leader_updates.borrow().clone();
+                        if write.send(SyncResponse::LeaderInfo(info)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -1377,12 +1488,37 @@ where
         if !self.send(SyncResponse::Accepted(feed.next_seq())).await {
             return false;
         }
+        if !self
+            .send(SyncResponse::LeaderInfo(self.inner.leader_info_message().await))
+            .await
+        {
+            return false;
+        }
 
         let write = self.write.clone();
+        let mut leader_updates = self.inner.leader_updates.subscribe();
         tokio::spawn(async move {
-            while let Ok((seq, action)) = feed.recv().await {
-                if write.send(SyncResponse::AuthorityAction(seq, action)).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    action = feed.recv() => {
+                        match action {
+                            Ok((seq, action)) => {
+                                if write.send(SyncResponse::AuthorityAction(seq, action)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    changed = leader_updates.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let info = leader_updates.borrow().clone();
+                        if write.send(SyncResponse::LeaderInfo(info)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -1425,6 +1561,7 @@ where
     }
 
     async fn handle_leader_status(&self, address: A, status: LeaderStatus<A>) {
+        let mut changed = false;
         match status {
             LeaderStatus::Promoted { term, leader } => {
                 let mut lock = self.inner.leader.lock().await;
@@ -1438,6 +1575,7 @@ where
                     } else {
                         None
                     };
+                    changed = true;
                 }
             }
             LeaderStatus::Offline { term, leader } => {
@@ -1446,11 +1584,15 @@ where
                     lock.leader = None;
                     lock.path = None;
                     lock.term = term;
+                    changed = true;
                 }
             }
             LeaderStatus::Observation(observation) => {
                 self.inner.record_observation(observation).await;
             }
+        }
+        if changed {
+            self.inner.publish_leader_info().await;
         }
     }
 

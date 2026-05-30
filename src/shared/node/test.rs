@@ -151,6 +151,14 @@ async fn wait_for_leader(node: &NodeState<u64, TestState>, expected: Option<u64>
     wait_until(timeout, || async { node.debug_info().await.leader == expected }).await
 }
 
+async fn wait_for_leader_path(node: &NodeState<u64, TestState>, expected: Vec<u64>, timeout: Duration) -> bool {
+    wait_until(timeout, || {
+        let expected = expected.clone();
+        async move { node.debug_info().await.leader_path == Some(expected) }
+    })
+    .await
+}
+
 #[path = "test/fuzzy.rs"]
 mod fuzzy;
 
@@ -321,4 +329,80 @@ async fn leader_rejoin_then_second_failover_promotes_available_candidate() {
 
     node7002_restarted.stop(&net).await;
     node7003.stop(&net).await;
+}
+
+#[tokio::test]
+async fn leader_path_update_propagates_to_downstream_followers() {
+    let net = SimulatedNet::new();
+
+    let node7001 = start_cluster_node(&net, 7001, true, &[7002, 7003, 7004]).await;
+    let node7002 = start_cluster_node(&net, 7002, false, &[7001, 7003, 7004]).await;
+    let node7003 = start_cluster_node(&net, 7003, false, &[7001, 7002, 7004]).await;
+    let node7004 = start_cluster_node(&net, 7004, false, &[7001, 7002, 7003]).await;
+
+    assert!(wait_for_leader(&node7001.node, Some(7001), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node7002.node, Some(7001), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node7003.node, Some(7001), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node7004.node, Some(7001), Duration::from_secs(3)).await);
+    assert!(wait_for_leader_path(&node7002.node, vec![7001, 7002], Duration::from_secs(3)).await);
+    assert!(wait_for_leader_path(&node7003.node, vec![7001, 7003], Duration::from_secs(3)).await);
+    assert!(wait_for_leader_path(&node7004.node, vec![7001, 7004], Duration::from_secs(3)).await);
+
+    net.set_edge_blocked(7002, 7001, true).await;
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            let debug = node7002.node.debug_info().await;
+            debug.leader == Some(7001)
+                && debug
+                    .follow_remote
+                    .is_some_and(|remote| remote == 7003 || remote == 7004)
+                && debug.follow_remote != Some(7001)
+                && debug
+                    .follow_leader_path
+                    .as_ref()
+                    .is_some_and(|path| path.first() == Some(&7001) && path.last() == Some(&7002))
+        })
+        .await,
+        "{:#?}",
+        node7002.node.debug_info().await
+    );
+
+    let relay = node7002.node.debug_info().await.follow_remote.unwrap();
+    let backup = if relay == 7003 { 7004 } else { 7003 };
+
+    net.set_edge_blocked(7002, backup, true).await;
+    net.set_edge_blocked(relay, 7001, true).await;
+
+    let relay_node = if relay == 7003 { &node7003.node } else { &node7004.node };
+
+    let expected_relay_path = vec![7001, backup, relay];
+    let expected_node_path = vec![7001, backup, relay, 7002];
+
+    assert!(
+        wait_for_leader_path(relay_node, expected_relay_path.clone(), Duration::from_secs(3)).await,
+        "relay={relay} backup={backup} relay_debug={:#?}",
+        relay_node.debug_info().await
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let expected_node_path = expected_node_path.clone();
+            async {
+                let debug = node7002.node.debug_info().await;
+                debug.leader == Some(7001)
+                    && debug.leader_path == Some(expected_node_path.clone())
+                    && debug.follow_remote == Some(relay)
+                    && debug.follow_leader_path == Some(expected_node_path)
+            }
+        })
+        .await,
+        "relay={relay} backup={backup} node7002_debug={:#?}",
+        node7002.node.debug_info().await
+    );
+
+    node7001.stop(&net).await;
+    node7002.stop(&net).await;
+    node7003.stop(&net).await;
+    node7004.stop(&net).await;
 }
