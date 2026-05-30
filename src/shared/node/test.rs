@@ -1,16 +1,6 @@
-
 use super::*;
-use crate::net::message_channel::NetIoSettings;
-use std::{
-    collections::BTreeMap,
-    pin::Pin,
-    sync::{Arc as StdArc, Mutex as StdMutex},
-    task::{Context, Poll},
-};
-use tokio::{
-    io::{duplex, split, AsyncRead, AsyncWrite, DuplexStream, ReadBuf, ReadHalf, WriteHalf},
-    sync::oneshot,
-};
+use crate::net::{message_channel::NetIoSettings, simulated::SimulatedNet};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TestState {
@@ -108,298 +98,6 @@ async fn node(address: u64, can_lead: bool) -> NodeState<u64, TestState> {
     .await
 }
 
-struct TestIncoming {
-    remote: u64,
-    read: KillableIo<ReadHalf<DuplexStream>>,
-    write: KillableIo<WriteHalf<DuplexStream>>,
-}
-
-#[derive(Clone)]
-struct TestNet {
-    inner: Arc<Mutex<TestNetInner>>,
-}
-
-struct TestNetInner {
-    listeners: HashMap<u64, mpsc::Sender<TestIncoming>>,
-    active_connections: HashMap<u64, Vec<KillHandle>>,
-    active_connection_edges: HashMap<(u64, u64), Vec<KillHandle>>,
-    blocked_nodes: HashSet<u64>,
-    blocked_edges: HashSet<(u64, u64)>,
-}
-
-#[derive(Clone, Debug)]
-struct TestTopologySnapshot {
-    online: BTreeSet<u64>,
-    blocked_nodes: BTreeSet<u64>,
-    blocked_edges: BTreeSet<(u64, u64)>,
-}
-
-impl TestNet {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(TestNetInner {
-                listeners: HashMap::new(),
-                active_connections: HashMap::new(),
-                active_connection_edges: HashMap::new(),
-                blocked_nodes: HashSet::new(),
-                blocked_edges: HashSet::new(),
-            })),
-        }
-    }
-
-    async fn start_io(&self, address: u64) -> Arc<TestIo> {
-        let (tx, rx) = mpsc::channel(128);
-        self.inner.lock().await.listeners.insert(address, tx);
-        Arc::new(TestIo {
-            address,
-            net: self.clone(),
-            incoming: Arc::new(Mutex::new(rx)),
-        })
-    }
-
-    async fn stop_node(&self, address: u64) {
-        let handles = {
-            let mut inner = self.inner.lock().await;
-            inner.listeners.remove(&address);
-            inner.active_connections.remove(&address).unwrap_or_default()
-        };
-
-        for handle in handles {
-            handle.kill();
-        }
-    }
-
-    async fn set_edge_blocked(&self, a: u64, b: u64, blocked: bool) {
-        let edge = Self::edge_key(a, b);
-        let handles = {
-            let mut inner = self.inner.lock().await;
-            if blocked {
-                inner.blocked_edges.insert(edge);
-                inner.active_connection_edges.remove(&edge).unwrap_or_default()
-            } else {
-                inner.blocked_edges.remove(&edge);
-                Vec::new()
-            }
-        };
-
-        for handle in handles {
-            handle.kill();
-        }
-    }
-
-    async fn clear_edge_blocks(&self) {
-        self.inner.lock().await.blocked_edges.clear();
-    }
-
-    async fn set_node_blocked(&self, address: u64, blocked: bool) {
-        let handles = {
-            let mut inner = self.inner.lock().await;
-            if blocked {
-                inner.blocked_nodes.insert(address);
-                inner.active_connections.remove(&address).unwrap_or_default()
-            } else {
-                inner.blocked_nodes.remove(&address);
-                Vec::new()
-            }
-        };
-
-        for handle in handles {
-            handle.kill();
-        }
-    }
-
-    async fn clear_node_blocks(&self) {
-        self.inner.lock().await.blocked_nodes.clear();
-    }
-
-    async fn topology_snapshot(&self) -> TestTopologySnapshot {
-        let inner = self.inner.lock().await;
-        TestTopologySnapshot {
-            online: inner.listeners.keys().copied().collect(),
-            blocked_nodes: inner.blocked_nodes.iter().copied().collect(),
-            blocked_edges: inner.blocked_edges.iter().copied().collect(),
-        }
-    }
-
-    fn edge_key(a: u64, b: u64) -> (u64, u64) {
-        if a < b {
-            (a, b)
-        } else {
-            (b, a)
-        }
-    }
-}
-
-#[derive(Clone)]
-struct TestIo {
-    address: u64,
-    net: TestNet,
-    incoming: Arc<Mutex<mpsc::Receiver<TestIncoming>>>,
-}
-
-impl SyncIO for TestIo {
-    type Address = u64;
-    type Read = KillableIo<ReadHalf<DuplexStream>>;
-    type Write = KillableIo<WriteHalf<DuplexStream>>;
-
-    async fn connect(&self, remote: &Self::Address) -> std::io::Result<SyncConnection<Self>> {
-        let (tx, handles) = {
-            let mut net = self.net.inner.lock().await;
-            if net.blocked_nodes.contains(&self.address)
-                || net.blocked_nodes.contains(remote)
-                || net.blocked_edges.contains(&TestNet::edge_key(self.address, *remote))
-            {
-                return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "connection blocked"));
-            }
-            let tx = net.listeners.get(remote).cloned();
-            let handles = [
-                KillHandle::new(),
-                KillHandle::new(),
-                KillHandle::new(),
-                KillHandle::new(),
-            ];
-            let active = net.active_connections.entry(self.address).or_default();
-            active.extend(handles.iter().map(|(handle, _)| handle.clone()));
-            let active = net.active_connections.entry(*remote).or_default();
-            active.extend(handles.iter().map(|(handle, _)| handle.clone()));
-            let active = net
-                .active_connection_edges
-                .entry(TestNet::edge_key(self.address, *remote))
-                .or_default();
-            active.extend(handles.iter().map(|(handle, _)| handle.clone()));
-            (tx, handles)
-        };
-
-        let Some(tx) = tx else {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "remote offline"));
-        };
-
-        let (client, server) = duplex(64 * 1024);
-        let (client_read, client_write) = split(client);
-        let (server_read, server_write) = split(server);
-        let [(client_read_handle, client_read_kill), (client_write_handle, client_write_kill), (server_read_handle, server_read_kill), (server_write_handle, server_write_kill)] =
-            handles;
-        drop((client_read_handle, client_write_handle, server_read_handle, server_write_handle));
-
-        tx.send(TestIncoming {
-            remote: self.address,
-            read: KillableIo::new(server_read, server_read_kill),
-            write: KillableIo::new(server_write, server_write_kill),
-        })
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotConnected, "remote listener closed"))?;
-
-        Ok(SyncConnection {
-            remote: *remote,
-            read: KillableIo::new(client_read, client_read_kill),
-            write: KillableIo::new(client_write, client_write_kill),
-        })
-    }
-}
-
-impl SyncIOListener for TestIo {
-    async fn next_client(&self) -> std::io::Result<SyncConnection<Self>> {
-        let incoming = self
-            .incoming
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "listener closed"))?;
-        Ok(SyncConnection {
-            remote: incoming.remote,
-            read: incoming.read,
-            write: incoming.write,
-        })
-    }
-}
-
-#[derive(Clone)]
-struct KillHandle(StdArc<StdMutex<Option<oneshot::Sender<()>>>>);
-
-impl KillHandle {
-    fn new() -> (Self, oneshot::Receiver<()>) {
-        let (tx, rx) = oneshot::channel();
-        (Self(StdArc::new(StdMutex::new(Some(tx)))), rx)
-    }
-
-    fn kill(&self) {
-        if let Some(tx) = self.0.lock().unwrap().take() {
-            let _ = tx.send(());
-        }
-    }
-}
-
-struct KillableIo<I> {
-    inner: I,
-    kill: oneshot::Receiver<()>,
-    killed: bool,
-}
-
-impl<I> KillableIo<I> {
-    fn new(inner: I, kill: oneshot::Receiver<()>) -> Self {
-        Self {
-            inner,
-            kill,
-            killed: false,
-        }
-    }
-
-    fn poll_kill(&mut self, cx: &mut Context<'_>) -> Option<Poll<std::io::Result<()>>> {
-        if self.killed {
-            return Some(Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection killed"))));
-        }
-
-        match Pin::new(&mut self.kill).poll(cx) {
-            Poll::Ready(_) => {
-                self.killed = true;
-                Some(Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection killed"))))
-            }
-            Poll::Pending => None,
-        }
-    }
-}
-
-impl<I: AsyncRead + Unpin> AsyncRead for KillableIo<I> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        if let Some(kill) = self.poll_kill(cx) {
-            return kill;
-        }
-
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl<I: AsyncWrite + Unpin> AsyncWrite for KillableIo<I> {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        if let Some(kill) = self.poll_kill(cx) {
-            return match kill {
-                Poll::Ready(Ok(())) => unreachable!(),
-                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-                Poll::Pending => Poll::Pending,
-            };
-        }
-
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if let Some(kill) = self.poll_kill(cx) {
-            return kill;
-        }
-
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if let Some(kill) = self.poll_kill(cx) {
-            return kill;
-        }
-
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
 struct TestClusterNode {
     address: u64,
     node: NodeState<u64, TestState>,
@@ -409,14 +107,14 @@ struct TestClusterNode {
 }
 
 impl TestClusterNode {
-    async fn stop(self, net: &TestNet) {
+    async fn stop(self, net: &SimulatedNet) {
         self.listener.abort();
         self.client.abort();
         net.stop_node(self.address).await;
     }
 }
 
-async fn start_cluster_node(net: &TestNet, address: u64, can_lead: bool, peers: &[u64]) -> TestClusterNode {
+async fn start_cluster_node(net: &SimulatedNet, address: u64, can_lead: bool, peers: &[u64]) -> TestClusterNode {
     let io = net.start_io(address).await;
     let node = node(address, can_lead).await;
     node.discover_peers(peers.iter().copied()).await;
@@ -556,7 +254,7 @@ async fn local_observation_does_not_advertise_remote_leader_without_follow_path(
 
 #[tokio::test]
 async fn leader_rejoin_then_second_failover_promotes_available_candidate() {
-    let net = TestNet::new();
+    let net = SimulatedNet::new();
 
     let node7001 = start_cluster_node(&net, 7001, true, &[7002, 7003]).await;
     let mut node7002 = Some(start_cluster_node(&net, 7002, true, &[7001, 7003]).await);

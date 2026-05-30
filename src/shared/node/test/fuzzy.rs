@@ -1,4 +1,5 @@
 use super::*;
+use crate::net::simulated::{SimulatedNet, SimulatedTopologySnapshot};
 use rand_chacha::{
     rand_core::{RngCore, SeedableRng},
     ChaCha8Rng,
@@ -64,7 +65,7 @@ fn default_runtime_seed() -> u64 {
 
 #[allow(dead_code)]
 struct FuzzyCluster {
-    net: TestNet,
+    net: SimulatedNet,
     nodes: HashMap<u64, TestClusterNode>,
     can_lead: BTreeSet<u64>,
     followers: BTreeSet<u64>,
@@ -75,7 +76,7 @@ impl FuzzyCluster {
     async fn start(config: &FuzzyConfig) -> Self {
         assert!(config.can_lead_count > 0, "fuzzy test needs at least one can_lead node");
 
-        let net = TestNet::new();
+        let net = SimulatedNet::new();
         let can_lead = (0..config.can_lead_count)
             .map(|idx| 7001 + idx as u64)
             .collect::<BTreeSet<_>>();
@@ -168,7 +169,7 @@ impl FuzzyCluster {
         snapshot
     }
 
-    async fn current_expectation(&self) -> (TestTopologySnapshot, StabilizationExpectation) {
+    async fn current_expectation(&self) -> (SimulatedTopologySnapshot, StabilizationExpectation) {
         let topology = self.net.topology_snapshot().await;
         let expectation = stabilization_expectation(&topology, &self.can_lead);
         (topology, expectation)
@@ -257,12 +258,15 @@ struct FuzzyFailureReport {
     elapsed: Duration,
     event_index: u64,
     last_events: Vec<FuzzyEvent>,
-    topology: TestTopologySnapshot,
+    topology: SimulatedTopologySnapshot,
     expectation: StabilizationExpectation,
     debug: Vec<NodeDebugInfo<u64>>,
 }
 
-fn stabilization_expectation(topology: &TestTopologySnapshot, can_lead: &BTreeSet<u64>) -> StabilizationExpectation {
+fn stabilization_expectation(
+    topology: &SimulatedTopologySnapshot,
+    can_lead: &BTreeSet<u64>,
+) -> StabilizationExpectation {
     let online = topology
         .online
         .difference(&topology.blocked_nodes)
@@ -297,7 +301,7 @@ fn stabilization_expectation(topology: &TestTopologySnapshot, can_lead: &BTreeSe
             if current == next || visited.contains(&next) {
                 continue;
             }
-            if !topology.blocked_edges.contains(&TestNet::edge_key(current, next)) {
+            if !topology.blocked_edges.contains(&SimulatedNet::edge_key(current, next)) {
                 queue.push_back(next);
             }
         }
@@ -405,7 +409,7 @@ struct FuzzyReportContext<'a> {
     started: tokio::time::Instant,
     event_index: u64,
     last_events: &'a VecDeque<FuzzyEvent>,
-    topology: TestTopologySnapshot,
+    topology: SimulatedTopologySnapshot,
 }
 
 impl FuzzyReportContext<'_> {
@@ -476,7 +480,7 @@ async fn choose_event(rng: &mut ChaCha8Rng, cluster: &FuzzyCluster) -> FuzzyEven
                 .filter_map(|info| info.leader_path.as_ref())
                 .flat_map(|path| {
                     path.windows(2)
-                        .map(|edge| TestNet::edge_key(edge[0], edge[1]))
+                        .map(|edge| SimulatedNet::edge_key(edge[0], edge[1]))
                         .collect::<Vec<_>>()
                 })
                 .collect::<BTreeSet<_>>();
@@ -510,7 +514,7 @@ fn random_pair(rng: &mut ChaCha8Rng, addresses: &[u64]) -> Option<(u64, u64)> {
     if a == b {
         b = (b + 1) % addresses.len();
     }
-    Some(TestNet::edge_key(addresses[a], addresses[b]))
+    Some(SimulatedNet::edge_key(addresses[a], addresses[b]))
 }
 
 async fn run_fuzzy_cluster(config: FuzzyConfig) {
