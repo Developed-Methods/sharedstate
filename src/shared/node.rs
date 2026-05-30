@@ -1013,16 +1013,27 @@ where
                 if *addr == self.inner.address {
                     return None;
                 }
-                let details = details.as_ref()?;
-                Some(FollowCandidate {
-                    address: *addr,
-                    connected: details.connected,
-                    latency_ms: details.latency_ms,
-                    repeat_connect_fails: details.repeat_connect_fails,
-                    last_connect_fail_ms: details.last_connect_fail.map(|v| v.get()),
-                    failed_without_activity: details.last_activity.is_none() && details.last_connect_fail.is_some(),
-                    can_lead: details.can_lead,
-                    observed_leader: details.last_observation.as_ref().and_then(|o| o.leader),
+                Some(match details {
+                    Some(details) => FollowCandidate {
+                        address: *addr,
+                        connected: details.connected,
+                        latency_ms: details.latency_ms,
+                        repeat_connect_fails: details.repeat_connect_fails,
+                        last_connect_fail_ms: details.last_connect_fail.map(|v| v.get()),
+                        failed_without_activity: details.last_activity.is_none() && details.last_connect_fail.is_some(),
+                        can_lead: details.can_lead,
+                        observed_leader: details.last_observation.as_ref().and_then(|o| o.leader),
+                    },
+                    None => FollowCandidate {
+                        address: *addr,
+                        connected: false,
+                        latency_ms: None,
+                        repeat_connect_fails: 0,
+                        last_connect_fail_ms: None,
+                        failed_without_activity: false,
+                        can_lead: false,
+                        observed_leader: None,
+                    },
                 })
             })
             .collect::<Vec<_>>();

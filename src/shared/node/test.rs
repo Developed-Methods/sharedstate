@@ -439,6 +439,43 @@ async fn non_leader_does_not_periodically_observe_known_non_leader_peers() {
 }
 
 #[tokio::test]
+async fn non_leader_falls_back_to_non_leader_relay_when_can_lead_peers_are_unreachable() {
+    let net = SimulatedNet::new();
+
+    let node1 = start_cluster_node(&net, 1, true, &[2, 3, 4]).await;
+    let node2 = start_cluster_node(&net, 2, true, &[1, 3, 4]).await;
+    let node3 = start_cluster_node(&net, 3, false, &[1, 2, 4]).await;
+    let node4 = start_cluster_node(&net, 4, false, &[1, 2]).await;
+
+    assert!(wait_for_leader(&node1.node, Some(1), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node2.node, Some(1), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node3.node, Some(1), Duration::from_secs(3)).await);
+    assert!(wait_for_leader(&node4.node, Some(1), Duration::from_secs(3)).await);
+
+    net.set_edge_blocked(4, 1, true).await;
+    net.set_edge_blocked(4, 2, true).await;
+
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            let debug = node4.node.debug_info().await;
+            debug.leader == Some(1)
+                && debug.follow_remote == Some(3)
+                && debug.leader_path == Some(vec![1, 3, 4])
+                && debug.follow_leader_path == Some(vec![1, 3, 4])
+        })
+        .await,
+        "node3={:#?}\nnode4={:#?}",
+        node3.node.debug_info().await,
+        node4.node.debug_info().await
+    );
+
+    node1.stop(&net).await;
+    node2.stop(&net).await;
+    node3.stop(&net).await;
+    node4.stop(&net).await;
+}
+
+#[tokio::test]
 async fn promoted_leader_uses_higher_term_than_isolated_old_leader() {
     let net = SimulatedNet::new();
 

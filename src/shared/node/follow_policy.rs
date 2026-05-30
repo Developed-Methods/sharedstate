@@ -115,4 +115,14 @@ mod tests {
         let sorted = sort_follow_candidates(None, vec![candidate(3), candidate(2)]);
         assert_eq!(sorted.into_iter().map(|c| c.address).collect::<Vec<_>>(), vec![2, 3]);
     }
+
+    #[test]
+    fn unknown_peer_is_available_as_last_resort() {
+        let mut failed_leader = candidate(1);
+        failed_leader.failed_without_activity = true;
+        let unknown_relay = candidate(3);
+
+        let sorted = sort_follow_candidates(Some(1), vec![failed_leader, unknown_relay]);
+        assert_eq!(sorted.into_iter().map(|c| c.address).collect::<Vec<_>>(), vec![3, 1]);
+    }
 }
