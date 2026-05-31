@@ -34,7 +34,7 @@ pub(super) fn observation_targets<A: SyncIOAddress>(input: ObservationTargetInpu
         let should_observe = Some(addr) == input.leader && addr != input.local
             || Some(addr) == input.follow_remote
             || matches!(kind, PeerKind::Known { can_lead: true })
-            || matches!(kind, PeerKind::Unknown) && !input.has_usable_path;
+            || !input.has_usable_path;
 
         if should_observe {
             targets.insert(addr);
@@ -76,13 +76,13 @@ mod tests {
     }
 
     #[test]
-    fn follower_without_path_observes_unknown_seed_peers() {
+    fn follower_without_path_observes_all_known_and_unknown_peers() {
         let mut input = input(false);
         input.leader = None;
         input.follow_remote = None;
         input.has_usable_path = false;
 
-        assert_eq!(observation_targets(input), vec![2, 5]);
+        assert_eq!(observation_targets(input), vec![2, 3, 4, 5]);
     }
 
     #[test]
