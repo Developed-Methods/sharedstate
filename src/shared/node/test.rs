@@ -230,9 +230,9 @@ async fn can_lead_node_promotes_when_other_can_lead_peers_are_inactive() {
 
     node.inner.apply_election().await;
 
-    let leader = node.inner.leader.lock().await;
-    assert_eq!(leader.leader, Some(2));
-    assert_eq!(leader.path, Some(vec![2]));
+    let control = node.inner.control.lock().await;
+    assert_eq!(control.leader.leader, Some(2));
+    assert_eq!(control.leader.path, Some(vec![2]));
 }
 
 #[tokio::test]
@@ -258,18 +258,18 @@ async fn can_lead_node_promotes_with_majority_reachability() {
         .await;
 
     {
-        let mut peers = node.inner.peers.lock().await;
-        let peer = peers.get_mut(&3).unwrap().as_mut().unwrap();
+        let mut control = node.inner.control.lock().await;
+        let peer = control.peers.get_mut(&3).unwrap().as_mut().unwrap();
         peer.last_activity = NonZeroU64::new(now_ms());
         peer.connected = true;
     }
 
     node.inner.apply_election().await;
 
-    let leader = node.inner.leader.lock().await;
-    assert_eq!(leader.leader, Some(2));
-    assert_eq!(leader.path, Some(vec![2]));
-    assert!(0 < leader.term);
+    let control = node.inner.control.lock().await;
+    assert_eq!(control.leader.leader, Some(2));
+    assert_eq!(control.leader.path, Some(vec![2]));
+    assert!(0 < control.leader.term);
 }
 
 #[tokio::test]
@@ -277,10 +277,10 @@ async fn local_observation_does_not_advertise_remote_leader_without_follow_path(
     let node = node(2, true).await;
 
     {
-        let mut leader = node.inner.leader.lock().await;
-        leader.leader = Some(1);
-        leader.path = Some(vec![1]);
-        leader.term = 4;
+        let mut control = node.inner.control.lock().await;
+        control.leader.leader = Some(1);
+        control.leader.path = Some(vec![1]);
+        control.leader.term = 4;
     }
 
     let observation = node.inner.local_observation().await;

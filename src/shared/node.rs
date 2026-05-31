@@ -112,15 +112,19 @@ struct Inner<A: SyncIOAddress, D: DeterministicState> {
     address: A,
     can_lead: bool,
     timing: NodeTiming,
-    leader: Mutex<LeaderInfo<A>>,
-    peers: Mutex<HashMap<A, Option<PeerDetails<A>>>>,
+    control: Mutex<ControlState<A, D>>,
     state: Mutex<AuthorativeState<D>>,
     state_reader: SharedStateReader<RecoverableState<D>>,
     local_actions_tx: mpsc::Sender<D::Action>,
     local_actions_rx: Mutex<Option<mpsc::Receiver<D::Action>>>,
-    follow: Mutex<Option<FollowConnection<A, D>>>,
-    election: Mutex<ElectionState<A>>,
     leader_updates: watch::Sender<LeaderInfoMessage<A>>,
+}
+
+struct ControlState<A: SyncIOAddress, D: DeterministicState> {
+    leader: LeaderInfo<A>,
+    peers: HashMap<A, Option<PeerDetails<A>>>,
+    follow: Option<FollowConnection<A, D>>,
+    election: ElectionState<A>,
 }
 
 #[derive(Clone)]
@@ -179,47 +183,49 @@ where
                 address,
                 can_lead,
                 timing,
-                leader: Mutex::new(LeaderInfo {
-                    leader: None,
-                    path: None,
-                    term: 0,
-                }),
-                peers: Mutex::new({
-                    let mut map = HashMap::new();
-                    map.insert(
-                        address,
-                        Some(PeerDetails {
-                            last_activity: None,
-                            last_connect_attempt: None,
-                            last_connect_fail: None,
-                            last_global_activity: None,
-                            repeat_connect_fails: 0,
-                            latency_ms: Some(0),
-                            can_lead,
-                            connected: true,
-                            last_observation: None,
-                        }),
-                    );
+                control: Mutex::new(ControlState {
+                    leader: LeaderInfo {
+                        leader: None,
+                        path: None,
+                        term: 0,
+                    },
+                    peers: {
+                        let mut map = HashMap::new();
+                        map.insert(
+                            address,
+                            Some(PeerDetails {
+                                last_activity: None,
+                                last_connect_attempt: None,
+                                last_connect_fail: None,
+                                last_global_activity: None,
+                                repeat_connect_fails: 0,
+                                latency_ms: Some(0),
+                                can_lead,
+                                connected: true,
+                                last_observation: None,
+                            }),
+                        );
 
-                    map
+                        map
+                    },
+                    follow: None,
+                    election: ElectionState {
+                        term: 0,
+                        known_can_lead: {
+                            let mut set = BTreeSet::new();
+                            if can_lead {
+                                set.insert(address);
+                            }
+                            set
+                        },
+                        observations: HashMap::new(),
+                        last_promoted_leader: None,
+                    },
                 }),
                 state: Mutex::new(state),
                 state_reader,
                 local_actions_tx,
                 local_actions_rx: Mutex::new(Some(local_actions_rx)),
-                follow: Mutex::new(None),
-                election: Mutex::new(ElectionState {
-                    term: 0,
-                    known_can_lead: {
-                        let mut set = BTreeSet::new();
-                        if can_lead {
-                            set.insert(address);
-                        }
-                        set
-                    },
-                    observations: HashMap::new(),
-                    last_promoted_leader: None,
-                }),
                 leader_updates,
             }),
             io_settings,
@@ -334,7 +340,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         tokio::spawn(async move {
             while let Some(mut action) = rx.recv().await {
                 loop {
-                    let is_leader = inner.leader.lock().await.leader == Some(inner.address);
+                    let is_leader = inner.control.lock().await.leader.leader == Some(inner.address);
                     if is_leader {
                         let authority = {
                             let state = inner.state.lock().await;
@@ -350,7 +356,13 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                         break;
                     }
 
-                    let follow_tx = inner.follow.lock().await.as_ref().map(|follow| follow.to_peer.clone());
+                    let follow_tx = inner
+                        .control
+                        .lock()
+                        .await
+                        .follow
+                        .as_ref()
+                        .map(|follow| follow.to_peer.clone());
 
                     if let Some(follow_tx) = follow_tx {
                         match follow_tx
@@ -377,8 +389,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
     }
 
     pub async fn discover_peers(&self, peers: impl Iterator<Item = impl Into<SharePeerDetails<A>>>) {
-        let mut peers_lock = self.peers.lock().await;
-        let mut election = self.election.lock().await;
+        let mut control = self.control.lock().await;
 
         for peer in peers {
             let details = peer.into();
@@ -387,36 +398,32 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                 continue;
             }
 
-            match peers_lock.entry(details.address) {
-                hash_map::Entry::Vacant(v) => {
-                    v.insert(details.can_be_leader.map(|can_lead| {
-                        if can_lead {
-                            election.known_can_lead.insert(details.address);
-                        }
+            if let Some(can_lead) = details.can_be_leader {
+                if can_lead {
+                    control.election.known_can_lead.insert(details.address);
+                } else {
+                    control.election.known_can_lead.remove(&details.address);
+                }
+            }
 
-                        PeerDetails {
-                            last_activity: None,
-                            last_connect_attempt: None,
-                            last_connect_fail: None,
-                            repeat_connect_fails: 0,
-                            latency_ms: None,
-                            can_lead,
-                            last_global_activity: details.last_global_activity,
-                            connected: false,
-                            last_observation: None,
-                        }
+            match control.peers.entry(details.address) {
+                hash_map::Entry::Vacant(v) => {
+                    v.insert(details.can_be_leader.map(|can_lead| PeerDetails {
+                        last_activity: None,
+                        last_connect_attempt: None,
+                        last_connect_fail: None,
+                        repeat_connect_fails: 0,
+                        latency_ms: None,
+                        can_lead,
+                        last_global_activity: details.last_global_activity,
+                        connected: false,
+                        last_observation: None,
                     }));
                 }
                 hash_map::Entry::Occupied(o) => {
                     let value = o.into_mut();
 
                     if let Some(can_lead) = details.can_be_leader {
-                        if can_lead {
-                            election.known_can_lead.insert(details.address);
-                        } else {
-                            election.known_can_lead.remove(&details.address);
-                        }
-
                         if let Some(current) = value {
                             current.can_lead = can_lead;
                             if details.last_global_activity > current.last_global_activity {
@@ -443,9 +450,10 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
     }
 
     async fn peer_snapshot(&self) -> Vec<SharePeerDetails<A>> {
-        let locked = self.peers.lock().await;
+        let control = self.control.lock().await;
 
-        locked
+        control
+            .peers
             .iter()
             .map(|(address, details)| SharePeerDetails {
                 address: *address,
@@ -456,13 +464,9 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
     }
 
     async fn leader_info_message(&self) -> LeaderInfoMessage<A> {
-        let leader = self.leader.lock().await.clone();
-        let follow_path = self
-            .follow
-            .lock()
-            .await
-            .as_ref()
-            .map(|follow| follow.leader_path.clone());
+        let control = self.control.lock().await;
+        let leader = control.leader.clone();
+        let follow_path = control.follow.as_ref().map(|follow| follow.leader_path.clone());
         let (leader_addr, path) = match leader.leader {
             Some(addr) if addr == self.address => (Some(addr), leader.path),
             Some(addr) => match follow_path {
@@ -486,17 +490,15 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
 
     async fn debug_info(&self) -> NodeDebugInfo<A> {
         let now = now_ms();
-        let leader = self.leader.lock().await.clone();
-        let follow = self
+        let control = self.control.lock().await;
+        let leader = control.leader.clone();
+        let follow = control
             .follow
-            .lock()
-            .await
             .as_ref()
             .map(|follow| (follow.remote, follow.leader_path.clone()));
-        let election = self.election.lock().await;
-        let peers = self.peers.lock().await;
 
-        let mut peer_debug = peers
+        let mut peer_debug = control
+            .peers
             .iter()
             .map(|(address, details)| {
                 let observation = details.as_ref().and_then(|details| details.last_observation.clone());
@@ -534,7 +536,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             .collect::<Vec<_>>();
         peer_debug.sort_by_key(|peer| peer.address);
 
-        let mut observations = election.observations.values().cloned().collect::<Vec<_>>();
+        let mut observations = control.election.observations.values().cloned().collect::<Vec<_>>();
         observations.sort_by_key(|observation| observation.observer);
 
         NodeDebugInfo {
@@ -545,32 +547,28 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             term: leader.term,
             follow_remote: follow.as_ref().map(|(remote, _)| *remote),
             follow_leader_path: follow.map(|(_, path)| path),
-            known_can_lead: election.known_can_lead.iter().copied().collect(),
-            last_promoted_leader: election.last_promoted_leader,
+            known_can_lead: control.election.known_can_lead.iter().copied().collect(),
+            last_promoted_leader: control.election.last_promoted_leader,
             observations,
             peers: peer_debug,
         }
     }
 
     async fn local_observation(&self) -> ElectionObservation<A> {
-        let leader = self.leader.lock().await.clone();
-        let follow_path = self
-            .follow
-            .lock()
-            .await
-            .as_ref()
-            .map(|follow| follow.leader_path.clone());
-        let (leader_addr, leader_path) = match leader.leader {
-            Some(addr) if addr == self.address => (Some(addr), leader.path),
-            Some(addr) => match follow_path {
-                Some(path) => (Some(addr), Some(path)),
+        let (term, leader_addr, leader_path, reachable_can_lead) = {
+            let control = self.control.lock().await;
+            let leader = control.leader.clone();
+            let follow_path = control.follow.as_ref().map(|follow| follow.leader_path.clone());
+            let (leader_addr, leader_path) = match leader.leader {
+                Some(addr) if addr == self.address => (Some(addr), leader.path),
+                Some(addr) => match follow_path {
+                    Some(path) => (Some(addr), Some(path)),
+                    None => (None, None),
+                },
                 None => (None, None),
-            },
-            None => (None, None),
-        };
-        let reachable_can_lead = {
-            let peers = self.peers.lock().await;
-            peers
+            };
+            let reachable_can_lead = control
+                .peers
                 .iter()
                 .filter_map(|(addr, details)| {
                     let details = details.as_ref()?;
@@ -580,13 +578,14 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                         None
                     }
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (leader.term, leader_addr, leader_path, reachable_can_lead)
         };
         let state_accept_seq = self.state.lock().await.state_clone().await.state().accept_seq();
 
         ElectionObservation {
             observer: self.address,
-            term: leader.term,
+            term,
             leader: leader_addr,
             leader_path,
             can_lead: self.can_lead,
@@ -596,8 +595,9 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
     }
 
     async fn record_observation(&self, mut observation: ElectionObservation<A>) {
+        let mut control = self.control.lock().await;
         if observation.can_lead {
-            self.election.lock().await.known_can_lead.insert(observation.observer);
+            control.election.known_can_lead.insert(observation.observer);
         }
 
         if let Some(leader) = observation.leader {
@@ -607,10 +607,8 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                     .as_deref()
                     .map(|path| valid_remote_leader_path(Some(leader), path, self.address))
                     .unwrap_or(false);
-                let leader_is_failed = self
+                let leader_is_failed = control
                     .peers
-                    .lock()
-                    .await
                     .get(&leader)
                     .and_then(|details| details.as_ref())
                     .map(|details| {
@@ -625,14 +623,14 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             }
         }
 
-        {
-            let mut election = self.election.lock().await;
-            election.term = election.term.max(observation.term);
-            election.observations.insert(observation.observer, observation.clone());
-        }
+        control.election.term = control.election.term.max(observation.term);
+        control
+            .election
+            .observations
+            .insert(observation.observer, observation.clone());
 
-        let mut peers = self.peers.lock().await;
-        let details = peers
+        let details = control
+            .peers
             .entry(observation.observer)
             .or_insert_with(|| {
                 Some(PeerDetails {
@@ -667,11 +665,15 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
     async fn apply_election(&self) {
         let local_observation = self.local_observation().await;
         let now = now_ms();
-        let (known_can_lead, observations, local_term) = {
-            let election = self.election.lock().await;
-            (election.known_can_lead.clone(), election.observations.clone(), election.term)
+        let (known_can_lead, observations, local_term, peer_details) = {
+            let control = self.control.lock().await;
+            (
+                control.election.known_can_lead.clone(),
+                control.election.observations.clone(),
+                control.election.term,
+                control.peers.clone(),
+            )
         };
-        let peer_details = self.peers.lock().await.clone();
         let max_seen_term = std::iter::once(&local_observation)
             .chain(observations.values())
             .map(|observation| observation.term)
@@ -723,11 +725,14 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             }
             ElectionDecision::FollowRemote { leader, term, path } => {
                 let changed = {
-                    let mut lock = self.leader.lock().await;
-                    if lock.term < term || lock.leader != Some(leader) || lock.path != Some(path.clone()) {
-                        lock.term = term;
-                        lock.leader = Some(leader);
-                        lock.path = Some(path);
+                    let mut control = self.control.lock().await;
+                    if control.leader.term < term
+                        || control.leader.leader != Some(leader)
+                        || control.leader.path != Some(path.clone())
+                    {
+                        control.leader.term = term;
+                        control.leader.leader = Some(leader);
+                        control.leader.path = Some(path);
                         true
                     } else {
                         false
@@ -746,29 +751,23 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
 
     async fn promote_if_needed(&self, observed_term: u64) {
         {
-            let leader = self.leader.lock().await;
-            if leader.leader == Some(self.address) && leader.path.as_deref() == Some(&[self.address]) {
+            let mut control = self.control.lock().await;
+            if control.leader.leader == Some(self.address) && control.leader.path.as_deref() == Some(&[self.address]) {
                 return;
             }
-        }
 
-        let current_leader_term = self.leader.lock().await.term;
-        let new_term = {
-            let mut election = self.election.lock().await;
-            election.term = election
+            let current_leader_term = control.leader.term;
+            control.election.term = control
+                .election
                 .term
                 .max(observed_term)
                 .max(current_leader_term)
                 .saturating_add(1);
-            election.last_promoted_leader = Some(self.address);
-            election.term
-        };
-
-        {
-            let mut leader = self.leader.lock().await;
-            leader.leader = Some(self.address);
-            leader.path = Some(vec![self.address]);
-            leader.term = new_term;
+            control.election.last_promoted_leader = Some(self.address);
+            let new_term = control.election.term;
+            control.leader.leader = Some(self.address);
+            control.leader.path = Some(vec![self.address]);
+            control.leader.term = new_term;
         }
         self.publish_leader_info().await;
 
@@ -780,21 +779,21 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
     }
 
     async fn clear_follow(&self) {
-        if let Some(follow) = self.follow.lock().await.take() {
+        if let Some(follow) = self.control.lock().await.follow.take() {
             follow.cancel.cancel();
         }
     }
 
     async fn observe_term(&self, term: u64) {
-        let mut election = self.election.lock().await;
-        election.term = election.term.max(term);
+        let mut control = self.control.lock().await;
+        control.election.term = control.election.term.max(term);
     }
 
     async fn clear_follow_to(&self, remote: A) -> bool {
         let follow = {
-            let mut lock = self.follow.lock().await;
-            if lock.as_ref().is_some_and(|follow| follow.remote == remote) {
-                lock.take()
+            let mut control = self.control.lock().await;
+            if control.follow.as_ref().is_some_and(|follow| follow.remote == remote) {
+                control.follow.take()
             } else {
                 None
             }
@@ -810,10 +809,10 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
 
     async fn clear_remote_leader_if(&self, leader_addr: A) {
         let changed = {
-            let mut leader = self.leader.lock().await;
-            if leader.leader == Some(leader_addr) && leader.leader != Some(self.address) {
-                leader.leader = None;
-                leader.path = None;
+            let mut control = self.control.lock().await;
+            if control.leader.leader == Some(leader_addr) && control.leader.leader != Some(self.address) {
+                control.leader.leader = None;
+                control.leader.path = None;
                 true
             } else {
                 false
@@ -826,10 +825,10 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
 
     async fn clear_remote_leader(&self) {
         let changed = {
-            let mut leader = self.leader.lock().await;
-            if leader.leader.is_some() && leader.leader != Some(self.address) {
-                leader.leader = None;
-                leader.path = None;
+            let mut control = self.control.lock().await;
+            if control.leader.leader.is_some() && control.leader.leader != Some(self.address) {
+                control.leader.leader = None;
+                control.leader.path = None;
                 true
             } else {
                 false
@@ -841,9 +840,10 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
     }
 
     async fn set_remote_leader_path(&self, leader_addr: A, term: Option<u64>, path: Vec<A>, follow_remote: Option<A>) {
-        let changed_leader = {
-            let mut leader = self.leader.lock().await;
-            if let Some(term) = term {
+        let (changed_leader, changed_follow) = {
+            let mut control = self.control.lock().await;
+            let leader = &mut control.leader;
+            let changed_leader = if let Some(term) = term {
                 if leader.term > term {
                     false
                 } else {
@@ -859,23 +859,24 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                 leader.leader = Some(leader_addr);
                 leader.path = Some(path.clone());
                 changed
-            }
-        };
+            };
 
-        let changed_follow = if let Some(follow_remote) = follow_remote {
-            let mut follow = self.follow.lock().await;
-            if let Some(follow) = follow.as_mut().filter(|follow| follow.remote == follow_remote) {
-                if follow.leader_path != path {
-                    follow.leader_path = path;
-                    true
+            let changed_follow = if let Some(follow_remote) = follow_remote {
+                if let Some(follow) = control.follow.as_mut().filter(|follow| follow.remote == follow_remote) {
+                    if follow.leader_path != path {
+                        follow.leader_path = path;
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
             } else {
                 false
-            }
-        } else {
-            false
+            };
+
+            (changed_leader, changed_follow)
         };
 
         if changed_leader || changed_follow {
@@ -920,18 +921,19 @@ where
     }
 
     async fn observation_targets(&self) -> Vec<I::Address> {
-        let leader = self.inner.leader.lock().await.leader;
-        let follow_remote = self.inner.follow.lock().await.as_ref().map(|follow| follow.remote);
+        let control = self.inner.control.lock().await;
+        let leader = control.leader.leader;
+        let follow_remote = control.follow.as_ref().map(|follow| follow.remote);
         let has_usable_path = leader.is_some() && (leader == Some(self.inner.address) || follow_remote.is_some());
 
-        let peers = self.inner.peers.lock().await;
         observation_targets(ObservationTargetInput {
             local: self.inner.address,
             can_lead: self.inner.can_lead,
             leader,
             follow_remote,
             has_usable_path,
-            peers: peers
+            peers: control
+                .peers
                 .iter()
                 .map(|(addr, details)| {
                     (
@@ -1010,13 +1012,16 @@ where
     }
 
     async fn ensure_follow_connection(&self) {
-        let leader = self.inner.leader.lock().await.leader;
+        let (leader, has_follow) = {
+            let control = self.inner.control.lock().await;
+            (control.leader.leader, control.follow.is_some())
+        };
         if leader == Some(self.inner.address) {
             self.inner.clear_follow().await;
             return;
         }
 
-        if self.inner.follow.lock().await.is_some() {
+        if has_follow {
             return;
         }
 
@@ -1029,8 +1034,9 @@ where
     }
 
     async fn select_follow_target(&self, leader: Option<I::Address>) -> Option<I::Address> {
-        let peers = self.inner.peers.lock().await;
-        let candidates = peers
+        let control = self.inner.control.lock().await;
+        let candidates = control
+            .peers
             .iter()
             .filter_map(|(addr, details)| {
                 if *addr == self.inner.address {
@@ -1167,7 +1173,7 @@ where
             cancel: cancel.clone(),
         };
 
-        if let Some(existing) = self.inner.follow.lock().await.replace(follow) {
+        if let Some(existing) = self.inner.control.lock().await.follow.replace(follow) {
             existing.cancel.cancel();
         }
 
@@ -1241,29 +1247,29 @@ where
                 }
             }
 
-            let closed_follow = { inner.follow.lock().await.take() };
+            let closed_follow = { inner.control.lock().await.follow.take() };
             if let Some(follow) = closed_follow {
                 if follow.remote == target {
                     follow.cancel.cancel();
                     inner.clear_remote_leader().await;
                 } else {
-                    let _ = inner.follow.lock().await.replace(follow);
+                    let _ = inner.control.lock().await.follow.replace(follow);
                 }
             }
         });
     }
 
     async fn mark_connect_attempt(&self, target: I::Address) {
-        let mut peers = self.inner.peers.lock().await;
-        if let Some(Some(details)) = peers.get_mut(&target) {
+        let mut control = self.inner.control.lock().await;
+        if let Some(Some(details)) = control.peers.get_mut(&target) {
             details.last_connect_attempt = NonZeroU64::new(now_ms());
         }
     }
 
     async fn mark_connect_fail(&self, target: I::Address) {
         {
-            let mut peers = self.inner.peers.lock().await;
-            if let Some(Some(details)) = peers.get_mut(&target) {
+            let mut control = self.inner.control.lock().await;
+            if let Some(Some(details)) = control.peers.get_mut(&target) {
                 details.last_activity = None;
                 details.last_connect_fail = NonZeroU64::new(now_ms());
                 details.repeat_connect_fails = details.repeat_connect_fails.saturating_add(1);
@@ -1271,7 +1277,7 @@ where
                 details.last_observation = None;
             }
 
-            for details in peers.values_mut().filter_map(Option::as_mut) {
+            for details in control.peers.values_mut().filter_map(Option::as_mut) {
                 let invalid_target_observation = details
                     .last_observation
                     .as_ref()
@@ -1288,14 +1294,8 @@ where
                     details.last_observation = None;
                 }
             }
-        }
 
-        self.inner
-            .election
-            .lock()
-            .await
-            .observations
-            .retain(|observer, observation| {
+            control.election.observations.retain(|observer, observation| {
                 if *observer == target {
                     return false;
                 }
@@ -1308,22 +1308,27 @@ where
                     .map(|path| valid_remote_leader_path(Some(target), path, self.inner.address))
                     .unwrap_or(false)
             });
-
-        let has_relay_follow = self
-            .inner
-            .follow
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|follow| follow.remote != target && follow.leader_path.first().copied() == Some(target));
-        if !has_relay_follow {
-            self.inner.clear_remote_leader_if(target).await;
+            let has_relay_follow = control
+                .follow
+                .as_ref()
+                .is_some_and(|follow| follow.remote != target && follow.leader_path.first().copied() == Some(target));
+            let should_clear = !has_relay_follow
+                && control.leader.leader == Some(target)
+                && control.leader.leader != Some(self.inner.address);
+            if should_clear {
+                control.leader.leader = None;
+                control.leader.path = None;
+            }
+            drop(control);
+            if should_clear {
+                self.inner.publish_leader_info().await;
+            }
         }
     }
 
     async fn mark_connected(&self, target: I::Address, latency_ms: u64) {
-        let mut peers = self.inner.peers.lock().await;
-        if let Some(Some(details)) = peers.get_mut(&target) {
+        let mut control = self.inner.control.lock().await;
+        if let Some(Some(details)) = control.peers.get_mut(&target) {
             details.last_activity = NonZeroU64::new(now_ms());
             details.last_global_activity = NonZeroU64::new(now_ms());
             details.repeat_connect_fails = 0;
@@ -1538,7 +1543,13 @@ where
     }
 
     async fn handle_action(&self, source: A, action: D::Action) {
-        let is_leader = self.inner.leader.lock().await.leader == Some(self.inner.address);
+        let (is_leader, follow_tx) = {
+            let control = self.inner.control.lock().await;
+            (
+                control.leader.leader == Some(self.inner.address),
+                control.follow.as_ref().map(|follow| follow.to_peer.clone()),
+            )
+        };
         if is_leader {
             let authority = {
                 let state = self.inner.state.lock().await;
@@ -1554,13 +1565,8 @@ where
             return;
         }
 
-        if let Some(follow) = self.inner.follow.lock().await.as_ref() {
-            if follow
-                .to_peer
-                .send(SyncRequest::Action { source, action })
-                .await
-                .is_err()
-            {
+        if let Some(follow_tx) = follow_tx {
+            if follow_tx.send(SyncRequest::Action { source, action }).await.is_err() {
                 tracing::warn!("failed to forward action to upstream leader");
             }
             return;
@@ -1575,11 +1581,11 @@ where
         match status {
             LeaderStatus::Promoted { term, leader } => {
                 observed_term = Some(term);
-                let mut lock = self.inner.leader.lock().await;
-                if lock.term < term || (lock.term == term && Some(leader) < lock.leader) {
-                    lock.term = term;
-                    lock.leader = Some(leader);
-                    lock.path = if leader == self.inner.address {
+                let mut control = self.inner.control.lock().await;
+                if control.leader.term < term || (control.leader.term == term && Some(leader) < control.leader.leader) {
+                    control.leader.term = term;
+                    control.leader.leader = Some(leader);
+                    control.leader.path = if leader == self.inner.address {
                         Some(vec![self.inner.address])
                     } else if leader == address {
                         Some(vec![leader, self.inner.address])
@@ -1591,11 +1597,11 @@ where
             }
             LeaderStatus::Offline { term, leader } => {
                 observed_term = Some(term);
-                let mut lock = self.inner.leader.lock().await;
-                if lock.term <= term && lock.leader == Some(leader) {
-                    lock.leader = None;
-                    lock.path = None;
-                    lock.term = term;
+                let mut control = self.inner.control.lock().await;
+                if control.leader.term <= term && control.leader.leader == Some(leader) {
+                    control.leader.leader = None;
+                    control.leader.path = None;
+                    control.leader.term = term;
                     changed = true;
                 }
             }
@@ -1614,8 +1620,8 @@ where
     async fn record_activity_ts(&self, connected: bool) {
         let now = NonZeroU64::new(now_ms());
 
-        let mut lock = self.inner.peers.lock().await;
-        let Some(Some(details)) = lock.get_mut(&self.addr) else {
+        let mut control = self.inner.control.lock().await;
+        let Some(Some(details)) = control.peers.get_mut(&self.addr) else {
             return;
         };
 
