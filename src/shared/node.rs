@@ -335,43 +335,39 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         let Some(mut rx) = self.local_actions_rx.lock().await.take() else {
             return;
         };
+
         let inner = self.clone();
 
         tokio::spawn(async move {
+            let mut state_handle = inner.state.lock().await.create_state_handle();
+
             while let Some(mut action) = rx.recv().await {
                 loop {
                     let is_leader = inner.control.lock().await.leader.leader == Some(inner.address);
                     if is_leader {
                         let authority = {
-                            let state = inner.state.lock().await;
-                            let state_clone = state.state_clone().await;
-                            state_clone.state().authority(action)
+                            let state = state_handle.read();
+                            let authority = state.authority(RecoverableStateAction::StateAction { action });
+                            state_handle.quiescent();
+                            authority
                         };
-                        inner
-                            .state
-                            .lock()
-                            .await
-                            .apply_authority(RecoverableStateAction::StateAction { action: authority })
-                            .await;
+
+                        inner.state.lock().await.apply_authority(authority).await;
                         break;
                     }
 
-                    let follow_tx = inner
-                        .control
-                        .lock()
-                        .await
-                        .follow
-                        .as_ref()
-                        .map(|follow| follow.to_peer.clone());
+                    let follow_tx = {
+                        let control = inner.control.lock().await;
+                        control.follow.as_ref().map(|follow| follow.to_peer.clone())
+                    };
 
                     if let Some(follow_tx) = follow_tx {
-                        match follow_tx
-                            .send(SyncRequest::Action {
-                                source: inner.address,
-                                action,
-                            })
-                            .await
-                        {
+                        let to_send = SyncRequest::Action {
+                            source: inner.address,
+                            action,
+                        };
+
+                        match follow_tx.send(to_send).await {
                             Ok(()) => break,
                             Err(error) => {
                                 action = match error.0 {
