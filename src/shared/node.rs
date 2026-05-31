@@ -287,10 +287,11 @@ where
             loop {
                 match io.next_client().await {
                     Ok(conn) => {
-                        let (addr, write, read) = conn.server_channels(io_settings.clone());
+                        let (transport_addr, write, read) = conn.server_channels(io_settings.clone());
                         tokio::spawn(
                             PeerWorker::<A, D> {
-                                addr,
+                                transport_addr,
+                                node_addr: None,
                                 inner: inner.clone(),
                                 write,
                                 read,
@@ -313,11 +314,12 @@ where
         D::Action: MessageEncoding + Clone,
         D::AuthorityAction: MessageEncoding,
     {
-        let (addr, write, read) = conn.server_channels(self.io_settings.clone());
+        let (transport_addr, write, read) = conn.server_channels(self.io_settings.clone());
 
         tokio::spawn(
             PeerWorker::<A, D> {
-                addr,
+                transport_addr,
+                node_addr: None,
                 inner: self.inner.clone(),
                 write,
                 read,
@@ -1076,7 +1078,7 @@ where
             return;
         };
 
-        let (remote, write, mut read) = conn.client_channels::<D>(self.io_settings.clone());
+        let (_transport_remote, write, mut read) = conn.client_channels::<D>(self.io_settings.clone());
         if !send_expect_ok(
             &write,
             &mut read,
@@ -1163,7 +1165,7 @@ where
 
         let cancel = CancellationToken::new();
         let follow = FollowConnection {
-            remote,
+            remote: target,
             leader_path: local_path,
             to_peer: write.clone(),
             cancel: cancel.clone(),
@@ -1335,7 +1337,8 @@ where
 }
 
 struct PeerWorker<A: SyncIOAddress, D: DeterministicState> {
-    addr: A,
+    transport_addr: A,
+    node_addr: Option<A>,
     inner: Arc<Inner<A, D>>,
     read: mpsc::Receiver<SyncRequest<A, D>>,
     write: mpsc::Sender<SyncResponse<A, D>>,
@@ -1395,7 +1398,7 @@ where
                     }
                 }
                 SyncRequest::MyAddress(addr) => {
-                    self.addr = addr;
+                    self.node_addr = Some(addr);
                     self.record_activity_ts(true).await;
                     if !self.send(SyncResponse::Ok).await {
                         break;
@@ -1615,9 +1618,16 @@ where
 
     async fn record_activity_ts(&self, connected: bool) {
         let now = NonZeroU64::new(now_ms());
+        let Some(node_addr) = self.node_addr else {
+            tracing::debug!(
+                ?self.transport_addr,
+                "not recording peer activity before node address is identified"
+            );
+            return;
+        };
 
         let mut control = self.inner.control.lock().await;
-        let Some(Some(details)) = control.peers.get_mut(&self.addr) else {
+        let Some(Some(details)) = control.peers.get_mut(&node_addr) else {
             return;
         };
 

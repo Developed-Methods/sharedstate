@@ -1,6 +1,10 @@
 use super::*;
-use crate::net::{message_channel::NetIoSettings, simulated::SimulatedNet};
-use std::collections::BTreeMap;
+use crate::net::{
+    message_channel::NetIoSettings,
+    simulated::{SimulatedIo, SimulatedNet},
+    sync_io::{SyncConnection, SyncIO, SyncIOListener},
+};
+use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TestState {
@@ -109,6 +113,38 @@ struct TestClusterNode {
     listener: JoinHandle<()>,
     client: JoinHandle<()>,
     actions: NodeActionSender<TestAction>,
+}
+
+#[derive(Clone)]
+struct MisreportingIo {
+    inner: Arc<SimulatedIo>,
+    reported_remote: u64,
+}
+
+impl SyncIO for MisreportingIo {
+    type Address = u64;
+    type Read = <SimulatedIo as SyncIO>::Read;
+    type Write = <SimulatedIo as SyncIO>::Write;
+
+    async fn connect(&self, remote: &Self::Address) -> std::io::Result<SyncConnection<Self>> {
+        let conn = self.inner.connect(remote).await?;
+        Ok(SyncConnection {
+            remote: self.reported_remote,
+            read: conn.read,
+            write: conn.write,
+        })
+    }
+}
+
+impl SyncIOListener for MisreportingIo {
+    async fn next_client(&self) -> std::io::Result<SyncConnection<Self>> {
+        let conn = self.inner.next_client().await?;
+        Ok(SyncConnection {
+            remote: self.reported_remote,
+            read: conn.read,
+            write: conn.write,
+        })
+    }
 }
 
 impl TestClusterNode {
@@ -502,6 +538,56 @@ async fn non_leader_falls_back_to_non_leader_relay_when_can_lead_peers_are_unrea
     node2.stop(&net).await;
     node3.stop(&net).await;
     node4.stop(&net).await;
+}
+
+#[tokio::test]
+async fn node_identity_comes_from_my_address_not_transport_address() {
+    let net = SimulatedNet::new();
+    let io1 = Arc::new(MisreportingIo {
+        inner: net.start_io(1).await,
+        reported_remote: 9001,
+    });
+    let io2 = Arc::new(MisreportingIo {
+        inner: net.start_io(2).await,
+        reported_remote: 9002,
+    });
+
+    let node1 = node(1, true).await;
+    let node2 = node(2, false).await;
+    node1.discover_peers([2].into_iter()).await;
+    node2.discover_peers([1].into_iter()).await;
+
+    let listener1 = node1.start_listener(io1.clone()).await;
+    let client1 = node1.start_client(io1).await;
+    let listener2 = node2.start_listener(io2.clone()).await;
+    let client2 = node2.start_client(io2).await;
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            let debug1 = node1.debug_info().await;
+            let debug2 = node2.debug_info().await;
+            let peer2 = debug1.peers.iter().find(|peer| peer.address == 2);
+            debug1.leader == Some(1)
+                && debug2.leader == Some(1)
+                && debug2.follow_remote == Some(1)
+                && debug2
+                    .peers
+                    .iter()
+                    .all(|peer| peer.address != 9001 && peer.address != 9002)
+                && peer2.is_some_and(|peer| peer.connected == Some(true))
+        })
+        .await,
+        "node1={:#?}\nnode2={:#?}",
+        node1.debug_info().await,
+        node2.debug_info().await
+    );
+
+    listener1.abort();
+    client1.abort();
+    listener2.abort();
+    client2.abort();
+    net.stop_node(1).await;
+    net.stop_node(2).await;
 }
 
 #[tokio::test]
