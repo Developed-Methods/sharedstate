@@ -506,6 +506,54 @@ async fn non_leader_does_not_periodically_observe_known_non_leader_peers() {
 }
 
 #[tokio::test]
+async fn short_lived_probe_close_does_not_clear_active_follow_connection() {
+    let net = SimulatedNet::new();
+
+    let node1 = start_cluster_node(&net, 1, true, &[2]).await;
+    let node2 = start_cluster_node(&net, 2, false, &[1]).await;
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            let debug1 = node1.node.debug_info().await;
+            let debug2 = node2.node.debug_info().await;
+            let peer2 = debug1.peers.iter().find(|peer| peer.address == 2);
+            debug1.leader == Some(1)
+                && debug2.leader == Some(1)
+                && debug2.follow_remote == Some(1)
+                && peer2.is_some_and(|peer| peer.connected == Some(true))
+        })
+        .await,
+        "node1={:#?}\nnode2={:#?}",
+        node1.node.debug_info().await,
+        node2.node.debug_info().await
+    );
+
+    let probe_io = net.start_io(9000).await;
+    let conn = probe_io.connect(&1).await.unwrap();
+    let (_remote, write, mut read) = conn.client_channels::<TestState>(NetIoSettings::default());
+
+    assert!(
+        send_expect_ok(&write, &mut read, SyncRequest::ProtocolVersion(PROTOCOL_VERSION), Duration::from_secs(1),)
+            .await
+    );
+    assert!(send_expect_ok(&write, &mut read, SyncRequest::MyAddress(2), Duration::from_secs(1),).await);
+    assert!(write.send(SyncRequest::Ping(42)).await.is_ok());
+    assert!(matches!(recv_timeout(&mut read, Duration::from_secs(1)).await, Some(SyncResponse::Pong(42))));
+    drop(write);
+    drop(read);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let debug1 = node1.node.debug_info().await;
+    let peer2 = debug1.peers.iter().find(|peer| peer.address == 2).unwrap();
+    assert_eq!(peer2.connected, Some(true), "{debug1:#?}");
+
+    node1.stop(&net).await;
+    node2.stop(&net).await;
+    net.stop_node(9000).await;
+}
+
+#[tokio::test]
 async fn non_leader_falls_back_to_non_leader_relay_when_can_lead_peers_are_unreachable() {
     let net = SimulatedNet::new();
 
