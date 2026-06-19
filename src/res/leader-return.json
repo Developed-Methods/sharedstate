@@ -1,0 +1,3404 @@
+{
+  "version": 1,
+  "events": [
+    {
+      "before": {
+        "nodes": [],
+        "connections": [],
+        "topology": {
+          "online": [],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "before_checkpoint": {
+        "nodes": [],
+        "topology": {
+          "online": [],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "action": {
+        "type": "addNode",
+        "address": 1,
+        "can_lead": true,
+        "peers": []
+      }
+    },
+    {
+      "before": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "term": 1,
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1
+            ],
+            "last_promoted_leader": 1,
+            "status": "leading",
+            "state": {
+              "seq": 1,
+              "values": {}
+            },
+            "debug": {
+              "address": 1,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1
+              ],
+              "term": 1,
+              "follow_remote": null,
+              "follow_leader_path": null,
+              "known_can_lead": [
+                1
+              ],
+              "last_promoted_leader": 1,
+              "observations": [],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          }
+        ],
+        "connections": [],
+        "topology": {
+          "online": [
+            1
+          ],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "before_checkpoint": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1
+            ],
+            "status": "leading",
+            "state": {
+              "seq": 1,
+              "values": {}
+            }
+          }
+        ],
+        "topology": {
+          "online": [
+            1
+          ],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "action": {
+        "type": "addNode",
+        "address": 2,
+        "can_lead": true,
+        "peers": [
+          1
+        ]
+      }
+    },
+    {
+      "before": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "term": 1,
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": 1,
+            "status": "leading",
+            "state": {
+              "seq": 1,
+              "values": {}
+            },
+            "debug": {
+              "address": 1,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1
+              ],
+              "term": 1,
+              "follow_remote": null,
+              "follow_leader_path": null,
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": 1,
+              "observations": [
+                {
+                  "observer": 2,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1,
+                    2
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": false,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 563,
+                  "last_global_activity_ms_ago": 563,
+                  "last_connect_attempt_ms_ago": 1606,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1,
+                    2
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              2
+            ],
+            "term": 1,
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              2
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": null,
+            "status": "connected",
+            "state": {
+              "seq": 1,
+              "values": {}
+            },
+            "debug": {
+              "address": 2,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1,
+                2
+              ],
+              "term": 1,
+              "follow_remote": 1,
+              "follow_leader_path": [
+                1,
+                2
+              ],
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": null,
+              "observations": [
+                {
+                  "observer": 1,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 563,
+                  "last_global_activity_ms_ago": 563,
+                  "last_connect_attempt_ms_ago": 563,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          }
+        ],
+        "connections": [
+          {
+            "source": 1,
+            "target": 2,
+            "blocked": false
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2
+          ],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "before_checkpoint": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "leading",
+            "state": {
+              "seq": 1,
+              "values": {}
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              2
+            ],
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              2
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "connected",
+            "state": {
+              "seq": 1,
+              "values": {}
+            }
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2
+          ],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "action": {
+        "type": "addNode",
+        "address": 3,
+        "can_lead": false,
+        "peers": [
+          1
+        ]
+      }
+    },
+    {
+      "before": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "term": 1,
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": 1,
+            "status": "leading",
+            "state": {
+              "seq": 1,
+              "values": {}
+            },
+            "debug": {
+              "address": 1,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1
+              ],
+              "term": 1,
+              "follow_remote": null,
+              "follow_leader_path": null,
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": 1,
+              "observations": [
+                {
+                  "observer": 2,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1,
+                    2
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": false,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 548,
+                  "last_global_activity_ms_ago": 548,
+                  "last_connect_attempt_ms_ago": 1593,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1,
+                    2
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": false,
+                  "latency_ms": null,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 2987,
+                  "last_global_activity_ms_ago": 2987,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              2
+            ],
+            "term": 1,
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              2
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": null,
+            "status": "connected",
+            "state": {
+              "seq": 1,
+              "values": {}
+            },
+            "debug": {
+              "address": 2,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1,
+                2
+              ],
+              "term": 1,
+              "follow_remote": 1,
+              "follow_leader_path": [
+                1,
+                2
+              ],
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": null,
+              "observations": [
+                {
+                  "observer": 1,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 548,
+                  "last_global_activity_ms_ago": 548,
+                  "last_connect_attempt_ms_ago": 548,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": false,
+                  "latency_ms": null,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 2987,
+                  "last_global_activity_ms_ago": 2987,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          },
+          {
+            "address": 3,
+            "can_lead": false,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              3
+            ],
+            "term": 1,
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              3
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": null,
+            "status": "connected",
+            "state": {
+              "seq": 1,
+              "values": {}
+            },
+            "debug": {
+              "address": 3,
+              "can_lead": false,
+              "leader": 1,
+              "leader_path": [
+                1,
+                3
+              ],
+              "term": 1,
+              "follow_remote": 1,
+              "follow_leader_path": [
+                1,
+                3
+              ],
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": null,
+              "observations": [
+                {
+                  "observer": 1,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1
+                  ]
+                },
+                {
+                  "observer": 2,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1,
+                    2
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 2987,
+                  "last_global_activity_ms_ago": 2987,
+                  "last_connect_attempt_ms_ago": 2987,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1
+                  ],
+                  "observed_reachable_can_lead": [
+                    1
+                  ]
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 2987,
+                  "last_global_activity_ms_ago": 2987,
+                  "last_connect_attempt_ms_ago": 2988,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1,
+                    2
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          }
+        ],
+        "connections": [
+          {
+            "source": 1,
+            "target": 2,
+            "blocked": false
+          },
+          {
+            "source": 1,
+            "target": 3,
+            "blocked": false
+          },
+          {
+            "source": 2,
+            "target": 3,
+            "blocked": false
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2,
+            3
+          ],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "before_checkpoint": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "leading",
+            "state": {
+              "seq": 1,
+              "values": {}
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              2
+            ],
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              2
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "connected",
+            "state": {
+              "seq": 1,
+              "values": {}
+            }
+          },
+          {
+            "address": 3,
+            "can_lead": false,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              3
+            ],
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              3
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "connected",
+            "state": {
+              "seq": 1,
+              "values": {}
+            }
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2,
+            3
+          ],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "action": {
+        "type": "sendAction",
+        "address": 1,
+        "action": {
+          "type": "set",
+          "key": "1",
+          "value": ""
+        }
+      }
+    },
+    {
+      "before": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "term": 1,
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": 1,
+            "status": "leading",
+            "state": {
+              "seq": 2,
+              "values": {
+                "1": ""
+              }
+            },
+            "debug": {
+              "address": 1,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1
+              ],
+              "term": 1,
+              "follow_remote": null,
+              "follow_leader_path": null,
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": 1,
+              "observations": [
+                {
+                  "observer": 2,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1,
+                    2
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 895,
+                  "last_global_activity_ms_ago": 895,
+                  "last_connect_attempt_ms_ago": 895,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1,
+                    2
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": false,
+                  "latency_ms": null,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 2290,
+                  "last_global_activity_ms_ago": 2290,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              2
+            ],
+            "term": 1,
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              2
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": null,
+            "status": "connected",
+            "state": {
+              "seq": 2,
+              "values": {
+                "1": ""
+              }
+            },
+            "debug": {
+              "address": 2,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1,
+                2
+              ],
+              "term": 1,
+              "follow_remote": 1,
+              "follow_leader_path": [
+                1,
+                2
+              ],
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": null,
+              "observations": [
+                {
+                  "observer": 1,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": false,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 895,
+                  "last_global_activity_ms_ago": 895,
+                  "last_connect_attempt_ms_ago": 2852,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": false,
+                  "latency_ms": null,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 2290,
+                  "last_global_activity_ms_ago": 2290,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          },
+          {
+            "address": 3,
+            "can_lead": false,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              3
+            ],
+            "term": 1,
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              3
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": null,
+            "status": "connected",
+            "state": {
+              "seq": 2,
+              "values": {
+                "1": ""
+              }
+            },
+            "debug": {
+              "address": 3,
+              "can_lead": false,
+              "leader": 1,
+              "leader_path": [
+                1,
+                3
+              ],
+              "term": 1,
+              "follow_remote": 1,
+              "follow_leader_path": [
+                1,
+                3
+              ],
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": null,
+              "observations": [
+                {
+                  "observer": 1,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1
+                  ]
+                },
+                {
+                  "observer": 2,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1,
+                    2
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 2290,
+                  "last_global_activity_ms_ago": 2290,
+                  "last_connect_attempt_ms_ago": 2290,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1
+                  ],
+                  "observed_reachable_can_lead": [
+                    1
+                  ]
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 2290,
+                  "last_global_activity_ms_ago": 2290,
+                  "last_connect_attempt_ms_ago": 2290,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1,
+                    2
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          }
+        ],
+        "connections": [
+          {
+            "source": 1,
+            "target": 2,
+            "blocked": false
+          },
+          {
+            "source": 1,
+            "target": 3,
+            "blocked": false
+          },
+          {
+            "source": 2,
+            "target": 3,
+            "blocked": false
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2,
+            3
+          ],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "before_checkpoint": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "leading",
+            "state": {
+              "seq": 2,
+              "values": {
+                "1": ""
+              }
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              2
+            ],
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              2
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "connected",
+            "state": {
+              "seq": 2,
+              "values": {
+                "1": ""
+              }
+            }
+          },
+          {
+            "address": 3,
+            "can_lead": false,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              3
+            ],
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              3
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "connected",
+            "state": {
+              "seq": 2,
+              "values": {
+                "1": ""
+              }
+            }
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2,
+            3
+          ],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "action": {
+        "type": "sendAction",
+        "address": 1,
+        "action": {
+          "type": "set",
+          "key": "1",
+          "value": "2"
+        }
+      }
+    },
+    {
+      "before": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "term": 1,
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": 1,
+            "status": "leading",
+            "state": {
+              "seq": 3,
+              "values": {
+                "1": "2"
+              }
+            },
+            "debug": {
+              "address": 1,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1
+              ],
+              "term": 1,
+              "follow_remote": null,
+              "follow_leader_path": null,
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": 1,
+              "observations": [
+                {
+                  "observer": 2,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1,
+                    2
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": false,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 1184,
+                  "last_global_activity_ms_ago": 622,
+                  "last_connect_attempt_ms_ago": 2228,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1,
+                    2
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": false,
+                  "latency_ms": null,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 622,
+                  "last_global_activity_ms_ago": 622,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              2
+            ],
+            "term": 1,
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              2
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": null,
+            "status": "connected",
+            "state": {
+              "seq": 3,
+              "values": {
+                "1": "2"
+              }
+            },
+            "debug": {
+              "address": 2,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1,
+                2
+              ],
+              "term": 1,
+              "follow_remote": 1,
+              "follow_leader_path": [
+                1,
+                2
+              ],
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": null,
+              "observations": [
+                {
+                  "observer": 1,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 1184,
+                  "last_global_activity_ms_ago": 1184,
+                  "last_connect_attempt_ms_ago": 1184,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": false,
+                  "latency_ms": null,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 622,
+                  "last_global_activity_ms_ago": 622,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          },
+          {
+            "address": 3,
+            "can_lead": false,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              3
+            ],
+            "term": 1,
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              3
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": null,
+            "status": "connected",
+            "state": {
+              "seq": 3,
+              "values": {
+                "1": "2"
+              }
+            },
+            "debug": {
+              "address": 3,
+              "can_lead": false,
+              "leader": 1,
+              "leader_path": [
+                1,
+                3
+              ],
+              "term": 1,
+              "follow_remote": 1,
+              "follow_leader_path": [
+                1,
+                3
+              ],
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": null,
+              "observations": [
+                {
+                  "observer": 1,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1
+                  ]
+                },
+                {
+                  "observer": 2,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1,
+                    2
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 622,
+                  "last_global_activity_ms_ago": 622,
+                  "last_connect_attempt_ms_ago": 622,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1
+                  ],
+                  "observed_reachable_can_lead": [
+                    1
+                  ]
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 622,
+                  "last_global_activity_ms_ago": 622,
+                  "last_connect_attempt_ms_ago": 622,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1,
+                    2
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          }
+        ],
+        "connections": [
+          {
+            "source": 1,
+            "target": 2,
+            "blocked": false
+          },
+          {
+            "source": 1,
+            "target": 3,
+            "blocked": false
+          },
+          {
+            "source": 2,
+            "target": 3,
+            "blocked": false
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2,
+            3
+          ],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "before_checkpoint": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "leading",
+            "state": {
+              "seq": 3,
+              "values": {
+                "1": "2"
+              }
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              2
+            ],
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              2
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "connected",
+            "state": {
+              "seq": 3,
+              "values": {
+                "1": "2"
+              }
+            }
+          },
+          {
+            "address": 3,
+            "can_lead": false,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              3
+            ],
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              3
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "connected",
+            "state": {
+              "seq": 3,
+              "values": {
+                "1": "2"
+              }
+            }
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2,
+            3
+          ],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "action": {
+        "type": "sendAction",
+        "address": 1,
+        "action": {
+          "type": "set",
+          "key": "2",
+          "value": "22"
+        }
+      }
+    },
+    {
+      "before": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "term": 1,
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": 1,
+            "status": "leading",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            },
+            "debug": {
+              "address": 1,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1
+              ],
+              "term": 1,
+              "follow_remote": null,
+              "follow_leader_path": null,
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": 1,
+              "observations": [
+                {
+                  "observer": 2,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1,
+                    2
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": false,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 961,
+                  "last_global_activity_ms_ago": 398,
+                  "last_connect_attempt_ms_ago": 2005,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1,
+                    2
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": false,
+                  "latency_ms": null,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 398,
+                  "last_global_activity_ms_ago": 398,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              2
+            ],
+            "term": 1,
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              2
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": null,
+            "status": "connected",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            },
+            "debug": {
+              "address": 2,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1,
+                2
+              ],
+              "term": 1,
+              "follow_remote": 1,
+              "follow_leader_path": [
+                1,
+                2
+              ],
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": null,
+              "observations": [
+                {
+                  "observer": 1,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 962,
+                  "last_global_activity_ms_ago": 962,
+                  "last_connect_attempt_ms_ago": 962,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": false,
+                  "latency_ms": null,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 398,
+                  "last_global_activity_ms_ago": 398,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          },
+          {
+            "address": 3,
+            "can_lead": false,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              3
+            ],
+            "term": 1,
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              3
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": null,
+            "status": "connected",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            },
+            "debug": {
+              "address": 3,
+              "can_lead": false,
+              "leader": 1,
+              "leader_path": [
+                1,
+                3
+              ],
+              "term": 1,
+              "follow_remote": 1,
+              "follow_leader_path": [
+                1,
+                3
+              ],
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": null,
+              "observations": [
+                {
+                  "observer": 1,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1
+                  ]
+                },
+                {
+                  "observer": 2,
+                  "term": 1,
+                  "leader": 1,
+                  "leader_path": [
+                    1,
+                    2
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 398,
+                  "last_global_activity_ms_ago": 398,
+                  "last_connect_attempt_ms_ago": 398,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1
+                  ],
+                  "observed_reachable_can_lead": [
+                    1
+                  ]
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 398,
+                  "last_global_activity_ms_ago": 398,
+                  "last_connect_attempt_ms_ago": 398,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 1,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    1,
+                    2
+                  ],
+                  "observed_reachable_can_lead": [
+                    1,
+                    2
+                  ]
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          }
+        ],
+        "connections": [
+          {
+            "source": 1,
+            "target": 2,
+            "blocked": false
+          },
+          {
+            "source": 1,
+            "target": 3,
+            "blocked": false
+          },
+          {
+            "source": 2,
+            "target": 3,
+            "blocked": false
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2,
+            3
+          ],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "before_checkpoint": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "leading",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              2
+            ],
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              2
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "connected",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            }
+          },
+          {
+            "address": 3,
+            "can_lead": false,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 1,
+            "leader_path": [
+              1,
+              3
+            ],
+            "follow_remote": 1,
+            "follow_leader_path": [
+              1,
+              3
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "connected",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            }
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2,
+            3
+          ],
+          "blocked_nodes": [],
+          "blocked_edges": []
+        }
+      },
+      "action": {
+        "type": "setNetworking",
+        "address": 1,
+        "disabled": true
+      }
+    },
+    {
+      "before": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": true,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "term": 1,
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": 1,
+            "status": "isolated",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            },
+            "debug": {
+              "address": 1,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1
+              ],
+              "term": 1,
+              "follow_remote": null,
+              "follow_leader_path": null,
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": 1,
+              "observations": [],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": false,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 2,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": 6496,
+                  "last_connect_attempt_ms_ago": 2499,
+                  "last_connect_fail_ms_ago": 2499,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": false,
+                  "latency_ms": null,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 6496,
+                  "last_global_activity_ms_ago": 6496,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 2,
+            "leader_path": [
+              2
+            ],
+            "term": 1,
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": 2,
+            "status": "leading",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            },
+            "debug": {
+              "address": 2,
+              "can_lead": true,
+              "leader": 2,
+              "leader_path": [
+                2
+              ],
+              "term": 1,
+              "follow_remote": null,
+              "follow_leader_path": null,
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": 2,
+              "observations": [],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": false,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 2,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": 6895,
+                  "last_connect_attempt_ms_ago": 1457,
+                  "last_connect_fail_ms_ago": 1457,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": false,
+                  "latency_ms": null,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 890,
+                  "last_global_activity_ms_ago": 890,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          },
+          {
+            "address": 3,
+            "can_lead": false,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 2,
+            "leader_path": [
+              2,
+              3
+            ],
+            "term": 1,
+            "follow_remote": 2,
+            "follow_leader_path": [
+              2,
+              3
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": null,
+            "status": "connected",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            },
+            "debug": {
+              "address": 3,
+              "can_lead": false,
+              "leader": 2,
+              "leader_path": [
+                2,
+                3
+              ],
+              "term": 1,
+              "follow_remote": 2,
+              "follow_leader_path": [
+                2,
+                3
+              ],
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": null,
+              "observations": [
+                {
+                  "observer": 2,
+                  "term": 1,
+                  "leader": 2,
+                  "leader_path": [
+                    2
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": false,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 2,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": 6895,
+                  "last_connect_attempt_ms_ago": 890,
+                  "last_connect_fail_ms_ago": 890,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 890,
+                  "last_global_activity_ms_ago": 890,
+                  "last_connect_attempt_ms_ago": 890,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 2,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    2
+                  ],
+                  "observed_reachable_can_lead": [
+                    2
+                  ]
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          }
+        ],
+        "connections": [
+          {
+            "source": 2,
+            "target": 3,
+            "blocked": false
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2,
+            3
+          ],
+          "blocked_nodes": [
+            1
+          ],
+          "blocked_edges": []
+        }
+      },
+      "before_checkpoint": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": true,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "isolated",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 2,
+            "leader_path": [
+              2
+            ],
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "leading",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            }
+          },
+          {
+            "address": 3,
+            "can_lead": false,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 2,
+            "leader_path": [
+              2,
+              3
+            ],
+            "follow_remote": 2,
+            "follow_leader_path": [
+              2,
+              3
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "connected",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            }
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2,
+            3
+          ],
+          "blocked_nodes": [
+            1
+          ],
+          "blocked_edges": []
+        }
+      },
+      "action": {
+        "type": "sendAction",
+        "address": 2,
+        "action": {
+          "type": "set",
+          "key": "3",
+          "value": "4"
+        }
+      }
+    },
+    {
+      "before": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": true,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "term": 1,
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": 1,
+            "status": "isolated",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            },
+            "debug": {
+              "address": 1,
+              "can_lead": true,
+              "leader": 1,
+              "leader_path": [
+                1
+              ],
+              "term": 1,
+              "follow_remote": null,
+              "follow_leader_path": null,
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": 1,
+              "observations": [],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": false,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 3,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": 9350,
+                  "last_connect_attempt_ms_ago": 2351,
+                  "last_connect_fail_ms_ago": 2351,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": false,
+                  "latency_ms": null,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 9350,
+                  "last_global_activity_ms_ago": 9350,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 2,
+            "leader_path": [
+              2
+            ],
+            "term": 1,
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": 2,
+            "status": "leading",
+            "state": {
+              "seq": 5,
+              "values": {
+                "1": "2",
+                "2": "22",
+                "3": "4"
+              }
+            },
+            "debug": {
+              "address": 2,
+              "can_lead": true,
+              "leader": 2,
+              "leader_path": [
+                2
+              ],
+              "term": 1,
+              "follow_remote": null,
+              "follow_leader_path": null,
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": 2,
+              "observations": [],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": false,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 3,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": 9749,
+                  "last_connect_attempt_ms_ago": 1309,
+                  "last_connect_fail_ms_ago": 1309,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": false,
+                  "latency_ms": null,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 741,
+                  "last_global_activity_ms_ago": 741,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          },
+          {
+            "address": 3,
+            "can_lead": false,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 2,
+            "leader_path": [
+              2,
+              3
+            ],
+            "term": 1,
+            "follow_remote": 2,
+            "follow_leader_path": [
+              2,
+              3
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "last_promoted_leader": null,
+            "status": "connected",
+            "state": {
+              "seq": 5,
+              "values": {
+                "1": "2",
+                "2": "22",
+                "3": "4"
+              }
+            },
+            "debug": {
+              "address": 3,
+              "can_lead": false,
+              "leader": 2,
+              "leader_path": [
+                2,
+                3
+              ],
+              "term": 1,
+              "follow_remote": 2,
+              "follow_leader_path": [
+                2,
+                3
+              ],
+              "known_can_lead": [
+                1,
+                2
+              ],
+              "last_promoted_leader": null,
+              "observations": [
+                {
+                  "observer": 2,
+                  "term": 1,
+                  "leader": 2,
+                  "leader_path": [
+                    2
+                  ],
+                  "can_lead": true,
+                  "reachable_can_lead": [
+                    2
+                  ]
+                }
+              ],
+              "peers": [
+                {
+                  "address": 1,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": false,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 3,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": 9749,
+                  "last_connect_attempt_ms_ago": 741,
+                  "last_connect_fail_ms_ago": 741,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                },
+                {
+                  "address": 2,
+                  "known": true,
+                  "can_lead": true,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": 741,
+                  "last_global_activity_ms_ago": 741,
+                  "last_connect_attempt_ms_ago": 741,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": 2,
+                  "observed_term": 1,
+                  "observed_leader_path": [
+                    2
+                  ],
+                  "observed_reachable_can_lead": [
+                    2
+                  ]
+                },
+                {
+                  "address": 3,
+                  "known": true,
+                  "can_lead": false,
+                  "connected": true,
+                  "latency_ms": 0,
+                  "repeat_connect_fails": 0,
+                  "last_activity_ms_ago": null,
+                  "last_global_activity_ms_ago": null,
+                  "last_connect_attempt_ms_ago": null,
+                  "last_connect_fail_ms_ago": null,
+                  "observed_leader": null,
+                  "observed_term": null,
+                  "observed_leader_path": null,
+                  "observed_reachable_can_lead": null
+                }
+              ]
+            }
+          }
+        ],
+        "connections": [
+          {
+            "source": 2,
+            "target": 3,
+            "blocked": false
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2,
+            3
+          ],
+          "blocked_nodes": [
+            1
+          ],
+          "blocked_edges": []
+        }
+      },
+      "before_checkpoint": {
+        "nodes": [
+          {
+            "address": 1,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": true,
+            "blocked_peers": [],
+            "known_peers": [],
+            "leader": 1,
+            "leader_path": [
+              1
+            ],
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "isolated",
+            "state": {
+              "seq": 4,
+              "values": {
+                "1": "2",
+                "2": "22"
+              }
+            }
+          },
+          {
+            "address": 2,
+            "can_lead": true,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 2,
+            "leader_path": [
+              2
+            ],
+            "follow_remote": null,
+            "follow_leader_path": null,
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "leading",
+            "state": {
+              "seq": 5,
+              "values": {
+                "1": "2",
+                "2": "22",
+                "3": "4"
+              }
+            }
+          },
+          {
+            "address": 3,
+            "can_lead": false,
+            "online": true,
+            "networking_disabled": false,
+            "blocked_peers": [],
+            "known_peers": [
+              1
+            ],
+            "leader": 2,
+            "leader_path": [
+              2,
+              3
+            ],
+            "follow_remote": 2,
+            "follow_leader_path": [
+              2,
+              3
+            ],
+            "known_can_lead": [
+              1,
+              2
+            ],
+            "status": "connected",
+            "state": {
+              "seq": 5,
+              "values": {
+                "1": "2",
+                "2": "22",
+                "3": "4"
+              }
+            }
+          }
+        ],
+        "topology": {
+          "online": [
+            1,
+            2,
+            3
+          ],
+          "blocked_nodes": [
+            1
+          ],
+          "blocked_edges": []
+        }
+      },
+      "action": {
+        "type": "setNetworking",
+        "address": 1,
+        "disabled": false
+      }
+    }
+  ]
+}

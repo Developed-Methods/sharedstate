@@ -4,8 +4,8 @@ use message_encoding::MessageEncoding;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use super::{
-    io::SyncIO,
     message_io::{read_message_opt, send_message, send_zero_message},
+    sync_io::SyncIO,
 };
 
 #[derive(Clone, Debug)]
@@ -99,22 +99,11 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
                 Some(msg) => {
                     tokio::time::timeout(
                         self.settings.process_timeout,
-                        send_message(
-                            &mut buffer,
-                            &msg,
-                            &mut self.output,
-                            self.settings.process_timeout,
-                        ),
+                        send_message(&mut buffer, &msg, &mut self.output, self.settings.process_timeout),
                     )
                     .await
                 }
-                None => {
-                    tokio::time::timeout(
-                        self.settings.process_timeout,
-                        send_zero_message(&mut self.output),
-                    )
-                    .await
-                }
+                None => tokio::time::timeout(self.settings.process_timeout, send_zero_message(&mut self.output)).await,
             };
 
             if let Err(error) = send_res {
