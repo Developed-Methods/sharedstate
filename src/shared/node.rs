@@ -500,17 +500,21 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             .follow
             .as_ref()
             .map(|follow| (follow.remote, follow.leader_path.clone()));
+        let follow_remote = follow.as_ref().map(|(remote, _)| *remote);
 
         let mut peer_debug = control
             .peers
             .iter()
             .map(|(address, details)| {
                 let observation = details.as_ref().and_then(|details| details.last_observation.clone());
+                let connected = details
+                    .as_ref()
+                    .map(|details| details.connected || Some(*address) == follow_remote);
                 PeerDebugInfo {
                     address: *address,
                     known: details.is_some(),
                     can_lead: details.as_ref().map(|details| details.can_lead),
-                    connected: details.as_ref().map(|details| details.connected),
+                    connected,
                     latency_ms: details.as_ref().and_then(|details| details.latency_ms),
                     repeat_connect_fails: details.as_ref().map(|details| details.repeat_connect_fails),
                     last_activity_ms_ago: details
@@ -549,7 +553,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             leader: leader.leader,
             leader_path: leader.path,
             term: leader.term,
-            follow_remote: follow.as_ref().map(|(remote, _)| *remote),
+            follow_remote,
             follow_leader_path: follow.map(|(_, path)| path),
             known_can_lead: control.election.known_can_lead.iter().copied().collect(),
             last_promoted_leader: control.election.last_promoted_leader,
@@ -563,6 +567,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
             let control = self.control.lock().await;
             let leader = control.leader.clone();
             let follow_path = control.follow.as_ref().map(|follow| follow.leader_path.clone());
+            let follow_remote = control.follow.as_ref().map(|follow| follow.remote);
             let (leader_addr, leader_path) = match leader.leader {
                 Some(addr) if addr == self.address => (Some(addr), leader.path),
                 Some(addr) => match follow_path {
@@ -576,7 +581,8 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                 .iter()
                 .filter_map(|(addr, details)| {
                     let details = details.as_ref()?;
-                    if details.can_lead && (details.connected || *addr == self.address) {
+                    if details.can_lead && (details.connected || Some(*addr) == follow_remote || *addr == self.address)
+                    {
                         Some(*addr)
                     } else {
                         None
@@ -993,7 +999,7 @@ where
 
         match recv_timeout(&mut read, self.inner.timing.rpc_timeout).await {
             Some(SyncResponse::Pong(id)) if id == started => {
-                self.mark_connected(target, now_ms().saturating_sub(started)).await;
+                self.mark_observed(target, now_ms().saturating_sub(started)).await;
             }
             _ => {
                 self.mark_connect_fail(target).await;
@@ -1348,6 +1354,16 @@ where
             details.repeat_connect_fails = 0;
             details.latency_ms = Some(latency_ms);
             details.connected = true;
+        }
+    }
+
+    async fn mark_observed(&self, target: I::Address, latency_ms: u64) {
+        let mut control = self.inner.control.lock().await;
+        if let Some(Some(details)) = control.peers.get_mut(&target) {
+            details.last_activity = NonZeroU64::new(now_ms());
+            details.last_global_activity = NonZeroU64::new(now_ms());
+            details.repeat_connect_fails = 0;
+            details.latency_ms = Some(latency_ms);
         }
     }
 }

@@ -498,6 +498,9 @@ async fn non_leader_does_not_periodically_observe_known_non_leader_peers() {
     assert_eq!(peer1.observed_leader, Some(1), "{debug:#?}");
     assert_eq!(peer3.observed_leader, None, "{debug:#?}");
     assert_eq!(peer4.observed_leader, None, "{debug:#?}");
+    assert_eq!(peer1.connected, Some(true), "{debug:#?}");
+    assert_eq!(peer3.connected, Some(false), "{debug:#?}");
+    assert_eq!(peer4.connected, Some(false), "{debug:#?}");
 
     node1.stop(&net).await;
     node2.stop(&net).await;
