@@ -5,22 +5,40 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub type MessageSizeHeader = u32;
 const MESSAGE_HEADER_SIZE: usize = std::mem::size_of::<MessageSizeHeader>();
+const KEEPALIVE_FRAME_SIZE: MessageSizeHeader = 0;
+const CLOSE_FRAME_SIZE: MessageSizeHeader = MessageSizeHeader::MAX;
+
+#[derive(Debug)]
+pub enum ReadMessageResult<M> {
+    Message(M),
+    KeepAlive,
+    Close,
+}
+
+#[derive(Debug)]
+pub enum ReadMessageToVecResult {
+    Message,
+    KeepAlive,
+    Close,
+}
 
 pub async fn read_message_opt<M: MessageEncoding, R: AsyncRead + Unpin>(
     buffer: &mut Vec<u8>,
     read: &mut R,
     progress_timeout: Duration,
     recv_timeout: Option<Duration>,
-) -> Result<Option<M>, ReadMessageError> {
+) -> Result<ReadMessageResult<M>, ReadMessageError> {
     let _assert = black_box(M::_ASSERT);
 
-    if !read_message_to_vec(buffer, read, progress_timeout, recv_timeout).await? {
-        return Ok(None);
-    }
+    match read_message_to_vec(buffer, read, progress_timeout, recv_timeout).await? {
+        ReadMessageToVecResult::Message => {}
+        ReadMessageToVecResult::KeepAlive => return Ok(ReadMessageResult::KeepAlive),
+        ReadMessageToVecResult::Close => return Ok(ReadMessageResult::Close),
+    };
 
     let mut reader = &buffer[..];
     let msg = M::read_from(&mut reader).map_err(ReadMessageError::EncodingError)?;
-    Ok(Some(msg))
+    Ok(ReadMessageResult::Message(msg))
 }
 
 pub async fn read_message_to_vec<R: AsyncRead + Unpin>(
@@ -28,7 +46,7 @@ pub async fn read_message_to_vec<R: AsyncRead + Unpin>(
     read: &mut R,
     progress_timeout: Duration,
     recv_timeout: Option<Duration>,
-) -> Result<bool, ReadMessageError> {
+) -> Result<ReadMessageToVecResult, ReadMessageError> {
     let mut len_bytes = [0u8; MESSAGE_HEADER_SIZE];
 
     if let Some(timeout) = recv_timeout {
@@ -42,11 +60,14 @@ pub async fn read_message_to_vec<R: AsyncRead + Unpin>(
             .map_err(ReadMessageError::SizeReadError)?;
     }
 
-    let msg_len = MessageSizeHeader::from_be_bytes(len_bytes) as usize;
-    if msg_len == 0 {
-        return Ok(false);
+    let msg_len = MessageSizeHeader::from_be_bytes(len_bytes);
+    match msg_len {
+        KEEPALIVE_FRAME_SIZE => return Ok(ReadMessageToVecResult::KeepAlive),
+        CLOSE_FRAME_SIZE => return Ok(ReadMessageToVecResult::Close),
+        _ => {}
     }
 
+    let msg_len = msg_len as usize;
     buffer.clear();
     buffer.resize(msg_len, 0u8);
 
@@ -62,7 +83,7 @@ pub async fn read_message_to_vec<R: AsyncRead + Unpin>(
         }
     }
 
-    Ok(true)
+    Ok(ReadMessageToVecResult::Message)
 }
 
 #[derive(Debug)]
@@ -92,7 +113,12 @@ impl From<ReadMessageError> for std::io::Error {
 }
 
 pub async fn send_zero_message<W: AsyncWrite + Unpin>(out: &mut W) -> std::io::Result<()> {
-    out.write_all(&(0 as MessageSizeHeader).to_be_bytes()).await?;
+    out.write_all(&KEEPALIVE_FRAME_SIZE.to_be_bytes()).await?;
+    out.flush().await
+}
+
+pub async fn send_close_message<W: AsyncWrite + Unpin>(out: &mut W) -> std::io::Result<()> {
+    out.write_all(&CLOSE_FRAME_SIZE.to_be_bytes()).await?;
     out.flush().await
 }
 
@@ -116,6 +142,9 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
 
     let bytes_written = message.write_to(buffer)?;
     assert_eq!(bytes_written + MESSAGE_HEADER_SIZE, buffer.len(), "M::write_to returned incorrect number of bytes");
+    if bytes_written >= CLOSE_FRAME_SIZE as usize {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "message too large for framing protocol"));
+    }
 
     /* if static size is known, we've already written size with MAX_SIZE var */
     if let Some(size) = M::STATIC_SIZE {
@@ -140,4 +169,50 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
     }
 
     out.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn read_close_frame_returns_close() {
+        let (mut writer, mut reader) = duplex(64);
+        writer.write_all(&CLOSE_FRAME_SIZE.to_be_bytes()).await.unwrap();
+
+        let mut buffer = Vec::new();
+        let result = read_message_opt::<u64, _>(&mut buffer, &mut reader, Duration::from_secs(1), None)
+            .await
+            .unwrap();
+
+        assert!(matches!(result, ReadMessageResult::Close));
+    }
+
+    #[tokio::test]
+    async fn read_keepalive_frame_returns_keepalive() {
+        let (mut writer, mut reader) = duplex(64);
+        writer.write_all(&KEEPALIVE_FRAME_SIZE.to_be_bytes()).await.unwrap();
+
+        let mut buffer = Vec::new();
+        let result = read_message_opt::<u64, _>(&mut buffer, &mut reader, Duration::from_secs(1), None)
+            .await
+            .unwrap();
+
+        assert!(matches!(result, ReadMessageResult::KeepAlive));
+    }
+
+    #[tokio::test]
+    async fn send_close_message_writes_close_header() {
+        let (mut writer, mut reader) = duplex(64);
+        send_close_message(&mut writer).await.unwrap();
+
+        let mut header = [0; MESSAGE_HEADER_SIZE];
+        reader.read_exact(&mut header).await.unwrap();
+
+        assert_eq!(header, CLOSE_FRAME_SIZE.to_be_bytes());
+    }
 }
