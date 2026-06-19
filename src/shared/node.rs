@@ -144,6 +144,7 @@ struct PeerDetails<A: SyncIOAddress> {
     latency_ms: Option<u64>,
     can_lead: bool,
     connected: bool,
+    active_connections: u64,
     last_observation: Option<ElectionObservation<A>>,
 }
 
@@ -202,6 +203,7 @@ where
                                 latency_ms: Some(0),
                                 can_lead,
                                 connected: true,
+                                active_connections: 0,
                                 last_observation: None,
                             }),
                         );
@@ -292,6 +294,7 @@ where
                             PeerWorker::<A, D> {
                                 transport_addr,
                                 node_addr: None,
+                                counted_connected: false,
                                 inner: inner.clone(),
                                 write,
                                 read,
@@ -320,6 +323,7 @@ where
             PeerWorker::<A, D> {
                 transport_addr,
                 node_addr: None,
+                counted_connected: false,
                 inner: self.inner.clone(),
                 write,
                 read,
@@ -415,6 +419,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                         can_lead,
                         last_global_activity: details.last_global_activity,
                         connected: false,
+                        active_connections: 0,
                         last_observation: None,
                     }));
                 }
@@ -439,6 +444,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                             latency_ms: None,
                             can_lead,
                             connected: false,
+                            active_connections: 0,
                             last_observation: None,
                         });
                     }
@@ -640,6 +646,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                     latency_ms: None,
                     can_lead: observation.can_lead,
                     connected: false,
+                    active_connections: 0,
                     last_observation: None,
                 })
             })
@@ -652,6 +659,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                 latency_ms: None,
                 can_lead: observation.can_lead,
                 connected: false,
+                active_connections: 0,
                 last_observation: None,
             });
 
@@ -1249,6 +1257,9 @@ where
             if let Some(follow) = closed_follow {
                 if follow.remote == target {
                     follow.cancel.cancel();
+                    if let Some(Some(details)) = inner.control.lock().await.peers.get_mut(&target) {
+                        details.connected = details.active_connections > 0;
+                    }
                     inner.clear_remote_leader().await;
                 } else {
                     let _ = inner.control.lock().await.follow.replace(follow);
@@ -1267,11 +1278,14 @@ where
     async fn mark_connect_fail(&self, target: I::Address) {
         {
             let mut control = self.inner.control.lock().await;
+            let has_follow_to_target = control.follow.as_ref().is_some_and(|follow| follow.remote == target);
             if let Some(Some(details)) = control.peers.get_mut(&target) {
-                details.last_activity = None;
+                if !has_follow_to_target && details.active_connections == 0 {
+                    details.last_activity = None;
+                    details.connected = false;
+                }
                 details.last_connect_fail = NonZeroU64::new(now_ms());
                 details.repeat_connect_fails = details.repeat_connect_fails.saturating_add(1);
-                details.connected = false;
                 details.last_observation = None;
             }
 
@@ -1341,6 +1355,7 @@ where
 struct PeerWorker<A: SyncIOAddress, D: DeterministicState> {
     transport_addr: A,
     node_addr: Option<A>,
+    counted_connected: bool,
     inner: Arc<Inner<A, D>>,
     read: mpsc::Receiver<SyncRequest<A, D>>,
     write: mpsc::Sender<SyncResponse<A, D>>,
@@ -1618,7 +1633,7 @@ where
         }
     }
 
-    async fn record_activity_ts(&self, connected: bool) {
+    async fn record_activity_ts(&mut self, connected: bool) {
         let now = NonZeroU64::new(now_ms());
         let Some(node_addr) = self.node_addr else {
             tracing::debug!(
@@ -1635,7 +1650,17 @@ where
 
         details.last_activity = now;
         details.last_global_activity = now;
-        details.connected = connected;
+        if connected {
+            if !self.counted_connected {
+                details.active_connections = details.active_connections.saturating_add(1);
+                self.counted_connected = true;
+            }
+            details.connected = true;
+        } else if self.counted_connected {
+            details.active_connections = details.active_connections.saturating_sub(1);
+            self.counted_connected = false;
+            details.connected = details.active_connections > 0;
+        }
     }
 
     #[track_caller]
