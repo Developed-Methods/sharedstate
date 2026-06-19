@@ -603,7 +603,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                 let has_valid_relay_path = observation
                     .leader_path
                     .as_deref()
-                    .map(|path| valid_remote_leader_path(Some(leader), path, self.address))
+                    .map(|path| valid_remote_leader_path(Some(leader), path, observation.observer, self.address))
                     .unwrap_or(false);
                 let leader_is_failed = control
                     .peers
@@ -1121,7 +1121,7 @@ where
             return;
         };
 
-        if !valid_remote_leader_path(Some(leader), &path, self.inner.address) {
+        if !valid_remote_leader_path(Some(leader), &path, target, self.inner.address) {
             self.mark_connect_fail(target).await;
             return;
         }
@@ -1201,7 +1201,7 @@ where
                     }
                     Some(SyncResponse::LeaderInfo(info)) => match (info.leader, info.path) {
                         (Some(leader_addr), Some(path))
-                            if valid_remote_leader_path(Some(leader_addr), &path, inner.address) =>
+                            if valid_remote_leader_path(Some(leader_addr), &path, target, inner.address) =>
                         {
                             inner
                                 .set_remote_leader_path(
@@ -1220,7 +1220,7 @@ where
                     },
                     Some(SyncResponse::LeaderPath(path)) => {
                         if let Some(leader_addr) = path.first().copied() {
-                            if valid_remote_leader_path(Some(leader_addr), &path, inner.address) {
+                            if valid_remote_leader_path(Some(leader_addr), &path, target, inner.address) {
                                 inner
                                     .set_remote_leader_path(
                                         leader_addr,
@@ -1284,7 +1284,9 @@ where
                         !observation
                             .leader_path
                             .as_deref()
-                            .map(|path| valid_remote_leader_path(Some(target), path, self.inner.address))
+                            .map(|path| {
+                                valid_remote_leader_path(Some(target), path, observation.observer, self.inner.address)
+                            })
                             .unwrap_or(false)
                     })
                     .unwrap_or(false);
@@ -1303,7 +1305,7 @@ where
                 observation
                     .leader_path
                     .as_deref()
-                    .map(|path| valid_remote_leader_path(Some(target), path, self.inner.address))
+                    .map(|path| valid_remote_leader_path(Some(target), path, *observer, self.inner.address))
                     .unwrap_or(false)
             });
             let has_relay_follow = control

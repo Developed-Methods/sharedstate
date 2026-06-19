@@ -74,7 +74,7 @@ pub(super) fn decide_election<A: SyncIOAddress>(input: ElectionInput<A>) -> Elec
             if !valid_local_leader_path(Some(leader), path, input.local_address) {
                 continue;
             }
-        } else if !valid_remote_leader_path(Some(leader), path, input.local_address) {
+        } else if !valid_remote_leader_path(Some(leader), path, observation.observer, input.local_address) {
             continue;
         }
         let local_path = if observation.observer == input.local_address {

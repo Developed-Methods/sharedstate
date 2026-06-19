@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::net::sync_io::SyncIOAddress;
 
-pub(super) fn valid_remote_leader_path<A: SyncIOAddress>(leader: Option<A>, path: &[A], local: A) -> bool {
+pub(super) fn valid_remote_leader_path<A: SyncIOAddress>(leader: Option<A>, path: &[A], remote: A, local: A) -> bool {
     let Some(leader) = leader else {
         return false;
     };
@@ -17,7 +17,11 @@ pub(super) fn valid_remote_leader_path<A: SyncIOAddress>(leader: Option<A>, path
         }
     }
 
-    !path.iter().skip(1).any(|step| *step == local)
+    path.last().copied() == Some(remote)
+        && !path
+            .iter()
+            .enumerate()
+            .any(|(idx, step)| *step == local && !(idx == 0 && leader == local))
 }
 
 pub(super) fn valid_local_leader_path<A: SyncIOAddress>(leader: Option<A>, path: &[A], local: A) -> bool {

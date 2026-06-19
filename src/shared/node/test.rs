@@ -229,10 +229,12 @@ mod fuzzy;
 
 #[test]
 fn remote_leader_path_rejects_cycles_and_local_node() {
-    assert!(valid_remote_leader_path(Some(1), &[1, 2], 3));
-    assert!(!valid_remote_leader_path(Some(1), &[1, 2, 3], 3));
-    assert!(!valid_remote_leader_path(Some(1), &[1, 2, 2], 3));
-    assert!(!valid_remote_leader_path(Some(2), &[1, 2], 3));
+    assert!(valid_remote_leader_path(Some(1), &[1, 2], 2, 3));
+    assert!(valid_remote_leader_path(Some(1), &[1], 1, 3));
+    assert!(!valid_remote_leader_path(Some(1), &[1, 2], 4, 3));
+    assert!(!valid_remote_leader_path(Some(1), &[1, 2, 3], 3, 3));
+    assert!(!valid_remote_leader_path(Some(1), &[1, 2, 2], 2, 3));
+    assert!(!valid_remote_leader_path(Some(2), &[1, 2], 2, 3));
 }
 
 #[test]
