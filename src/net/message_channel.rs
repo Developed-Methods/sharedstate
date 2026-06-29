@@ -71,7 +71,11 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> ReadChannel<I, M> {
                     break;
                 }
                 Err(error) => {
-                    tracing::error!(?error, "failed to read from network");
+                    if error.is_disconnect() {
+                        tracing::debug!(?error, "network read closed");
+                    } else {
+                        tracing::error!(?error, "failed to read from network");
+                    }
                     break;
                 }
             }
