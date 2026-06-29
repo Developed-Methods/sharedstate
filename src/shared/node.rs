@@ -338,6 +338,27 @@ where
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
+    async fn apply_action_as_current_leader(
+        &self,
+        action: D::Action,
+        state_handle: &mut SharedStateHandle<RecoverableState<D>>,
+    ) -> Result<(), D::Action> {
+        let control = self.control.lock().await;
+        if control.leader.leader != Some(self.address) {
+            return Err(action);
+        }
+
+        let authority = {
+            let state = state_handle.read();
+            let authority = state.authority(RecoverableStateAction::StateAction { action });
+            state_handle.quiescent();
+            authority
+        };
+
+        self.state.lock().await.apply_authority(authority).await;
+        Ok(())
+    }
+
     async fn start_local_action_pump(self: &Arc<Self>)
     where
         D::Action: Send,
@@ -353,17 +374,11 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
 
             while let Some(mut action) = rx.recv().await {
                 loop {
-                    let is_leader = inner.control.lock().await.leader.leader == Some(inner.address);
-                    if is_leader {
-                        let authority = {
-                            let state = state_handle.read();
-                            let authority = state.authority(RecoverableStateAction::StateAction { action });
-                            state_handle.quiescent();
-                            authority
-                        };
-
-                        inner.state.lock().await.apply_authority(authority).await;
-                        break;
+                    match inner.apply_action_as_current_leader(action, &mut state_handle).await {
+                        Ok(()) => break,
+                        Err(returned_action) => {
+                            action = returned_action;
+                        }
                     }
 
                     let follow_tx = {
@@ -1579,27 +1594,20 @@ where
     }
 
     async fn handle_action(&self, source: A, action: D::Action) {
-        let (is_leader, follow_tx) = {
-            let control = self.inner.control.lock().await;
-            (
-                control.leader.leader == Some(self.inner.address),
-                control.follow.as_ref().map(|follow| follow.to_peer.clone()),
-            )
+        let mut state_handle = self.inner.state_reader.create_handle();
+        let action = match self
+            .inner
+            .apply_action_as_current_leader(action, &mut state_handle)
+            .await
+        {
+            Ok(()) => return,
+            Err(action) => action,
         };
-        if is_leader {
-            let authority = {
-                let state = self.inner.state.lock().await;
-                let state_clone = state.state_clone().await;
-                state_clone.state().authority(action)
-            };
-            self.inner
-                .state
-                .lock()
-                .await
-                .apply_authority(RecoverableStateAction::StateAction { action: authority })
-                .await;
-            return;
-        }
+
+        let follow_tx = {
+            let control = self.inner.control.lock().await;
+            control.follow.as_ref().map(|follow| follow.to_peer.clone())
+        };
 
         if let Some(follow_tx) = follow_tx {
             if follow_tx.send(SyncRequest::Action { source, action }).await.is_err() {

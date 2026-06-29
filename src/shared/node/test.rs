@@ -328,6 +328,85 @@ async fn local_observation_does_not_advertise_remote_leader_without_follow_path(
 }
 
 #[tokio::test]
+async fn leader_action_holds_control_until_authority_is_applied() {
+    let node = node(2, true).await;
+
+    {
+        let mut control = node.inner.control.lock().await;
+        control.leader.leader = Some(2);
+        control.leader.path = Some(vec![2]);
+        control.leader.term = 1;
+    }
+
+    let state_guard = node.inner.state.lock().await;
+    let (_request_tx, request_rx) = mpsc::channel(1);
+    let (response_tx, _response_rx) = mpsc::channel(1);
+    let worker = PeerWorker {
+        transport_addr: 99,
+        node_addr: Some(99),
+        counted_connected: false,
+        inner: node.inner.clone(),
+        read: request_rx,
+        write: response_tx,
+    };
+
+    let action_task = tokio::spawn(async move {
+        worker
+            .handle_action(
+                99,
+                TestAction::Set {
+                    key: "race".to_string(),
+                    value: "blocked".to_string(),
+                },
+            )
+            .await;
+    });
+
+    assert!(
+        wait_until(Duration::from_millis(500), || async { node.inner.control.try_lock().is_err() }).await,
+        "leader action did not hold control while waiting to apply authority"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), node.inner.control.lock())
+            .await
+            .is_err(),
+        "control lock was available before authority application completed"
+    );
+
+    let demotion = {
+        let inner = node.inner.clone();
+        tokio::spawn(async move {
+            let mut control = inner.control.lock().await;
+            control.leader.leader = Some(3);
+            control.leader.path = Some(vec![3, 2]);
+            control.leader.term = 2;
+        })
+    };
+
+    drop(state_guard);
+    action_task.await.expect("action task panicked");
+    demotion.await.expect("demotion task panicked");
+
+    let inner = node.inner.clone();
+    assert!(
+        wait_until(Duration::from_secs(1), || {
+            let inner = inner.clone();
+            async move {
+                let state = inner.state.lock().await.state_clone().await;
+                state.state().values.get("race").map(String::as_str) == Some("blocked")
+            }
+        })
+        .await,
+        "leader action was not applied before the queued demotion completed"
+    );
+
+    let control = node.inner.control.lock().await;
+    assert_eq!(control.leader.leader, Some(3));
+    assert_eq!(control.leader.path, Some(vec![3, 2]));
+    assert_eq!(control.leader.term, 2);
+}
+
+#[tokio::test]
 async fn leader_rejoin_then_second_failover_promotes_available_candidate() {
     let net = SimulatedNet::new();
 
