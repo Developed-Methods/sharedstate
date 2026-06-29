@@ -73,6 +73,7 @@ impl<I: SyncIO> SyncConnection<I> {
 
         tokio::spawn(
             WriteChannel::<I, W> {
+                remote: self.remote,
                 input: write_rx,
                 output: self.write,
                 settings: settings.clone(),
@@ -82,6 +83,7 @@ impl<I: SyncIO> SyncConnection<I> {
 
         tokio::spawn(
             ReadChannel::<I, R> {
+                remote: self.remote,
                 output: read_tx,
                 input: self.read,
                 settings,

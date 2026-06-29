@@ -96,6 +96,24 @@ pub enum ReadMessageError {
     Closed,
 }
 
+impl ReadMessageError {
+    pub fn is_disconnect(&self) -> bool {
+        match self {
+            ReadMessageError::Closed => true,
+            ReadMessageError::SizeReadError(error) | ReadMessageError::MessageReadError(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            ),
+            ReadMessageError::MessageReadTimeout
+            | ReadMessageError::NextMessageTimeout(_)
+            | ReadMessageError::EncodingError(_) => false,
+        }
+    }
+}
+
 impl From<ReadMessageError> for std::io::Error {
     fn from(value: ReadMessageError) -> Self {
         match value {
@@ -214,5 +232,26 @@ mod tests {
         reader.read_exact(&mut header).await.unwrap();
 
         assert_eq!(header, CLOSE_FRAME_SIZE.to_be_bytes());
+    }
+
+    #[test]
+    fn read_message_error_classifies_disconnects() {
+        let closed = ReadMessageError::Closed;
+        let eof = ReadMessageError::SizeReadError(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof"));
+        let reset =
+            ReadMessageError::MessageReadError(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"));
+
+        assert!(closed.is_disconnect());
+        assert!(eof.is_disconnect());
+        assert!(reset.is_disconnect());
+    }
+
+    #[test]
+    fn read_message_error_does_not_classify_protocol_failures_as_disconnects() {
+        let timeout = ReadMessageError::MessageReadTimeout;
+        let encoding = ReadMessageError::EncodingError(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid"));
+
+        assert!(!timeout.is_disconnect());
+        assert!(!encoding.is_disconnect());
     }
 }
