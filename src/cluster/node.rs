@@ -34,7 +34,7 @@ use super::observer::ClientWorker;
 use super::peer_handler::PeerWorker;
 
 pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
-    inner: Arc<Inner<A, D>>,
+    pub(crate) inner: Arc<Inner<A, D>>,
     io_settings: NetIoSettings,
 }
 
@@ -304,6 +304,3 @@ where
 {
     tokio::time::timeout(timeout, read.recv()).await.ok().flatten()
 }
-
-#[cfg(test)]
-mod test;

@@ -853,4 +853,7 @@ fn peer_debug_dto(peer: PeerDebugInfo<u64>) -> PeerDebugInfoDto {
 }
 
 #[cfg(test)]
+mod node;
+
+#[cfg(test)]
 mod test;

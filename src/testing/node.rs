@@ -1,7 +1,11 @@
-use super::*;
 use crate::{
-    cluster::election::{valid_local_leader_path, valid_remote_leader_path},
-    protocol::messages::SharePeerDetails,
+    cluster::{
+        election::{valid_local_leader_path, valid_remote_leader_path},
+        node::{recv_timeout, send_expect_ok, PROTOCOL_VERSION},
+        NodeActionSender, NodeState, NodeTiming, SendActionError,
+    },
+    protocol::messages::{SharePeerDetails, SyncRequest, SyncResponse},
+    state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
     transport::{
         channels::NetIoSettings,
         simulated::{SimulatedIo, SimulatedNet},
@@ -9,7 +13,9 @@ use crate::{
     },
     utils::now_ms,
 };
-use std::{collections::BTreeMap, future::Future, num::NonZeroU64, sync::Arc};
+use message_encoding::MessageEncoding;
+use std::{collections::BTreeMap, future::Future, num::NonZeroU64, sync::Arc, time::Duration};
+use tokio::task::JoinHandle;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TestState {
@@ -273,7 +279,7 @@ async fn send_when_leader_unblocks_after_election() {
     node.stop(&net).await;
 }
 
-#[path = "test/fuzzy.rs"]
+#[path = "node/fuzzy.rs"]
 mod fuzzy;
 
 #[test]

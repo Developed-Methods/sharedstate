@@ -1,5 +1,8 @@
 use super::*;
-use crate::transport::simulated::{SimulatedNet, SimulatedTopologySnapshot};
+use crate::{
+    cluster::NodeDebugInfo,
+    transport::simulated::{SimulatedNet, SimulatedTopologySnapshot},
+};
 use rand_chacha::{
     rand_core::{RngCore, SeedableRng},
     ChaCha8Rng,
