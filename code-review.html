@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SharedState Code Review</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: #0f1117;
+    color: #c9d1d9;
+    line-height: 1.6;
+  }
+  header {
+    background: linear-gradient(135deg, #161b22 0%, #0d1117 100%);
+    border-bottom: 1px solid #30363d;
+    padding: 2.5rem 2rem;
+  }
+  header h1 { font-size: 1.8rem; color: #e6edf3; font-weight: 700; }
+  header .subtitle { color: #8b949e; margin-top: 0.3rem; font-size: 0.95rem; }
+  header .meta { margin-top: 1rem; display: flex; gap: 1.5rem; flex-wrap: wrap; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 0.35rem;
+    padding: 0.2rem 0.65rem; border-radius: 2rem;
+    font-size: 0.78rem; font-weight: 600; border: 1px solid;
+  }
+  .badge-critical { background: #3d0009; color: #ff7b72; border-color: #ff7b7240; }
+  .badge-high     { background: #2d1c00; color: #e3b341; border-color: #e3b34140; }
+  .badge-medium   { background: #1c2a00; color: #7ee787; border-color: #7ee78740; }
+  .badge-low      { background: #0d1a2d; color: #58a6ff; border-color: #58a6ff40; }
+  .badge-info     { background: #161b22; color: #8b949e; border-color: #30363d; }
+
+  main { max-width: 1000px; margin: 0 auto; padding: 2rem 1.5rem 4rem; }
+
+  section { margin-bottom: 2.5rem; }
+  section > h2 {
+    font-size: 1.15rem; color: #e6edf3;
+    border-bottom: 1px solid #30363d;
+    padding-bottom: 0.5rem; margin-bottom: 1.2rem;
+    font-weight: 600;
+  }
+
+  .summary-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 1rem; margin-bottom: 1.5rem;
+  }
+  .summary-card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 1rem; text-align: center;
+  }
+  .summary-card .count { font-size: 2.2rem; font-weight: 700; }
+  .summary-card .label { font-size: 0.8rem; color: #8b949e; margin-top: 0.2rem; }
+  .count-critical { color: #ff7b72; }
+  .count-high     { color: #e3b341; }
+  .count-medium   { color: #7ee787; }
+  .count-low      { color: #58a6ff; }
+
+  .arch-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;
+  }
+  .arch-card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.2rem;
+  }
+  .arch-card h3 { font-size: 0.9rem; color: #58a6ff; margin-bottom: 0.6rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .arch-card p { font-size: 0.88rem; color: #8b949e; line-height: 1.55; }
+  .arch-card ul { list-style: none; padding: 0; }
+  .arch-card ul li { font-size: 0.88rem; color: #8b949e; padding: 0.15rem 0; }
+  .arch-card ul li::before { content: "›  "; color: #30363d; }
+
+  .finding {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    margin-bottom: 1.2rem; overflow: hidden;
+  }
+  .finding-header {
+    display: flex; align-items: flex-start; gap: 1rem;
+    padding: 1rem 1.2rem; border-bottom: 1px solid #21262d; cursor: pointer;
+  }
+  .finding-body { padding: 1.2rem; }
+
+  .severity-bar {
+    width: 4px; border-radius: 2px; flex-shrink: 0; align-self: stretch; min-height: 24px;
+  }
+  .sev-critical { background: #ff7b72; }
+  .sev-high     { background: #e3b341; }
+  .sev-medium   { background: #7ee787; }
+  .sev-low      { background: #58a6ff; }
+
+  .finding-title { flex: 1; }
+  .finding-title h3 { font-size: 1rem; color: #e6edf3; font-weight: 600; margin-bottom: 0.3rem; }
+  .finding-title .loc { font-size: 0.8rem; color: #8b949e; font-family: 'Consolas', monospace; }
+
+  .finding-body p { font-size: 0.9rem; color: #8b949e; margin-bottom: 0.8rem; }
+  .finding-body p:last-child { margin-bottom: 0; }
+  .finding-body strong { color: #c9d1d9; }
+
+  pre, code {
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  }
+  pre {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 6px;
+    padding: 1rem; overflow-x: auto; font-size: 0.83rem; line-height: 1.5;
+    margin: 0.8rem 0;
+  }
+  code { font-size: 0.85em; background: #21262d; padding: 0.1em 0.35em; border-radius: 3px; color: #c9d1d9; }
+
+  .scenario {
+    background: #0d1117; border-left: 3px solid #30363d; border-radius: 0 6px 6px 0;
+    padding: 0.8rem 1rem; margin: 0.8rem 0;
+    font-size: 0.87rem;
+  }
+  .scenario .scenario-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: #8b949e; margin-bottom: 0.4rem; }
+
+  .fix-box {
+    background: #0d2016; border: 1px solid #238636; border-radius: 6px;
+    padding: 0.8rem 1rem; margin-top: 1rem; font-size: 0.87rem;
+  }
+  .fix-box .fix-label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: #2ea043; margin-bottom: 0.4rem; }
+
+  .toc { list-style: none; padding: 0; }
+  .toc li { padding: 0.3rem 0; }
+  .toc a { color: #58a6ff; text-decoration: none; font-size: 0.9rem; }
+  .toc a:hover { text-decoration: underline; }
+  .toc .sev { margin-right: 0.5rem; font-size: 0.75rem; }
+
+  @media (max-width: 640px) {
+    .arch-grid { grid-template-columns: 1fr; }
+    .summary-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SharedState — Code Review</h1>
+  <p class="subtitle">Distributed shared state library · Rust · Leader-election consensus protocol</p>
+  <div class="meta">
+    <span class="badge badge-info">Reviewed: 2026-06-29</span>
+    <span class="badge badge-info">Branch: main @ 076103e</span>
+    <span class="badge badge-info">Scope: full codebase</span>
+    <span class="badge badge-critical">2 Critical</span>
+    <span class="badge badge-high">2 High</span>
+    <span class="badge badge-medium">3 Medium</span>
+    <span class="badge badge-low">2 Low / Latent</span>
+  </div>
+</header>
+
+<main>
+
+<!-- SUMMARY -->
+<section>
+  <h2>Finding Summary</h2>
+  <div class="summary-grid">
+    <div class="summary-card">
+      <div class="count count-critical">2</div>
+      <div class="label">Critical</div>
+    </div>
+    <div class="summary-card">
+      <div class="count count-high">2</div>
+      <div class="label">High</div>
+    </div>
+    <div class="summary-card">
+      <div class="count count-medium">3</div>
+      <div class="label">Medium</div>
+    </div>
+    <div class="summary-card">
+      <div class="count count-low">2</div>
+      <div class="label">Low / Latent</div>
+    </div>
+  </div>
+
+  <p style="font-size:0.9rem;color:#8b949e;line-height:1.7">
+    The two most severe findings — the <strong style="color:#c9d1d9">quorum calculation</strong> and the
+    <strong style="color:#c9d1d9">leader check TOCTOU</strong> — can produce split-brain state corruption in any
+    partitioned deployment. For a 20-datacenter system these must be addressed before production use.
+    All other findings are independently actionable.
+  </p>
+</section>
+
+<!-- ARCHITECTURE -->
+<section>
+  <h2>Architecture Overview</h2>
+  <div class="arch-grid">
+    <div class="arch-card">
+      <h3>Core Layers</h3>
+      <ul>
+        <li><code>DeterministicState</code> — user-defined CRDT/state machine</li>
+        <li><code>RecoverableState</code> — wraps user state with generation IDs &amp; history for follower recovery</li>
+        <li><code>AuthorativeState</code> — leader-side sequenced broadcast to followers</li>
+        <li><code>SharedState / HotRead</code> — lock-free snapshot reads for local consumers</li>
+      </ul>
+    </div>
+    <div class="arch-card">
+      <h3>Consensus Model</h3>
+      <p>
+        Leader-election gossip: every node periodically pings peers, collects
+        <code>ElectionObservation</code>s, and calls <code>decide_election</code> to converge on a leader.
+        Non-leaders establish a long-lived <em>follow connection</em> to stream authority actions.
+        The protocol resembles a simplified Raft without persistent log or formal quorum writes.
+      </p>
+    </div>
+    <div class="arch-card">
+      <h3>Network</h3>
+      <ul>
+        <li>Custom length-prefixed framing (<code>u32</code> header)</li>
+        <li>Keepalive (0) and close (0xFFFFFFFF) sentinel frames</li>
+        <li>Separate short-lived probe connections (observe) vs long-lived follow connections</li>
+        <li>Peer discovery gossip via <code>SharePeers</code> exchange</li>
+      </ul>
+    </div>
+    <div class="arch-card">
+      <h3>Key Invariants</h3>
+      <ul>
+        <li>Only the leader calls <code>apply_authority</code></li>
+        <li>Every authority action carries a monotone sequence number</li>
+        <li>Generation ID changes on every leadership promotion to allow follower recovery detection</li>
+        <li>Leader paths must be cycle-free and end at the local node</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- FINDINGS TABLE OF CONTENTS -->
+<section>
+  <h2>Findings</h2>
+  <ul class="toc">
+    <li><span class="sev badge badge-critical">C1</span> <a href="#c1">Quorum computed from reachable nodes — minority partition can elect a leader (split-brain)</a></li>
+    <li><span class="sev badge badge-critical">C2</span> <a href="#c2">TOCTOU between leader check and <code>apply_authority</code> — non-leader can corrupt state</a></li>
+    <li><span class="sev badge badge-high">H1</span> <a href="#h1">Follow reader unconditionally <code>take()</code>s current follow — races with new connection, loses it</a></li>
+    <li><span class="sev badge badge-high">H2</span> <a href="#h2">Peer-controlled vector length → unbounded <code>Vec::with_capacity</code> → OOM / DoS</a></li>
+    <li><span class="sev badge badge-medium">M1</span> <a href="#m1"><code>subscribe()</code> panics after 16 retries — crashes the node task</a></li>
+    <li><span class="sev badge badge-medium">M2</span> <a href="#m2"><code>apply_authority</code> panics on closed broadcast — hard crash instead of graceful shutdown</a></li>
+    <li><span class="sev badge badge-medium">M3</span> <a href="#m3">Action pump silently starves during leaderless intervals — actions are dropped after 1024 queue depth</a></li>
+    <li><span class="sev badge badge-low">L1</span> <a href="#l1"><code>RecovGenerationEnd::STATIC_SIZE</code> undercounts by one field</a></li>
+    <li><span class="sev badge badge-low">L2</span> <a href="#l2"><code>apply_update</code> panics with a truncated message — obscures root cause</a></li>
+  </ul>
+</section>
+
+<!-- ──────────────────────────────────────────────────────────────────── -->
+<!-- CRITICAL -->
+
+<div class="finding" id="c1">
+  <div class="finding-header">
+    <div class="severity-bar sev-critical"></div>
+    <div class="finding-title">
+      <h3>C1 — Quorum computed from reachable nodes: minority partition can elect a leader</h3>
+      <div class="loc">src/shared/node/election.rs : 159–163</div>
+    </div>
+    <span class="badge badge-critical">Critical</span>
+  </div>
+  <div class="finding-body">
+    <p>
+      <strong>What the code does.</strong> After tallying which leader-capable nodes are reachable,
+      <code>decide_election</code> computes a majority threshold and decides whether to promote the local node:
+    </p>
+<pre>let reachable_count = input.known_can_lead.iter()
+    .filter(|addr| reachable_within_stale(addr, ...))
+    .count();
+let active_can_lead_count = reachable_count.max(usize::from(input.can_lead));
+let majority = active_can_lead_count / 2 + 1;         // ← bug: denominator is reachable, not total
+
+if leader == input.local_address &amp;&amp; input.can_lead &amp;&amp; majority &lt;= reachable_count {
+    return ElectionDecision::PromoteSelf { observed_term: term };
+}</pre>
+    <p>
+      The denominator for the majority threshold is derived from <code>reachable_count</code>, not
+      from the total <code>known_can_lead.len()</code>.  This means "majority" shrinks whenever
+      nodes go unreachable — exactly the moment correctness matters most.
+    </p>
+
+    <div class="scenario">
+      <div class="scenario-label">Concrete split-brain scenario — 5-node cluster, 3+2 partition</div>
+      <p>Cluster: nodes 1–5, all <code>can_lead = true</code>, <code>known_can_lead = {1,2,3,4,5}</code>.</p>
+      <p><strong>Partition A (nodes 1, 2, 3 see each other):</strong><br>
+        <code>reachable_count = 3</code> → <code>majority = 3/2+1 = 2</code> → <code>2 ≤ 3</code> → node 1 promotes ✓</p>
+      <p><strong>Partition B (nodes 4, 5 see each other):</strong><br>
+        <code>reachable_count = 2</code> → <code>majority = 2/2+1 = 2</code> → <code>2 ≤ 2</code> → node 4 promotes ✗</p>
+      <p>Both sides elect a leader. Both leaders accept writes. State permanently diverges.</p>
+    </div>
+
+    <div class="fix-box">
+      <div class="fix-label">Fix</div>
+      <p>Use the total cluster size as the denominator, not the reachable subset:</p>
+<pre>let total_can_lead = input.known_can_lead.len().max(usize::from(input.can_lead));
+let majority = total_can_lead / 2 + 1;
+
+if leader == input.local_address &amp;&amp; input.can_lead &amp;&amp; majority &lt;= reachable_count {
+    return ElectionDecision::PromoteSelf { ... };
+}</pre>
+      <p>With this fix: Partition B has <code>reachable_count = 2 &lt; majority = 3</code> → does not promote.</p>
+    </div>
+  </div>
+</div>
+
+<div class="finding" id="c2">
+  <div class="finding-header">
+    <div class="severity-bar sev-critical"></div>
+    <div class="finding-title">
+      <h3>C2 — TOCTOU between leader check and <code>apply_authority</code>: non-leader can corrupt state</h3>
+      <div class="loc">src/shared/node.rs : 356–366 &nbsp;|&nbsp; 1582–1601</div>
+    </div>
+    <span class="badge badge-critical">Critical</span>
+  </div>
+  <div class="finding-body">
+    <p>
+      <strong>In the local action pump</strong> (<code>start_local_action_pump</code>), the node checks
+      whether it is the current leader, releases the <code>control</code> mutex, and then calls
+      <code>apply_authority</code> under a separate <code>state</code> mutex lock:
+    </p>
+<pre>// lock acquired and released here:
+let is_leader = inner.control.lock().await.leader.leader == Some(inner.address);
+if is_leader {
+    let authority = {
+        let state = state_handle.read();           // reads state snapshot
+        state.authority(RecoverableStateAction::StateAction { action })
+    };
+    // ← leadership can change here; control lock not held
+    inner.state.lock().await.apply_authority(authority).await;  // writes!
+    break;
+}</pre>
+    <p>
+      Between the leadership check and <code>apply_authority</code>, Tokio can schedule another task that:
+      (a) strips this node of leadership, and (b) lets a new leader start accepting writes.
+      When this node resumes, it applies an authority action it should not — resulting in
+      a state sequence that no follower will receive from the new leader.
+    </p>
+    <p>
+      The same pattern appears in <code>handle_action</code> (line 1582–1601), where an incoming
+      peer action is applied: a peer sends an action to what it believes is the leader; the
+      receiving node checks <code>is_leader</code>, releases the control lock, and applies the action.
+    </p>
+
+    <div class="scenario">
+      <div class="scenario-label">Failure scenario</div>
+      <p>Node A is leader. Node A and Node B simultaneously detect a network partition.
+         Node B promotes itself (C1 aside). Node A's action pump task is scheduled,
+         checks <code>is_leader = true</code>, yields, B's promotion is recorded, then
+         A's pump resumes and calls <code>apply_authority</code>. A's followers receive an
+         action that B (the new leader) never issued, permanently diverging from B's state.</p>
+    </div>
+
+    <div class="fix-box">
+      <div class="fix-label">Fix</div>
+      <p>Re-check leadership under the same lock that guards <code>AuthorativeState</code>, or
+         hold a single combined lock across the check and the apply. Alternatively, gate
+         <code>apply_authority</code> on an epoch/term token that is invalidated on leader change:
+         before applying, verify the term has not advanced since the check.</p>
+    </div>
+  </div>
+</div>
+
+<!-- HIGH -->
+
+<div class="finding" id="h1">
+  <div class="finding-header">
+    <div class="severity-bar sev-high"></div>
+    <div class="finding-title">
+      <h3>H1 — Follow reader unconditionally <code>take()</code>s current follow: races with new connection</h3>
+      <div class="loc">src/shared/node.rs : 1266–1277</div>
+    </div>
+    <span class="badge badge-high">High</span>
+  </div>
+  <div class="finding-body">
+    <p>
+      When a follow reader task exits (stream closed, cancelled, etc.) it cleans up:
+    </p>
+<pre>// Step 1: unconditionally take whatever follow is currently set
+let closed_follow = { inner.control.lock().await.follow.take() };
+// ← lock is released; another task can now set a NEW follow connection
+
+if let Some(follow) = closed_follow {
+    if follow.remote == target {
+        // correct path: cancels old follow, clears leader
+        follow.cancel.cancel();
+        inner.clear_remote_leader().await;
+    } else {
+        // wrong: tries to put back whatever we took — but a third connection
+        // may have been established in the gap between take() and here
+        let _ = inner.control.lock().await.follow.replace(follow);
+    }
+}</pre>
+    <p>
+      If the follow connection was replaced by the time the reader exits (because the leader changed
+      and <code>connect_follow</code> established a new one), the reader <code>take()</code>s the
+      <em>new</em> connection. The <code>else</code> branch then tries to put it back, but the
+      control lock was released between <code>take()</code> and <code>replace()</code>.
+      A third connection established in that window is silently overwritten and lost.
+    </p>
+    <p>
+      The node ends up holding a stale follow reference that points to a dead channel,
+      causing it to never reconnect until the next full observation cycle detects the anomaly.
+    </p>
+
+    <div class="fix-box">
+      <div class="fix-label">Fix</div>
+      <p>Only take the follow if it matches the exiting reader's target. Hold the lock across
+         any subsequent state mutations:</p>
+<pre>let mut control = inner.control.lock().await;
+if control.follow.as_ref().is_some_and(|f| f.remote == target) {
+    if let Some(follow) = control.follow.take() {
+        follow.cancel.cancel();
+        if let Some(Some(details)) = control.peers.get_mut(&amp;target) {
+            details.connected = details.active_connections > 0;
+        }
+        drop(control);
+        inner.clear_remote_leader().await;
+    }
+}
+// else: a different follow is active; leave it untouched</pre>
+    </div>
+  </div>
+</div>
+
+<div class="finding" id="h2">
+  <div class="finding-header">
+    <div class="severity-bar sev-high"></div>
+    <div class="finding-title">
+      <h3>H2 — Peer-controlled vector length causes unbounded allocation: OOM / DoS</h3>
+      <div class="loc">src/shared/messages.rs : 377 &nbsp;|&nbsp; src/state/recoverable_state.rs : 230</div>
+    </div>
+    <span class="badge badge-high">High</span>
+  </div>
+  <div class="finding-body">
+    <p>
+      Two deserialization sites trust a peer-supplied <code>u64</code> as a vector length and
+      immediately allocate capacity:
+    </p>
+<pre>// messages.rs — read_vec (called for SharePeers, LeaderPath, reachable_can_lead, etc.)
+fn read_vec&lt;T: MessageEncoding, R: std::io::Read&gt;(read: &amp;mut R) -&gt; std::io::Result&lt;Vec&lt;T&gt;&gt; {
+    let count = u64::read_from(read)? as usize;
+    let mut vec = Vec::with_capacity(count);   // ← allocates count * sizeof(T) bytes
+    for _ in 0..count { ... }
+    Ok(vec)
+}
+
+// recoverable_state.rs — RecoverableStateDetails::read_from
+let len = u64::read_from(read)? as usize;
+let mut history = VecDeque::with_capacity(len); // ← same issue</pre>
+    <p>
+      A rogue or compromised peer sends a message with <code>count = 2^32</code>. For a 32-byte
+      element type, <code>Vec::with_capacity</code> attempts to allocate 16 GiB. The allocator
+      either OOMs and aborts the process, or on systems with overcommit, the subsequent
+      element writes trigger the OS killer. Either way the node crashes.
+    </p>
+    <p>
+      <code>RecoverableStateDetails</code> history is internally capped at 2048 on write
+      (line <code>recoverable_state.rs:78</code>) but this cap is not enforced on deserialization,
+      so a peer claiming 2 billion history entries is accepted.
+    </p>
+
+    <div class="fix-box">
+      <div class="fix-label">Fix</div>
+      <p>Cap allocations at a sane maximum before allocating capacity. For history, use the
+         existing write-side cap:</p>
+<pre>// read_vec
+const MAX_VEC_ITEMS: usize = 65_536;
+let count = u64::read_from(read)? as usize;
+if count > MAX_VEC_ITEMS {
+    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "vector too large"));
+}
+let mut vec = Vec::with_capacity(count);
+
+// recoverable_state.rs history
+const MAX_HISTORY: usize = 2048;
+if len > MAX_HISTORY {
+    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "history too large"));
+}</pre>
+    </div>
+  </div>
+</div>
+
+<!-- MEDIUM -->
+
+<div class="finding" id="m1">
+  <div class="finding-header">
+    <div class="severity-bar sev-medium"></div>
+    <div class="finding-title">
+      <h3>M1 — <code>subscribe()</code> panics after 16 retries: crashes the node task</h3>
+      <div class="loc">src/shared/authorative_state.rs : 74–93</div>
+    </div>
+    <span class="badge badge-medium">Medium</span>
+  </div>
+  <div class="finding-body">
+    <p>
+      <code>AuthorativeState::subscribe</code> retries up to 16 times (spaced 1ms apart) to
+      obtain a broadcast subscription aligned with the current state snapshot.  On the 17th failure
+      it panics:
+    </p>
+<pre>for _ in 0..16 {
+    let state_borrow = handle.read();
+    let Ok(sub) = self.authority_broadcast.subscribe_from(state_borrow.accept_seq()).await else {
+        handle.quiescent();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        continue;
+    };
+    return (state.clone(), sub);
+}
+panic!("failed to subscribe");  // ← kills the task and all its children</pre>
+    <p>
+      <code>subscribe</code> is called from <code>PeerWorker::subscribe_fresh</code> and
+      <code>subscribe_recovery</code>, which are invoked on every follower connection.
+      Under high write throughput the broadcast ring can race the state snapshot repeatedly
+      for longer than 16ms, triggering the panic.  The panic unwinds <code>PeerWorker</code>,
+      kills its spawned feed task, and may leave the follower stuck with no state stream.
+    </p>
+
+    <div class="fix-box">
+      <div class="fix-label">Fix</div>
+      <p>Return an error instead of panicking, and let the caller close the connection gracefully:</p>
+<pre>pub async fn subscribe(&amp;self) -&gt; Option&lt;(RecoverableState&lt;D&gt;, ...)&gt; {
+    for _ in 0..32 {
+        ...
+        let Ok(sub) = ... else { ...; continue; };
+        return Some((state, sub));
+    }
+    tracing::error!("failed to subscribe after retries");
+    None
+}</pre>
+    </div>
+  </div>
+</div>
+
+<div class="finding" id="m2">
+  <div class="finding-header">
+    <div class="severity-bar sev-medium"></div>
+    <div class="finding-title">
+      <h3>M2 — <code>apply_authority</code> panics on closed broadcast: hard crash instead of graceful shutdown</h3>
+      <div class="loc">src/shared/authorative_state.rs : 137–143</div>
+    </div>
+    <span class="badge badge-medium">Medium</span>
+  </div>
+  <div class="finding-body">
+    <p>
+      If the internal broadcast channel is closed for any reason (bug in
+      <code>StateMaintainWorker</code>, task crash, or a logical error during
+      <code>reset</code>), every subsequent call to <code>apply_authority</code> panics:
+    </p>
+<pre>pub async fn apply_authority(&amp;mut self, authority: ...) {
+    let success = self.authority_tx.send(authority).await.is_ok();
+    if !success {
+        panic!("authority broadcast is offline");
+    }
+}</pre>
+    <p>
+      This turns any internal transient failure into a hard node crash.  For a system expected
+      to run across 20 datacenters indefinitely, crashes from internal errors should be logged
+      and trigger graceful re-initialization, not process abort.
+    </p>
+
+    <div class="fix-box">
+      <div class="fix-label">Fix</div>
+      <p>Return a <code>Result</code> from <code>apply_authority</code> and propagate the error
+         to the caller for clean shutdown or recovery:</p>
+<pre>pub async fn apply_authority(&amp;mut self, authority: ...) -&gt; Result&lt;(), AuthBroadcastClosed&gt; {
+    self.authority_tx.send(authority).await.map_err(|_| AuthBroadcastClosed)
+}</pre>
+    </div>
+  </div>
+</div>
+
+<div class="finding" id="m3">
+  <div class="finding-header">
+    <div class="severity-bar sev-medium"></div>
+    <div class="finding-title">
+      <h3>M3 — Action pump silently starves during leaderless intervals: actions drop after queue fills</h3>
+      <div class="loc">src/shared/node.rs : 354–394</div>
+    </div>
+    <span class="badge badge-medium">Medium</span>
+  </div>
+  <div class="finding-body">
+    <p>
+      When neither a local leader nor a follow connection exists, the action pump spins with a
+      500ms sleep per attempt, holding each pending action captive:
+    </p>
+<pre>while let Some(mut action) = rx.recv().await {
+    loop {
+        let is_leader = ...;
+        if is_leader { ... break; }
+
+        let follow_tx = ...;
+        if let Some(follow_tx) = follow_tx {
+            match follow_tx.send(...).await {
+                Ok(()) =&gt; break,
+                Err(e) =&gt; { action = recover(e); }   // re-enter loop
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;  // blocks next action
+    }
+}</pre>
+    <p>
+      The <code>local_actions_tx</code> channel is bounded at 1024 items (line 177).
+      During an election (which can take multiple observation intervals at 3s each), 1024
+      user-submitted actions fill the queue.  Further <code>action_sender().send(...)</code>
+      calls return <code>Err(SendActionError::Closed)</code> — misleadingly named; the channel
+      is full, not closed — and the actions are silently discarded.  Callers have no way to
+      distinguish "leader elected, please retry" from "node is shutting down".
+    </p>
+
+    <div class="fix-box">
+      <div class="fix-label">Fix</div>
+      <p>Add a distinct <code>SendActionError::NoLeader</code> variant, or expose backpressure.
+         The 500ms hardcoded sleep should also respect the configurable <code>NodeTiming</code>
+         values rather than being a magic constant.</p>
+    </div>
+  </div>
+</div>
+
+<!-- LOW / LATENT -->
+
+<div class="finding" id="l1">
+  <div class="finding-header">
+    <div class="severity-bar sev-low"></div>
+    <div class="finding-title">
+      <h3>L1 — <code>RecovGenerationEnd::STATIC_SIZE</code> undercounts by one field</h3>
+      <div class="loc">src/state/recoverable_state.rs : 189–191</div>
+    </div>
+    <span class="badge badge-low">Low / Latent</span>
+  </div>
+  <div class="finding-body">
+    <p>
+      <code>RecovGenerationEnd</code> has three <code>u64</code> fields (<code>old_id</code>,
+      <code>generation</code>, <code>next_sequence</code>), but its <code>STATIC_SIZE</code>
+      constant only sums two:
+    </p>
+<pre>impl MessageEncoding for RecovGenerationEnd {
+    const STATIC_SIZE: Option&lt;usize&gt; = m_opt_sum(&amp;[u64::STATIC_SIZE, u64::STATIC_SIZE]);
+    //                                                ^ two u64 = 16 bytes
+    // write_to writes three u64 fields = 24 bytes
+    fn write_to&lt;T: Write&gt;(&amp;self, out: &amp;mut T) -&gt; std::io::Result&lt;usize&gt; {
+        let mut sum = 0;
+        sum += self.old_id.write_to(out)?;        // 8
+        sum += self.generation.write_to(out)?;     // 8
+        sum += self.next_sequence.write_to(out)?;  // 8
+        Ok(sum)  // = 24
+    }
+}</pre>
+    <p>
+      Currently harmless because <code>RecovGenerationEnd</code> is only serialized as part
+      of <code>RecoverableStateDetails</code>, never as a top-level framed message.
+      The mismatch would trigger the <code>assert_eq!(size, bytes_written)</code> assertion
+      in <code>send_message</code> if this type were ever framed directly, producing a
+      confusing panic instead of a compile-time error.
+    </p>
+
+    <div class="fix-box">
+      <div class="fix-label">Fix</div>
+      <pre>const STATIC_SIZE: Option&lt;usize&gt; = m_opt_sum(&amp;[u64::STATIC_SIZE, u64::STATIC_SIZE, u64::STATIC_SIZE]);</pre>
+    </div>
+  </div>
+</div>
+
+<div class="finding" id="l2">
+  <div class="finding-header">
+    <div class="severity-bar sev-low"></div>
+    <div class="finding-title">
+      <h3>L2 — <code>apply_update</code> panics with a truncated message: obscures root cause</h3>
+      <div class="loc">src/state/shared_state.rs : 107–109</div>
+    </div>
+    <span class="badge badge-low">Low / Latent</span>
+  </div>
+  <div class="finding-body">
+    <p>
+      The state update function panics with an incomplete string literal if the sequence
+      invariant is violated:
+    </p>
+<pre>fn apply_update(&amp;mut self, update: &amp;Self::Action) {
+    match update {
+        HotSharedStateUpdate::Authority { seq, action } =&gt; {
+            if self.state.accept_seq() != *seq {
+                panic!("Received authority ")   // ← message is cut off mid-sentence
+            }
+            assert_eq!(self.state.accept_seq(), *seq);   // ← redundant: already checked above
+            self.state.update(action);
+            assert_eq!(self.state.accept_seq(), seq + 1);
+        }
+        ...
+    }
+}</pre>
+    <p>
+      The panic message appears to be a copy-paste artifact left mid-edit.  More critically,
+      it provides no information about the expected vs. actual sequence, making post-mortem
+      analysis from logs nearly impossible.  The immediately following
+      <code>assert_eq!(self.state.accept_seq(), *seq)</code> is also dead code — the panic
+      above would have already fired.
+    </p>
+
+    <div class="fix-box">
+      <div class="fix-label">Fix</div>
+<pre>if self.state.accept_seq() != *seq {
+    panic!(
+        "authority action sequence mismatch: expected {}, got {}",
+        self.state.accept_seq(), seq
+    );
+}
+// remove the redundant assert_eq below</pre>
+    </div>
+  </div>
+</div>
+
+<!-- RECOMMENDATIONS -->
+<section>
+  <h2>Recommendations</h2>
+  <div class="arch-grid">
+    <div class="arch-card">
+      <h3>Immediate (before any production traffic)</h3>
+      <ul>
+        <li>Fix the quorum denominator (C1) — cannot be deferred for multi-DC use</li>
+        <li>Fix the follow-reader take/replace race (H1)</li>
+        <li>Add vector length caps on deserialization (H2)</li>
+        <li>Address the leader TOCTOU (C2) — requires a design decision on locking strategy</li>
+      </ul>
+    </div>
+    <div class="arch-card">
+      <h3>Short-term</h3>
+      <ul>
+        <li>Replace panics in <code>subscribe</code> and <code>apply_authority</code> with returned errors (M1, M2)</li>
+        <li>Expose a <code>NoLeader</code> error variant from the action sender (M3)</li>
+        <li>Fix the truncated panic message (L2)</li>
+        <li>Fix <code>STATIC_SIZE</code> on <code>RecovGenerationEnd</code> (L1)</li>
+      </ul>
+    </div>
+    <div class="arch-card">
+      <h3>Testing gaps</h3>
+      <ul>
+        <li>No tests for partition scenarios — add simulation tests with <code>test_orchestrator</code> that split and re-join nodes</li>
+        <li>No fuzz tests for deserialization — run <code>cargo-fuzz</code> on <code>SyncRequest::read_from</code></li>
+        <li>The <code>fuzzy.rs</code> test file exists but is not integrated into CI (not listed in <code>lib.rs</code>)</li>
+      </ul>
+    </div>
+    <div class="arch-card">
+      <h3>Design considerations</h3>
+      <ul>
+        <li>The protocol has no persistent log — node crash loses all in-flight actions since last snapshot</li>
+        <li>Leader path relay (chain of follow connections) introduces cascading failure modes not currently handled</li>
+        <li>Consider a term-based authority token threaded through <code>apply_authority</code> to close the TOCTOU fundamentally</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+</main>
+</body>
+</html>
