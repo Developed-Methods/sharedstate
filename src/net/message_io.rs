@@ -178,6 +178,9 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
     let mut written = 0;
     while written < buffer.len() {
         match tokio::time::timeout(progress_timeout, out.write(&buffer[written..])).await {
+            Ok(Ok(0)) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write message data"));
+            }
             Ok(Ok(bytes)) => {
                 written += bytes;
             }
@@ -191,11 +194,31 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
 
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
+
+    struct ZeroWrite;
+
+    impl AsyncWrite for ZeroWrite {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn read_close_frame_returns_close() {
@@ -232,6 +255,18 @@ mod tests {
         reader.read_exact(&mut header).await.unwrap();
 
         assert_eq!(header, CLOSE_FRAME_SIZE.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn send_message_returns_write_zero_when_writer_makes_no_progress() {
+        let mut writer = ZeroWrite;
+        let mut buffer = Vec::new();
+
+        let error = send_message(&mut buffer, &42u64, &mut writer, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
     }
 
     #[test]
