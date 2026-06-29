@@ -112,7 +112,7 @@ struct TestClusterNode {
     node: NodeState<u64, TestState>,
     listener: JoinHandle<()>,
     client: JoinHandle<()>,
-    actions: NodeActionSender<TestAction>,
+    actions: NodeActionSender<TestAction, u64>,
 }
 
 #[derive(Clone)]
@@ -222,6 +222,99 @@ async fn wait_for_leader_path(node: &NodeState<u64, TestState>, expected: Vec<u6
         async move { node.debug_info().await.leader_path == Some(expected) }
     })
     .await
+}
+
+#[tokio::test]
+async fn action_sender_send_returns_no_leader_without_known_leader() {
+    let node = node(1, false).await;
+    let actions = node.action_sender();
+
+    let result = actions
+        .send(TestAction::Set {
+            key: "leaderless".to_owned(),
+            value: "rejected".to_owned(),
+        })
+        .await;
+
+    assert!(matches!(result, Err(SendActionError::NoLeader)));
+}
+
+#[tokio::test]
+async fn action_sender_send_when_leader_waits_for_leader() {
+    let net = SimulatedNet::new();
+    let io = net.start_io(1).await;
+    let node = node(1, true).await;
+    let mut actions = node.action_sender();
+
+    let listener = node.start_listener(io.clone()).await;
+    let client = node.start_client(io.clone()).await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        actions.send_when_leader(TestAction::Set {
+            key: "waited".to_owned(),
+            value: "ok".to_owned(),
+        }),
+    )
+    .await;
+
+    assert!(matches!(result, Ok(Ok(()))));
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            let mut handle = node.create_state_handle();
+            let value = handle.read().state().values.get("waited").cloned();
+            handle.quiescent();
+            value.as_deref() == Some("ok")
+        })
+        .await,
+        "node={:#?}",
+        node.debug_info().await
+    );
+
+    listener.abort();
+    client.abort();
+    net.stop_node(1).await;
+}
+
+#[tokio::test]
+async fn local_action_pump_uses_configured_follow_retry_interval() {
+    let timing = NodeTiming {
+        observation_stale_after: Duration::from_secs(30),
+        observation_interval: Duration::from_millis(25),
+        follow_retry_interval: Duration::from_millis(25),
+        rpc_timeout: Duration::from_millis(100),
+    };
+    let node = node_with_timing(1, false, timing).await;
+    let actions = node.action_sender();
+    let raw_actions = actions.sender();
+
+    node.inner.start_local_action_pump().await;
+    raw_actions
+        .send(TestAction::Set {
+            key: "retry".to_owned(),
+            value: "timed".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    {
+        let mut control = node.inner.control.lock().await;
+        control.leader.leader = Some(1);
+        control.leader.path = Some(vec![1]);
+        control.leader.term = 1;
+    }
+
+    assert!(
+        wait_until(Duration::from_millis(200), || async {
+            let mut handle = node.create_state_handle();
+            let value = handle.read().state().values.get("retry").cloned();
+            handle.quiescent();
+            value.as_deref() == Some("timed")
+        })
+        .await,
+        "local action pump did not observe the configured retry interval"
+    );
 }
 
 #[path = "test/fuzzy.rs"]
@@ -673,7 +766,12 @@ async fn high_latency_cluster_converges_with_configured_timing() {
             let Some(leader) = debug1.leader else {
                 return false;
             };
-            debug2.leader == Some(leader) && debug3.leader == Some(leader)
+            debug2.leader == Some(leader)
+                && debug3.leader == Some(leader)
+                && debug3
+                    .leader_path
+                    .as_ref()
+                    .is_some_and(|path| path.first() == Some(&leader))
         })
         .await,
         "node1={:#?}\nnode2={:#?}\nnode3={:#?}",
@@ -682,14 +780,17 @@ async fn high_latency_cluster_converges_with_configured_timing() {
         node3.node.debug_info().await
     );
 
-    node3
-        .actions
-        .send(TestAction::Set {
+    let mut actions = node3.actions.clone();
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        actions.send_when_leader(TestAction::Set {
             key: "slow".to_owned(),
             value: "ok".to_owned(),
-        })
-        .await
-        .unwrap();
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
 
     assert!(
         wait_until(Duration::from_secs(20), || async {
