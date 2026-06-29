@@ -25,12 +25,14 @@ impl Default for NetIoSettings {
 }
 
 pub struct ReadChannel<I: SyncIO, M: MessageEncoding> {
+    pub remote: I::Address,
     pub input: I::Read,
     pub output: Sender<M>,
     pub settings: NetIoSettings,
 }
 
 pub struct WriteChannel<I: SyncIO, M: MessageEncoding> {
+    pub remote: I::Address,
     pub input: Receiver<M>,
     pub output: I::Write,
     pub settings: NetIoSettings,
@@ -51,7 +53,7 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> ReadChannel<I, M> {
                     Some(self.settings.message_timeout),
                 ) => read_opt_res,
                 _ = self.output.closed() => {
-                    tracing::info!("output closed, stopping read");
+                    tracing::info!(remote = ?self.remote, "output closed, stopping read");
                     break;
                 }
             };
@@ -59,7 +61,7 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> ReadChannel<I, M> {
             match read_opt_res {
                 Ok(ReadMessageResult::Message(msg)) => {
                     if self.output.send(msg).await.is_err() {
-                        tracing::error!("failed to send message to output, stopping read");
+                        tracing::error!(remote = ?self.remote, "failed to send message to output, stopping read");
                         break;
                     }
                 }
@@ -67,14 +69,14 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> ReadChannel<I, M> {
                     continue;
                 }
                 Ok(ReadMessageResult::Close) => {
-                    tracing::info!("remote closed connection");
+                    tracing::info!(remote = ?self.remote, "remote closed connection");
                     break;
                 }
                 Err(error) => {
                     if error.is_disconnect() {
-                        tracing::debug!(?error, "network read closed");
+                        tracing::debug!(remote = ?self.remote, ?error, "network read closed");
                     } else {
-                        tracing::error!(?error, "failed to read from network");
+                        tracing::error!(remote = ?self.remote, ?error, "failed to read from network");
                     }
                     break;
                 }
@@ -96,7 +98,7 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
                     match msg_opt {
                         Some(v) => Some(v),
                         None => {
-                            tracing::info!("input closed, closing write");
+                            tracing::info!(remote = ?self.remote, "input closed, closing write");
                             let close_res = tokio::time::timeout(
                                 self.settings.process_timeout,
                                 send_close_message(&mut self.output),
@@ -105,8 +107,12 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
 
                             match close_res {
                                 Ok(Ok(())) => {}
-                                Ok(Err(error)) => tracing::debug!(?error, "failed to send close message"),
-                                Err(error) => tracing::debug!(?error, "timed out sending close message"),
+                                Ok(Err(error)) => {
+                                    tracing::debug!(remote = ?self.remote, ?error, "failed to send close message")
+                                }
+                                Err(error) => {
+                                    tracing::debug!(remote = ?self.remote, ?error, "timed out sending close message")
+                                }
                             }
 
                             break;
@@ -130,11 +136,11 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
             match send_res {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    tracing::error!(?error, "failed to send message, closing write");
+                    tracing::error!(remote = ?self.remote, ?error, "failed to send message, closing write");
                     break;
                 }
                 Err(error) => {
-                    tracing::error!(?error, "timed out sending message, closing write");
+                    tracing::error!(remote = ?self.remote, ?error, "timed out sending message, closing write");
                     break;
                 }
             }
@@ -143,8 +149,8 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
         let shutdown_res = tokio::time::timeout(self.settings.process_timeout, self.output.shutdown()).await;
         match shutdown_res {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::debug!(?error, "failed to shutdown write"),
-            Err(error) => tracing::debug!(?error, "timed out shutting down write"),
+            Ok(Err(error)) => tracing::debug!(remote = ?self.remote, ?error, "failed to shutdown write"),
+            Err(error) => tracing::debug!(remote = ?self.remote, ?error, "timed out shutting down write"),
         }
     }
 }
@@ -194,6 +200,7 @@ mod tests {
 
         let handle = tokio::spawn(
             WriteChannel::<DuplexSyncIo, u64> {
+                remote: 1,
                 input: rx,
                 output,
                 settings: test_settings(),
@@ -215,6 +222,7 @@ mod tests {
 
         let handle = tokio::spawn(
             ReadChannel::<DuplexSyncIo, u64> {
+                remote: 1,
                 input,
                 output: tx,
                 settings: test_settings(),
