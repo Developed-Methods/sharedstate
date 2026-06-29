@@ -255,7 +255,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_set(rest: &str, actions: &NodeActionSender<KvAction>) {
+async fn handle_set(rest: &str, actions: &NodeActionSender<KvAction, u16>) {
     let mut parts = rest.splitn(2, char::is_whitespace);
     let Some(key) = parts.next().filter(|v| !v.is_empty()) else {
         println!("usage: set <key> <value>");
@@ -295,7 +295,7 @@ fn handle_get(rest: &str, handle: &mut sharedstate::state::shared_state::SharedS
     }
 }
 
-async fn handle_delete(rest: &str, actions: &NodeActionSender<KvAction>) {
+async fn handle_delete(rest: &str, actions: &NodeActionSender<KvAction, u16>) {
     let key = rest.trim();
     if key.is_empty() || key.split_whitespace().nth(1).is_some() {
         println!("usage: delete <key>");
@@ -381,6 +381,7 @@ fn report_send(result: std::result::Result<(), SendActionError>) {
     match result {
         Ok(()) => println!("queued"),
         Err(SendActionError::Closed) => println!("node action channel is closed"),
+        Err(SendActionError::NoLeader) => println!("no leader is currently known"),
     }
 }
 

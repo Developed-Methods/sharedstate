@@ -61,7 +61,7 @@ struct NodeRuntime<D: DeterministicState> {
     _io: Arc<SimulatedIo>,
     listener: JoinHandle<()>,
     client: JoinHandle<()>,
-    actions: NodeActionSender<D::Action>,
+    actions: NodeActionSender<D::Action, u64>,
 }
 
 impl<D: DeterministicState> NodeRuntime<D> {

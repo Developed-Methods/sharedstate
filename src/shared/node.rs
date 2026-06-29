@@ -62,19 +62,34 @@ pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
 #[derive(Debug)]
 pub enum SendActionError {
     Closed,
+    NoLeader,
 }
 
 #[derive(Clone)]
-pub struct NodeActionSender<Action> {
+pub struct NodeActionSender<Action, A: SyncIOAddress> {
     tx: mpsc::Sender<Action>,
+    leader: watch::Receiver<LeaderInfoMessage<A>>,
 }
 
-impl<Action> NodeActionSender<Action> {
+impl<Action, A: SyncIOAddress> NodeActionSender<Action, A> {
     pub fn sender(&self) -> mpsc::Sender<Action> {
         self.tx.clone()
     }
 
     pub async fn send(&self, action: Action) -> Result<(), SendActionError> {
+        if self.leader.borrow().leader.is_none() {
+            return Err(SendActionError::NoLeader);
+        }
+
+        self.tx.send(action).await.map_err(|_| SendActionError::Closed)
+    }
+
+    pub async fn send_when_leader(&mut self, action: Action) -> Result<(), SendActionError> {
+        self.leader
+            .wait_for(|info| info.leader.is_some())
+            .await
+            .map_err(|_| SendActionError::Closed)?;
+
         self.tx.send(action).await.map_err(|_| SendActionError::Closed)
     }
 }
@@ -250,9 +265,10 @@ where
         self.inner.state_reader.create_handle()
     }
 
-    pub fn action_sender(&self) -> NodeActionSender<D::Action> {
+    pub fn action_sender(&self) -> NodeActionSender<D::Action, A> {
         NodeActionSender {
             tx: self.inner.local_actions_tx.clone(),
+            leader: self.inner.leader_updates.subscribe(),
         }
     }
 
@@ -347,6 +363,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         };
 
         let inner = self.clone();
+        let timing = inner.timing.clone();
 
         tokio::spawn(async move {
             let mut state_handle = inner.state.lock().await.create_state_handle();
@@ -388,7 +405,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
                         }
                     }
 
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tokio::time::sleep(timing.follow_retry_interval).await;
                 }
             }
         });
