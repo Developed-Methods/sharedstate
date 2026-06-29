@@ -70,6 +70,10 @@ pub struct NodeActionSender<Action> {
 }
 
 impl<Action> NodeActionSender<Action> {
+    pub fn sender(&self) -> mpsc::Sender<Action> {
+        self.tx.clone()
+    }
+
     pub async fn send(&self, action: Action) -> Result<(), SendActionError> {
         self.tx.send(action).await.map_err(|_| SendActionError::Closed)
     }
