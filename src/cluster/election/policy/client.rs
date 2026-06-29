@@ -1,15 +1,15 @@
 use std::collections::BTreeSet;
 
-use crate::net::sync_io::SyncIOAddress;
+use crate::transport::traits::SyncIOAddress;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum PeerKind {
+pub(crate) enum PeerKind {
     Unknown,
     Known { can_lead: bool },
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct ObservationTargetInput<A: SyncIOAddress> {
+pub(crate) struct ObservationTargetInput<A: SyncIOAddress> {
     pub local: A,
     pub can_lead: bool,
     pub leader: Option<A>,
@@ -18,7 +18,7 @@ pub(super) struct ObservationTargetInput<A: SyncIOAddress> {
     pub peers: Vec<(A, PeerKind)>,
 }
 
-pub(super) fn observation_targets<A: SyncIOAddress>(input: ObservationTargetInput<A>) -> Vec<A> {
+pub(crate) fn observation_targets<A: SyncIOAddress>(input: ObservationTargetInput<A>) -> Vec<A> {
     let mut targets = BTreeSet::new();
 
     for (addr, kind) in input.peers {

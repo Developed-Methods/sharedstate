@@ -1,7 +1,7 @@
-use crate::net::sync_io::SyncIOAddress;
+use crate::transport::traits::SyncIOAddress;
 
 #[derive(Clone, Debug)]
-pub(super) struct FollowCandidate<A: SyncIOAddress> {
+pub(crate) struct FollowCandidate<A: SyncIOAddress> {
     pub address: A,
     pub connected: bool,
     pub latency_ms: Option<u64>,
@@ -12,7 +12,7 @@ pub(super) struct FollowCandidate<A: SyncIOAddress> {
     pub observed_leader: Option<A>,
 }
 
-pub(super) fn sort_follow_candidates<A: SyncIOAddress>(
+pub(crate) fn sort_follow_candidates<A: SyncIOAddress>(
     leader: Option<A>,
     mut candidates: Vec<FollowCandidate<A>>,
 ) -> Vec<FollowCandidate<A>> {

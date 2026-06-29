@@ -7,9 +7,13 @@ use rand_chacha::{
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     env,
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
+
+use crate::utils::now_ms;
+
+static FUZZY_SEED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
 struct FuzzyConfig {
@@ -60,7 +64,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 fn default_runtime_seed() -> u64 {
-    now_ms() ^ PROMOTION_COUNTER.fetch_add(1, Ordering::SeqCst).rotate_left(19)
+    now_ms() ^ FUZZY_SEED_COUNTER.fetch_add(1, Ordering::SeqCst).rotate_left(19)
 }
 
 #[allow(dead_code)]
@@ -381,9 +385,7 @@ async fn common_leader(cluster: &FuzzyCluster, expected: &StabilizationExpectati
     }
 
     for (address, info) in debug_by_address {
-        let Some(path) = info.leader_path else {
-            return None;
-        };
+        let path = info.leader_path?;
         if path.is_empty() || path.first().copied() != Some(leader) {
             return None;
         }

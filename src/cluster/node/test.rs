@@ -4,7 +4,12 @@ use crate::net::{
     simulated::{SimulatedIo, SimulatedNet},
     sync_io::{SyncConnection, SyncIO, SyncIOListener},
 };
-use std::{collections::BTreeMap, sync::Arc};
+use crate::{
+    cluster::election::{valid_local_leader_path, valid_remote_leader_path},
+    protocol::messages::SharePeerDetails,
+    utils::now_ms,
+};
+use std::{collections::BTreeMap, future::Future, num::NonZeroU64, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TestState {
@@ -112,7 +117,7 @@ struct TestClusterNode {
     node: NodeState<u64, TestState>,
     listener: JoinHandle<()>,
     client: JoinHandle<()>,
-    actions: NodeActionSender<TestAction>,
+    actions: NodeActionSender<TestAction, u64>,
 }
 
 #[derive(Clone)]
@@ -222,6 +227,50 @@ async fn wait_for_leader_path(node: &NodeState<u64, TestState>, expected: Vec<u6
         async move { node.debug_info().await.leader_path == Some(expected) }
     })
     .await
+}
+
+#[tokio::test]
+async fn send_returns_no_leader_when_no_leader() {
+    let node = node(9001, false).await;
+    let actions = node.action_sender();
+
+    let result = actions
+        .send(TestAction::Set {
+            key: "leaderless".to_owned(),
+            value: "rejected".to_owned(),
+        })
+        .await;
+
+    assert!(matches!(result, Err(SendActionError::NoLeader)));
+}
+
+#[tokio::test]
+async fn send_when_leader_unblocks_after_election() {
+    let net = SimulatedNet::new();
+    let node = start_cluster_node(&net, 9002, true, &[]).await;
+    let mut actions = node.actions.clone();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        actions.send_when_leader(TestAction::Set {
+            key: "after-election".to_owned(),
+            value: "accepted".to_owned(),
+        }),
+    )
+    .await;
+
+    assert!(matches!(result, Ok(Ok(()))));
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            let mut handle = node.node.create_state_handle();
+            let value = handle.read().state().values.get("after-election").cloned();
+            handle.quiescent();
+            value.as_deref() == Some("accepted")
+        })
+        .await
+    );
+
+    node.stop(&net).await;
 }
 
 #[path = "test/fuzzy.rs"]
@@ -682,9 +731,9 @@ async fn high_latency_cluster_converges_with_configured_timing() {
         node3.node.debug_info().await
     );
 
-    node3
-        .actions
-        .send(TestAction::Set {
+    let mut actions = node3.actions.clone();
+    actions
+        .send_when_leader(TestAction::Set {
             key: "slow".to_owned(),
             value: "ok".to_owned(),
         })

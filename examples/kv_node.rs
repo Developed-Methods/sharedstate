@@ -219,15 +219,15 @@ async fn main() -> Result<()> {
 
     let actions = node.action_sender();
     let mut handle = node.create_state_handle();
-    let mut editor = DefaultEditor::new()
-        .map_err(|error| Error::new(ErrorKind::Other, format!("failed to initialize terminal editor: {error}")))?;
+    let mut editor =
+        DefaultEditor::new().map_err(|error| Error::other(format!("failed to initialize terminal editor: {error}")))?;
 
     loop {
         let line = match editor.readline("kv> ") {
             Ok(line) => line,
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
             Err(error) => {
-                return Err(Error::new(ErrorKind::Other, format!("failed to read terminal input: {error}")));
+                return Err(Error::other(format!("failed to read terminal input: {error}")));
             }
         };
         let line = line.trim();
@@ -255,7 +255,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_set(rest: &str, actions: &NodeActionSender<KvAction>) {
+async fn handle_set(rest: &str, actions: &NodeActionSender<KvAction, u16>) {
     let mut parts = rest.splitn(2, char::is_whitespace);
     let Some(key) = parts.next().filter(|v| !v.is_empty()) else {
         println!("usage: set <key> <value>");
@@ -295,7 +295,7 @@ fn handle_get(rest: &str, handle: &mut sharedstate::state::shared_state::SharedS
     }
 }
 
-async fn handle_delete(rest: &str, actions: &NodeActionSender<KvAction>) {
+async fn handle_delete(rest: &str, actions: &NodeActionSender<KvAction, u16>) {
     let key = rest.trim();
     if key.is_empty() || key.split_whitespace().nth(1).is_some() {
         println!("usage: delete <key>");
@@ -380,6 +380,7 @@ fn print_debug(debug: NodeDebugInfo<u16>) {
 fn report_send(result: std::result::Result<(), SendActionError>) {
     match result {
         Ok(()) => println!("queued"),
+        Err(SendActionError::NoLeader) => println!("no leader is currently available"),
         Err(SendActionError::Closed) => println!("node action channel is closed"),
     }
 }

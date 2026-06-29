@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
-use crate::net::sync_io::SyncIOAddress;
+use crate::transport::traits::SyncIOAddress;
 
-pub(super) fn valid_remote_leader_path<A: SyncIOAddress>(leader: Option<A>, path: &[A], remote: A, local: A) -> bool {
+pub(crate) fn valid_remote_leader_path<A: SyncIOAddress>(leader: Option<A>, path: &[A], remote: A, local: A) -> bool {
     let Some(leader) = leader else {
         return false;
     };
@@ -24,7 +24,7 @@ pub(super) fn valid_remote_leader_path<A: SyncIOAddress>(leader: Option<A>, path
             .any(|(idx, step)| *step == local && !(idx == 0 && leader == local))
 }
 
-pub(super) fn valid_local_leader_path<A: SyncIOAddress>(leader: Option<A>, path: &[A], local: A) -> bool {
+pub(crate) fn valid_local_leader_path<A: SyncIOAddress>(leader: Option<A>, path: &[A], local: A) -> bool {
     let Some(leader) = leader else {
         return false;
     };
@@ -42,7 +42,7 @@ pub(super) fn valid_local_leader_path<A: SyncIOAddress>(leader: Option<A>, path:
     path.last().copied() == Some(local)
 }
 
-pub(super) fn append_path<A: SyncIOAddress>(mut path: Vec<A>, local: A) -> Vec<A> {
+pub(crate) fn append_path<A: SyncIOAddress>(mut path: Vec<A>, local: A) -> Vec<A> {
     if !path.contains(&local) {
         path.push(local);
     }

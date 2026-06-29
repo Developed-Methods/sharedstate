@@ -1,10 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
 
-use crate::{net::sync_io::SyncIOAddress, shared::messages::ElectionObservation};
+use crate::{protocol::messages::ElectionObservation, transport::traits::SyncIOAddress};
 
 use super::paths::{append_path, valid_local_leader_path, valid_remote_leader_path};
 
-pub(super) struct ElectionState<A: SyncIOAddress> {
+pub(crate) struct ElectionState<A: SyncIOAddress> {
     pub term: u64,
     pub known_can_lead: BTreeSet<A>,
     pub observations: HashMap<A, ElectionObservation<A>>,
@@ -20,7 +20,7 @@ struct CandidateEvidence<A: SyncIOAddress> {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct ElectionInput<A: SyncIOAddress> {
+pub(crate) struct ElectionInput<A: SyncIOAddress> {
     pub local_address: A,
     pub can_lead: bool,
     pub known_can_lead: BTreeSet<A>,
@@ -33,26 +33,26 @@ pub(super) struct ElectionInput<A: SyncIOAddress> {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct TimedPeerObservation<A: SyncIOAddress> {
+pub(crate) struct TimedPeerObservation<A: SyncIOAddress> {
     pub observer: A,
     pub last_activity_ms: Option<u64>,
     pub observation: ElectionObservation<A>,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct PeerReachability {
+pub(crate) struct PeerReachability {
     pub last_activity_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum ElectionDecision<A: SyncIOAddress> {
+pub(crate) enum ElectionDecision<A: SyncIOAddress> {
     PromoteSelf { observed_term: u64 },
     FollowRemote { leader: A, term: u64, path: Vec<A> },
     ClearRemoteLeader { leader: A },
     NoChange,
 }
 
-pub(super) fn decide_election<A: SyncIOAddress>(input: ElectionInput<A>) -> ElectionDecision<A> {
+pub(crate) fn decide_election<A: SyncIOAddress>(input: ElectionInput<A>) -> ElectionDecision<A> {
     let mut candidates: HashMap<A, CandidateEvidence<A>> = HashMap::new();
 
     let now_ms = input.now_ms;
@@ -126,7 +126,7 @@ pub(super) fn decide_election<A: SyncIOAddress>(input: ElectionInput<A>) -> Elec
         selected = input
             .known_can_lead
             .iter()
-            .filter(|addr| {
+            .find(|addr| {
                 **addr == input.local_address
                     || input
                         .peer_reachability
@@ -135,7 +135,6 @@ pub(super) fn decide_election<A: SyncIOAddress>(input: ElectionInput<A>) -> Elec
                         .map(|ts| input.now_ms.saturating_sub(ts) <= input.stale_after_ms)
                         .unwrap_or(false)
             })
-            .next()
             .map(|leader| (input.election_term, *leader, None));
     }
 
