@@ -169,6 +169,19 @@ impl FuzzyCluster {
         snapshot
     }
 
+    async fn state_snapshot(&self) -> HashMap<u64, TestState> {
+        let mut snapshot = HashMap::new();
+        for address in &self.all_addresses {
+            if let Some(node) = self.nodes.get(address) {
+                let mut handle = node.node.create_state_handle();
+                let state = handle.read().state().clone();
+                handle.quiescent();
+                snapshot.insert(*address, state);
+            }
+        }
+        snapshot
+    }
+
     async fn current_expectation(&self) -> (SimulatedTopologySnapshot, StabilizationExpectation) {
         let topology = self.net.topology_snapshot().await;
         let expectation = stabilization_expectation(&topology, &self.can_lead);
@@ -261,6 +274,39 @@ struct FuzzyFailureReport {
     topology: SimulatedTopologySnapshot,
     expectation: StabilizationExpectation,
     debug: Vec<NodeDebugInfo<u64>>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct FuzzyActionFailureReport {
+    seed: u64,
+    elapsed: Duration,
+    event_index: u64,
+    last_events: Vec<FuzzyEvent>,
+    topology: SimulatedTopologySnapshot,
+    expectation: StabilizationExpectation,
+    debug: Vec<NodeDebugInfo<u64>>,
+    source: u64,
+    leader: u64,
+    key: String,
+    value: String,
+    observed: Vec<FuzzyActionObservedValue>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+struct FuzzyActionObservedValue {
+    address: u64,
+    value: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FuzzyActionProbe {
+    source: u64,
+    leader: u64,
+    key: String,
+    value: String,
+    expected: BTreeSet<u64>,
 }
 
 fn stabilization_expectation(
@@ -424,6 +470,132 @@ impl FuzzyReportContext<'_> {
             debug: cluster.debug_snapshot().await,
         }
     }
+
+    async fn action_report(
+        &self,
+        cluster: &FuzzyCluster,
+        expectation: StabilizationExpectation,
+        action: &FuzzyActionProbe,
+    ) -> FuzzyActionFailureReport {
+        let states = cluster.state_snapshot().await;
+        let observed = action
+            .expected
+            .iter()
+            .map(|address| FuzzyActionObservedValue {
+                address: *address,
+                value: states
+                    .get(address)
+                    .and_then(|state| state.values.get(&action.key))
+                    .cloned(),
+            })
+            .collect();
+
+        FuzzyActionFailureReport {
+            seed: self.seed,
+            elapsed: self.started.elapsed(),
+            event_index: self.event_index,
+            last_events: self.last_events.iter().cloned().collect(),
+            topology: self.topology.clone(),
+            expectation,
+            debug: cluster.debug_snapshot().await,
+            source: action.source,
+            leader: action.leader,
+            key: action.key.clone(),
+            value: action.value.clone(),
+            observed,
+        }
+    }
+}
+
+async fn send_peer_action_to_leader(
+    cluster: &FuzzyCluster,
+    topology: &SimulatedTopologySnapshot,
+    expectation: &StabilizationExpectation,
+    leader: u64,
+    event_index: u64,
+    action_index: u64,
+) -> Option<FuzzyActionProbe> {
+    let StabilizationExpectation::Stabilizable { online, .. } = expectation else {
+        return None;
+    };
+
+    let expected = online
+        .difference(&topology.blocked_nodes)
+        .copied()
+        .filter(|address| cluster.nodes.contains_key(address))
+        .collect::<BTreeSet<_>>();
+    let source = expected
+        .iter()
+        .find(|address| **address != leader)
+        .or_else(|| expected.iter().find(|address| **address == leader))
+        .copied()?;
+    let node = cluster.nodes.get(&source)?;
+    let key = format!("fuzzy_action_{event_index}_{action_index}");
+    let value = format!("from_{source}_to_{leader}");
+
+    node.actions
+        .send(TestAction::Set {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .await
+        .unwrap();
+
+    Some(FuzzyActionProbe {
+        source,
+        leader,
+        key,
+        value,
+        expected,
+    })
+}
+
+async fn wait_for_action_convergence(
+    cluster: &FuzzyCluster,
+    action: &FuzzyActionProbe,
+    timeout: Duration,
+    report_context: &FuzzyReportContext<'_>,
+    expectation: &StabilizationExpectation,
+) -> Result<(), FuzzyActionFailureReport> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let states = cluster.state_snapshot().await;
+        if action.expected.iter().all(|address| {
+            states
+                .get(address)
+                .and_then(|state| state.values.get(&action.key))
+                .is_some_and(|value| value == &action.value)
+        }) {
+            return Ok(());
+        }
+
+        if deadline <= tokio::time::Instant::now() {
+            return Err(report_context.action_report(cluster, expectation.clone(), action).await);
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn verify_peer_action_after_convergence(
+    cluster: &FuzzyCluster,
+    topology: &SimulatedTopologySnapshot,
+    expectation: &StabilizationExpectation,
+    leader: u64,
+    action_index: u64,
+    timeout: Duration,
+    report_context: &FuzzyReportContext<'_>,
+) {
+    let Some(action) =
+        send_peer_action_to_leader(cluster, topology, expectation, leader, report_context.event_index, action_index)
+            .await
+    else {
+        return;
+    };
+
+    if let Err(report) = wait_for_action_convergence(cluster, &action, timeout, report_context, expectation).await {
+        panic!("fuzzy cluster failed to process peer action:\n{report:#?}");
+    }
 }
 
 fn remember_event(events: &mut VecDeque<FuzzyEvent>, event: FuzzyEvent) {
@@ -522,6 +694,7 @@ async fn run_fuzzy_cluster(config: FuzzyConfig) {
     let mut cluster = FuzzyCluster::start(&config).await;
     let started = tokio::time::Instant::now();
     let mut event_index = 0;
+    let mut action_index = 0;
     let mut last_events = VecDeque::new();
 
     let (topology, expectation) = cluster.current_expectation().await;
@@ -533,9 +706,21 @@ async fn run_fuzzy_cluster(config: FuzzyConfig) {
             last_events: &last_events,
             topology,
         };
-        if let Err(report) = wait_for_common_leader(&cluster, &expectation, config.settle_timeout, &context).await {
-            panic!("fuzzy cluster failed to stabilize:\n{report:#?}");
-        }
+        let leader = match wait_for_common_leader(&cluster, &expectation, config.settle_timeout, &context).await {
+            Ok(leader) => leader,
+            Err(report) => panic!("fuzzy cluster failed to stabilize:\n{report:#?}"),
+        };
+        verify_peer_action_after_convergence(
+            &cluster,
+            &context.topology,
+            &expectation,
+            leader,
+            action_index,
+            config.settle_timeout,
+            &context,
+        )
+        .await;
+        action_index += 1;
     }
 
     while started.elapsed() < config.run_for {
@@ -553,9 +738,21 @@ async fn run_fuzzy_cluster(config: FuzzyConfig) {
                 last_events: &last_events,
                 topology,
             };
-            if let Err(report) = wait_for_common_leader(&cluster, &expectation, config.settle_timeout, &context).await {
-                panic!("fuzzy cluster failed to stabilize:\n{report:#?}");
-            }
+            let leader = match wait_for_common_leader(&cluster, &expectation, config.settle_timeout, &context).await {
+                Ok(leader) => leader,
+                Err(report) => panic!("fuzzy cluster failed to stabilize:\n{report:#?}"),
+            };
+            verify_peer_action_after_convergence(
+                &cluster,
+                &context.topology,
+                &expectation,
+                leader,
+                action_index,
+                config.settle_timeout,
+                &context,
+            )
+            .await;
+            action_index += 1;
         } else {
             tracing::debug!(?expectation, "fuzzy topology is not globally stabilizable");
         }
@@ -575,9 +772,20 @@ async fn run_fuzzy_cluster(config: FuzzyConfig) {
         last_events: &last_events,
         topology,
     };
-    if let Err(report) = wait_for_common_leader(&cluster, &expectation, config.settle_timeout, &context).await {
-        panic!("fuzzy cluster failed to stabilize:\n{report:#?}");
-    }
+    let leader = match wait_for_common_leader(&cluster, &expectation, config.settle_timeout, &context).await {
+        Ok(leader) => leader,
+        Err(report) => panic!("fuzzy cluster failed to stabilize:\n{report:#?}"),
+    };
+    verify_peer_action_after_convergence(
+        &cluster,
+        &context.topology,
+        &expectation,
+        leader,
+        action_index,
+        config.settle_timeout,
+        &context,
+    )
+    .await;
 }
 
 #[tokio::test]
