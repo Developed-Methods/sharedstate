@@ -1,0 +1,1220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sharedstate — Rewrite Plan</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #22263a;
+    --border: #2e3352;
+    --accent: #6c8aff;
+    --accent2: #a78bfa;
+    --green: #4ade80;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --orange: #fb923c;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --code-bg: #0d0f18;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 15px;
+    line-height: 1.65;
+  }
+
+  .page {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 48px 32px;
+  }
+
+  h1 {
+    font-size: 2.2rem;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent2) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin-bottom: 6px;
+  }
+
+  .subtitle {
+    color: var(--muted);
+    font-size: 1rem;
+    margin-bottom: 48px;
+  }
+
+  h2 {
+    font-size: 1.35rem;
+    font-weight: 600;
+    color: var(--text);
+    margin: 48px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  h2 .icon {
+    font-size: 1.1rem;
+  }
+
+  h3 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--accent);
+    margin: 28px 0 10px;
+  }
+
+  h4 {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    margin: 18px 0 8px;
+  }
+
+  p { margin-bottom: 12px; }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* Cards */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+  }
+
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 14px;
+    margin-bottom: 16px;
+  }
+
+  .card-sm {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 18px;
+  }
+
+  .card-sm .card-title {
+    font-weight: 600;
+    font-size: 0.9rem;
+    margin-bottom: 5px;
+    color: var(--text);
+  }
+
+  .card-sm .card-body {
+    color: var(--muted);
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+
+  /* Code */
+  pre, code {
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.82rem;
+  }
+
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    overflow-x: auto;
+    margin: 12px 0;
+    line-height: 1.6;
+  }
+
+  code {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 0.83em;
+    color: #c9d1d9;
+  }
+
+  pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: inherit;
+  }
+
+  /* Syntax highlight helpers */
+  .kw { color: #ff79c6; }
+  .ty { color: #8be9fd; }
+  .fn { color: #50fa7b; }
+  .cm { color: #6272a4; font-style: italic; }
+  .st { color: #f1fa8c; }
+  .nm { color: #bd93f9; }
+  .op { color: #ff79c6; }
+
+  /* Badges */
+  .badge {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 99px;
+    font-size: 0.73rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .badge-red { background: rgba(248,113,113,0.15); color: var(--red); border: 1px solid rgba(248,113,113,0.3); }
+  .badge-yellow { background: rgba(251,191,36,0.15); color: var(--yellow); border: 1px solid rgba(251,191,36,0.3); }
+  .badge-green { background: rgba(74,222,128,0.15); color: var(--green); border: 1px solid rgba(74,222,128,0.3); }
+  .badge-blue { background: rgba(108,138,255,0.15); color: var(--accent); border: 1px solid rgba(108,138,255,0.3); }
+  .badge-purple { background: rgba(167,139,250,0.15); color: var(--accent2); border: 1px solid rgba(167,139,250,0.3); }
+
+  /* Table */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 14px 0;
+    font-size: 0.87rem;
+  }
+
+  th {
+    text-align: left;
+    padding: 9px 14px;
+    background: var(--surface2);
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    border-bottom: 1px solid var(--border);
+  }
+
+  td {
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+
+  /* Diff */
+  .diff { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin: 12px 0; }
+  .diff-header { background: var(--surface2); padding: 8px 16px; font-size: 0.78rem; color: var(--muted); border-bottom: 1px solid var(--border); font-family: monospace; }
+  .diff-body { padding: 12px 16px; font-family: monospace; font-size: 0.82rem; line-height: 1.7; overflow-x: auto; }
+  .diff-del { color: var(--red); background: rgba(248,113,113,0.08); display: block; margin: 0 -16px; padding: 0 16px; }
+  .diff-add { color: var(--green); background: rgba(74,222,128,0.08); display: block; margin: 0 -16px; padding: 0 16px; }
+  .diff-ctx { color: var(--muted); display: block; }
+
+  /* File tree */
+  .filetree {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    font-family: monospace;
+    font-size: 0.83rem;
+    line-height: 1.8;
+    overflow-x: auto;
+  }
+
+  .filetree .dir { color: var(--accent); font-weight: 600; }
+  .filetree .file { color: var(--text); }
+  .filetree .note { color: var(--muted); font-style: italic; }
+  .filetree .new { color: var(--green); }
+  .filetree .changed { color: var(--yellow); }
+  .filetree .deleted { color: var(--red); text-decoration: line-through; }
+
+  /* Phase timeline */
+  .phases { position: relative; }
+  .phases::before {
+    content: '';
+    position: absolute;
+    left: 19px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: var(--border);
+  }
+
+  .phase {
+    display: flex;
+    gap: 20px;
+    margin-bottom: 28px;
+    position: relative;
+  }
+
+  .phase-dot {
+    flex-shrink: 0;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: var(--surface2);
+    border: 2px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: var(--accent);
+    z-index: 1;
+  }
+
+  .phase-body { flex: 1; padding-top: 8px; }
+  .phase-title { font-weight: 600; font-size: 1rem; margin-bottom: 6px; }
+  .phase-desc { color: var(--muted); font-size: 0.88rem; }
+
+  /* Callout */
+  .callout {
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin: 14px 0;
+    display: flex;
+    gap: 12px;
+    font-size: 0.88rem;
+  }
+
+  .callout-icon { flex-shrink: 0; font-size: 1.1rem; line-height: 1.5; }
+  .callout-body { flex: 1; }
+  .callout-body strong { display: block; margin-bottom: 3px; }
+
+  .callout-warn { background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); }
+  .callout-warn .callout-icon { color: var(--yellow); }
+  .callout-err  { background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.25); }
+  .callout-err .callout-icon  { color: var(--red); }
+  .callout-info { background: rgba(108,138,255,0.08); border: 1px solid rgba(108,138,255,0.25); }
+  .callout-info .callout-icon { color: var(--accent); }
+  .callout-ok   { background: rgba(74,222,128,0.08);  border: 1px solid rgba(74,222,128,0.25); }
+  .callout-ok .callout-icon   { color: var(--green); }
+
+  /* Comparison split */
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 12px 0; }
+  .split-label { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
+  .split-before .split-label { color: var(--red); }
+  .split-after  .split-label { color: var(--green); }
+
+  @media (max-width: 700px) {
+    .split { grid-template-columns: 1fr; }
+    .card-grid { grid-template-columns: 1fr; }
+  }
+
+  /* TOC */
+  .toc {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 40px;
+  }
+
+  .toc h2 { margin: 0 0 12px; font-size: 1rem; border: none; padding: 0; }
+
+  .toc ol {
+    padding-left: 20px;
+    color: var(--muted);
+    font-size: 0.88rem;
+    line-height: 2;
+  }
+
+  .toc a { color: var(--muted); }
+  .toc a:hover { color: var(--accent); }
+
+  ul { padding-left: 20px; margin-bottom: 10px; }
+  li { margin-bottom: 4px; }
+  ul li { color: var(--text); }
+
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 40px 0;
+  }
+
+  .mono { font-family: monospace; font-size: 0.88em; }
+
+  .tag-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <h1>sharedstate — Complete Rewrite Plan</h1>
+  <p class="subtitle">v0.5.1 &rarr; v1.0 &nbsp;·&nbsp; Prepared 2026-06-29</p>
+
+  <!-- TOC -->
+  <div class="toc">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#overview">Executive Overview</a></li>
+      <li><a href="#pain-points">Current Pain Points</a></li>
+      <li><a href="#principles">Rewrite Principles</a></li>
+      <li><a href="#architecture">New Architecture</a></li>
+      <li><a href="#module-layout">Module Layout</a></li>
+      <li><a href="#type-redesigns">Key Type Redesigns</a></li>
+      <li><a href="#bug-fixes">Known Bug Fixes</a></li>
+      <li><a href="#phases">Implementation Phases</a></li>
+      <li><a href="#testing">Testing Strategy</a></li>
+      <li><a href="#public-api">Public API Compatibility</a></li>
+    </ol>
+  </div>
+
+  <!-- 1. Overview -->
+  <h2 id="overview"><span class="icon">🗺</span> 1. Executive Overview</h2>
+
+  <p>
+    <code>sharedstate</code> is a Rust library that synchronizes a user-defined deterministic
+    state machine across a cluster using gossip-based leader election and TCP streaming replication.
+    It is a well-conceived system with a solid test suite — but its implementation has grown
+    organically until roughly 80% of the critical logic lives inside a single 1,736-line file
+    (<code>node.rs</code>), with multiple panics replacing proper error paths and several
+    undocumented invariants.
+  </p>
+  <p>
+    The goal of the rewrite is <strong>not</strong> to change what the library does — the
+    protocol, the election algorithm, and the public trait surface all remain. The goal is to
+    make the implementation <em>legible</em>: each file has one job, every error is handled
+    explicitly, and every invariant is encoded in the type system rather than asserted at runtime.
+  </p>
+
+  <div class="card-grid">
+    <div class="card-sm">
+      <div class="card-title">Current largest file</div>
+      <div class="card-body"><span style="color:var(--red);font-size:1.4rem;font-weight:700">1,736</span> lines — <code>src/shared/node.rs</code> — contains peer observation, election application, follow-connection management, action forwarding, incoming-peer dispatch, and subscription streaming all interleaved.</div>
+    </div>
+    <div class="card-sm">
+      <div class="card-title">Target after rewrite</div>
+      <div class="card-body"><span style="color:var(--green);font-size:1.4rem;font-weight:700">&lt;300</span> lines per file. Every file has a single stated responsibility. No file contains more than one async worker type.</div>
+    </div>
+    <div class="card-sm">
+      <div class="card-title">Panic count (current)</div>
+      <div class="card-body"><span style="color:var(--red);font-size:1.4rem;font-weight:700">6</span> reachable <code>panic!</code> calls in production paths — subscribe retries, broadcast-offline, state-worker lag, and message encoding assertions.</div>
+    </div>
+    <div class="card-sm">
+      <div class="card-title">Panic count (target)</div>
+      <div class="card-body"><span style="color:var(--green);font-size:1.4rem;font-weight:700">0</span> panics in production paths. Every current panic is replaced with a typed <code>Result</code> or a graceful shutdown signal.</div>
+    </div>
+  </div>
+
+  <!-- 2. Pain Points -->
+  <h2 id="pain-points"><span class="icon">⚠</span> 2. Current Pain Points</h2>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Location</th>
+          <th>Severity</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mono">P1</td>
+          <td class="mono">node.rs (whole file)</td>
+          <td><span class="badge badge-red">Critical</span></td>
+          <td>1,736-line god-file. Peer observation, election, follow management, action forwarding, incoming-connection dispatch, and subscription streaming are all interleaved with no boundary between concerns.</td>
+        </tr>
+        <tr>
+          <td class="mono">P2</td>
+          <td class="mono">node.rs:391</td>
+          <td><span class="badge badge-red">Bug</span></td>
+          <td>Action pump uses hardcoded <code>sleep(500ms)</code> instead of <code>NodeTiming::follow_retry_interval</code>. Tests and deployments cannot tune it. Documented in <code>plan.txt</code> as M3.</td>
+        </tr>
+        <tr>
+          <td class="mono">P3</td>
+          <td class="mono">node.rs:62–80</td>
+          <td><span class="badge badge-red">Bug</span></td>
+          <td><code>NodeActionSender</code> has no awareness of leader state. During leaderless periods the 1024-item queue fills and callers block. On pump exit they receive <code>SendActionError::Closed</code>, which incorrectly implies node shutdown. Also documented in <code>plan.txt</code> M3.</td>
+        </tr>
+        <tr>
+          <td class="mono">P4</td>
+          <td class="mono">authorative_state.rs:93</td>
+          <td><span class="badge badge-red">Critical</span></td>
+          <td><code>subscribe()</code> panics with <code>panic!("failed to subscribe")</code> after 16 × 1ms retries. Any transient lag in the state worker crashes the process with no recovery path.</td>
+        </tr>
+        <tr>
+          <td class="mono">P5</td>
+          <td class="mono">authorative_state.rs:141</td>
+          <td><span class="badge badge-red">Critical</span></td>
+          <td><code>apply_authority()</code> panics with <code>panic!("authority broadcast is offline")</code>. A dead broadcast kills the entire node instead of triggering a graceful leadership handoff.</td>
+        </tr>
+        <tr>
+          <td class="mono">P6</td>
+          <td class="mono">authorative_state.rs (StateMaintainWorker)</td>
+          <td><span class="badge badge-yellow">High</span></td>
+          <td><code>StateMaintainWorker</code> silently breaks on <code>SequencedRecvError::Lagged</code>. The node continues running but <code>SharedState</code> stops advancing — readers silently see stale data.</td>
+        </tr>
+        <tr>
+          <td class="mono">P7</td>
+          <td class="mono">node.rs (ControlState)</td>
+          <td><span class="badge badge-yellow">High</span></td>
+          <td>A single Tokio <code>Mutex</code> guards all 30+ operations on <code>ControlState</code>. Some compound operations drop and re-acquire the lock mid-operation, creating race windows. The single lock also means peer observation (slow, network-bound) blocks the election tick.</td>
+        </tr>
+        <tr>
+          <td class="mono">P8</td>
+          <td class="mono">messages.rs</td>
+          <td><span class="badge badge-blue">Low</span></td>
+          <td><code>SyncRequest</code> wire IDs skip 2 and 5 — artifacts of protocol evolution. Not a runtime bug, but fragile: any future variant must avoid those IDs or silently break older peers.</td>
+        </tr>
+        <tr>
+          <td class="mono">P9</td>
+          <td class="mono">message_io.rs</td>
+          <td><span class="badge badge-yellow">High</span></td>
+          <td><code>send_message</code> uses <code>assert_eq!</code> (not <code>debug_assert!</code>) to validate <code>MessageEncoding</code> byte counts — panics in release builds on any encoding implementation bug.</td>
+        </tr>
+        <tr>
+          <td class="mono">P10</td>
+          <td class="mono">recoverable_state.rs</td>
+          <td><span class="badge badge-blue">Low</span></td>
+          <td>The 2048-entry history cap is hard-coded with no warning mechanism when a slow follower falls outside the window and will require a full state dump on reconnect.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 3. Principles -->
+  <h2 id="principles"><span class="icon">📐</span> 3. Rewrite Principles</h2>
+
+  <div class="card-grid">
+    <div class="card-sm">
+      <div class="card-title">One file, one job</div>
+      <div class="card-body">Every source file encapsulates exactly one async worker, one data structure family, or one pure algorithm. No file exceeds 350 lines. If it does, it splits.</div>
+    </div>
+    <div class="card-sm">
+      <div class="card-title">Errors, not panics</div>
+      <div class="card-body">Every failure path that currently <code>panic!</code>s is replaced with a typed <code>Result</code>. Workers propagate errors to a <code>NodeSupervisor</code> that decides whether to restart or shut down.</div>
+    </div>
+    <div class="card-sm">
+      <div class="card-title">Invariants in types</div>
+      <div class="card-body">If a condition must be true (e.g., "the broadcast sender is always alive while a node is leader"), encode it as a type that <em>cannot be constructed</em> unless the condition holds, rather than asserting it at runtime.</div>
+    </div>
+    <div class="card-sm">
+      <div class="card-title">Lock granularity</div>
+      <div class="card-body">Split <code>ControlState</code>'s single coarse lock into three finer-grained structures — peer map, election state, and follow connection — so slow operations (peer I/O) cannot block fast ones (election tick).</div>
+    </div>
+    <div class="card-sm">
+      <div class="card-title">Preserve the public API</div>
+      <div class="card-body">The <code>DeterministicState</code> trait, <code>NodeState</code>, <code>NodeTiming</code>, and <code>NodeActionSender</code> signatures stay. The M3 changes (<code>SendActionError::NoLeader</code>, generic <code>A</code> param on sender) are included as the only breaking changes.</div>
+    </div>
+    <div class="card-sm">
+      <div class="card-title">No behaviour change</div>
+      <div class="card-body">Election algorithm, wire protocol, recovery protocol, and test scenarios are not altered. The existing integration test suite and recorded-replay scenarios are the acceptance criteria for the rewrite.</div>
+    </div>
+  </div>
+
+  <!-- 4. Architecture -->
+  <h2 id="architecture"><span class="icon">🏗</span> 4. New Architecture</h2>
+
+  <p>The rewrite reorganises the implementation into five clear layers:</p>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Layer</th><th>Module</th><th>Responsibility</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>State</strong></td>
+          <td class="mono">state/</td>
+          <td>User-facing <code>DeterministicState</code> trait; <code>RecoverableState</code> wrapper; lock-free <code>SharedState</code> / <code>SharedStateHandle</code> (unchanged from current)</td>
+        </tr>
+        <tr>
+          <td><strong>Protocol</strong></td>
+          <td class="mono">protocol/</td>
+          <td>All wire message types (<code>SyncRequest</code>, <code>SyncResponse</code>) and the binary framing layer. Isolated so the message set can evolve independently.</td>
+        </tr>
+        <tr>
+          <td><strong>Transport</strong></td>
+          <td class="mono">transport/</td>
+          <td>Abstract <code>SyncIO</code> / <code>SyncIOAddress</code> traits; <code>ReadChannel</code> / <code>WriteChannel</code> async workers; <code>SimulatedNet</code>. No cluster logic here.</td>
+        </tr>
+        <tr>
+          <td><strong>Cluster</strong></td>
+          <td class="mono">cluster/</td>
+          <td>All cluster logic split across focused submodules: leader state, follower connection, peer observer, peer handler, action pump, election. Described in detail below.</td>
+        </tr>
+        <tr>
+          <td><strong>Testing</strong></td>
+          <td class="mono">testing/</td>
+          <td><code>SharedStateTestOrchestrator</code>, recording/replay infrastructure. Currently lives at crate root — moved to its own module for clarity.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Worker supervision model</h3>
+  <p>
+    Currently workers (<code>StateMaintainWorker</code>, the client loop, the peer handler, the action pump) are spawned as fire-and-forget tasks. When one fails, the node silently degrades.
+    The rewrite introduces a lightweight <code>NodeSupervisor</code> that owns all worker <code>JoinHandle</code>s and a shared <code>CancellationToken</code>. When any worker returns an error, the supervisor cancels remaining workers and reports the failure via a <code>watch::Receiver&lt;NodeStatus&gt;</code> so callers can observe node health.
+  </p>
+
+  <pre><code><span class="kw">pub enum</span> <span class="ty">NodeStatus</span> {
+    Running,
+    Degraded { reason: <span class="ty">String</span> },   <span class="cm">// one non-critical worker failed, node still operates</span>
+    Stopped,                           <span class="cm">// clean shutdown requested</span>
+    Failed { reason: <span class="ty">String</span> },        <span class="cm">// critical worker failed, node must be restarted</span>
+}</code></pre>
+
+  <!-- 5. Module Layout -->
+  <h2 id="module-layout"><span class="icon">📁</span> 5. Module Layout</h2>
+
+  <div class="filetree">
+<span class="dir">src/</span>
+├── <span class="file changed">lib.rs</span>               <span class="note">re-exports public API; no logic</span>
+├── <span class="file">utils.rs</span>             <span class="note">LogHelper, PanicHelper, now_ms — unchanged</span>
+│
+├── <span class="dir">state/</span>               <span class="note">unchanged from current</span>
+│   ├── <span class="file">mod.rs</span>
+│   ├── <span class="file">deterministic.rs</span>     <span class="note">DeterministicState trait</span>
+│   ├── <span class="file">recoverable.rs</span>       <span class="note">RecoverableState&lt;D&gt; + generation tracking</span>
+│   └── <span class="file">hot_reader.rs</span>        <span class="note">SharedState&lt;D&gt; + HotRead integration</span>
+│
+├── <span class="dir new">protocol/</span>            <span class="note">new: wire format isolated from cluster logic</span>
+│   ├── <span class="file new">mod.rs</span>
+│   ├── <span class="file changed">messages.rs</span>          <span class="note">SyncRequest/SyncResponse — fix non-sequential IDs (compat layer)</span>
+│   └── <span class="file new">framing.rs</span>           <span class="note">send_message / read_message_opt extracted from message_io.rs</span>
+│
+├── <span class="dir">transport/</span>           <span class="note">renamed from net/</span>
+│   ├── <span class="file changed">mod.rs</span>
+│   ├── <span class="file changed">traits.rs</span>            <span class="note">SyncIO, SyncIOAddress, SyncConnection (was sync_io.rs)</span>
+│   ├── <span class="file changed">channels.rs</span>          <span class="note">ReadChannel / WriteChannel (was message_channel.rs)</span>
+│   └── <span class="file">simulated.rs</span>         <span class="note">SimulatedNet — unchanged</span>
+│
+├── <span class="dir new">cluster/</span>             <span class="note">new: replaces src/shared/node.rs (1,736 lines → 8 focused files)</span>
+│   ├── <span class="file new">mod.rs</span>               <span class="note">NodeState&lt;A,D&gt; public facade + NodeSupervisor</span>
+│   ├── <span class="file new">node.rs</span>              <span class="note">constructor, action_sender, state_reader, debug_info, start_*/handle_client</span>
+│   ├── <span class="file new">control.rs</span>           <span class="note">ControlState split into PeerMap + ElectionState + FollowSlot</span>
+│   ├── <span class="file new">leader.rs</span>            <span class="note">AuthorativeState — panics → Results; subscribe timeout → error</span>
+│   ├── <span class="file new">follower.rs</span>          <span class="note">FollowConnection: manages upstream subscribe lifecycle</span>
+│   ├── <span class="file new">observer.rs</span>          <span class="note">ClientWorker: outbound peer observation loop</span>
+│   ├── <span class="file new">peer_handler.rs</span>      <span class="note">PeerWorker: incoming connection dispatch + subscription streaming</span>
+│   ├── <span class="file new">action_pump.rs</span>       <span class="note">local action pump (fixes hardcoded 500ms + NoLeader error)</span>
+│   └── <span class="dir new">election/</span>
+│       ├── <span class="file new">mod.rs</span>             <span class="note">apply_election, local_observation — pulled from node.rs</span>
+│       ├── <span class="file">algorithm.rs</span>       <span class="note">decide_election() — unchanged pure function</span>
+│       ├── <span class="file">timing.rs</span>          <span class="note">NodeTiming — unchanged</span>
+│       ├── <span class="file">paths.rs</span>           <span class="note">valid_*_leader_path — unchanged</span>
+│       └── <span class="dir">policy/</span>
+│           ├── <span class="file">client.rs</span>      <span class="note">observation_targets() — unchanged</span>
+│           └── <span class="file">follow.rs</span>      <span class="note">sort_follow_candidates() — unchanged</span>
+│
+└── <span class="dir new">testing/</span>             <span class="note">new: test harness moved out of crate root</span>
+    ├── <span class="file changed">mod.rs</span>               <span class="note">SharedStateTestOrchestrator</span>
+    └── <span class="file changed">scenarios.rs</span>         <span class="note">recording, replay, checkpoint logic (was test_orchestrator.rs)</span>
+  </div>
+
+  <div class="callout callout-info">
+    <div class="callout-icon">ℹ</div>
+    <div class="callout-body">
+      <strong>Net reduction</strong>
+      The pure-function modules (<code>election/algorithm.rs</code>, <code>election/paths.rs</code>,
+      <code>election/policy/</code>, <code>state/deterministic.rs</code>) are copied verbatim — they have no
+      complexity problems. All the work is in carving up <code>node.rs</code> and fixing the error paths.
+    </div>
+  </div>
+
+  <!-- 6. Type Redesigns -->
+  <h2 id="type-redesigns"><span class="icon">🧩</span> 6. Key Type Redesigns</h2>
+
+  <!-- 6a. ControlState split -->
+  <h3>6a. Split ControlState into three narrow locks</h3>
+  <p>
+    The current single <code>Mutex&lt;ControlState&gt;</code> means a slow peer-observation network call
+    blocks the election tick. Split into three independently locked structures:
+  </p>
+
+  <div class="split">
+    <div class="split-before">
+      <div class="split-label">Before (node.rs)</div>
+      <pre><code><span class="kw">struct</span> <span class="ty">Inner</span>&lt;A, D&gt; {
+    control: <span class="ty">Mutex</span>&lt;<span class="ty">ControlState</span>&lt;A, D&gt;&gt;,
+    authorative: <span class="ty">Mutex</span>&lt;<span class="ty">AuthorativeState</span>&lt;D&gt;&gt;,
+    <span class="cm">// ...</span>
+}
+
+<span class="kw">struct</span> <span class="ty">ControlState</span>&lt;A, D&gt; {
+    leader_info: <span class="ty">LeaderInfo</span>&lt;A&gt;,
+    peers: <span class="ty">HashMap</span>&lt;A, <span class="ty">Option</span>&lt;<span class="ty">PeerDetails</span>&lt;A&gt;&gt;&gt;,
+    follow: <span class="ty">Option</span>&lt;<span class="ty">FollowConnection</span>&lt;A, D&gt;&gt;,
+    election: <span class="ty">ElectionState</span>&lt;A&gt;,
+}</code></pre>
+    </div>
+    <div class="split-after">
+      <div class="split-label">After (cluster/control.rs)</div>
+      <pre><code><span class="kw">struct</span> <span class="ty">NodeShared</span>&lt;A, D&gt; {
+    <span class="cm">// fine-grained: each lock held briefly</span>
+    peers:    <span class="ty">RwLock</span>&lt;<span class="ty">PeerMap</span>&lt;A&gt;&gt;,
+    election: <span class="ty">Mutex</span>&lt;<span class="ty">ElectionState</span>&lt;A&gt;&gt;,
+    follow:   <span class="ty">Mutex</span>&lt;<span class="ty">FollowSlot</span>&lt;A, D&gt;&gt;,
+    leader:   <span class="ty">Mutex</span>&lt;<span class="ty">LeaderSlot</span>&lt;D&gt;&gt;,
+    <span class="cm">// channels, no lock needed</span>
+    leader_tx: <span class="ty">watch</span>::<span class="ty">Sender</span>&lt;<span class="ty">LeaderInfoMessage</span>&lt;A&gt;&gt;,
+    actions_tx: <span class="ty">mpsc</span>::<span class="ty">Sender</span>&lt;D::<span class="ty">Action</span>&gt;,
+}</code></pre>
+    </div>
+  </div>
+
+  <p>Key insight: <code>PeerMap</code> is read by observation workers and written only during election. Using <code>RwLock</code> allows concurrent reads. <code>ElectionState</code> and <code>FollowSlot</code> are only touched by the single client-worker task — their <code>Mutex</code> is uncontended, just for <code>Sync</code>.</p>
+
+  <!-- 6b. AuthorativeState -->
+  <h3>6b. AuthorativeState — replace panics with Results</h3>
+
+  <div class="split">
+    <div class="split-before">
+      <div class="split-label">Before (authorative_state.rs)</div>
+      <pre><code><span class="kw">pub fn</span> <span class="fn">subscribe</span>(&amp;<span class="kw">self</span>) -&gt; (...) {
+    <span class="kw">for</span> _ <span class="kw">in</span> <span class="nm">0</span>..<span class="nm">16</span> {
+        <span class="cm">// try to align snapshot + rx head</span>
+        <span class="kw">if let</span> <span class="ty">Some</span>(result) = <span class="kw">self</span>.try_subscribe() {
+            <span class="kw">return</span> result;
+        }
+        std::thread::sleep(Duration::from_millis(<span class="nm">1</span>));
+    }
+    <span class="kw">panic!</span>(<span class="st">"failed to subscribe"</span>);
+}
+
+<span class="kw">pub fn</span> <span class="fn">apply_authority</span>(&amp;<span class="kw">self</span>, action: ...) {
+    <span class="kw">self</span>.broadcast.send(action)
+        .unwrap_or_else(|_| <span class="kw">panic!</span>(<span class="st">"authority broadcast is offline"</span>));
+}</code></pre>
+    </div>
+    <div class="split-after">
+      <div class="split-label">After (cluster/leader.rs)</div>
+      <pre><code><span class="kw">pub async fn</span> <span class="fn">subscribe</span>(
+    &amp;<span class="kw">self</span>
+) -&gt; <span class="ty">Result</span>&lt;..., <span class="ty">LeaderError</span>&gt; {
+    tokio::time::timeout(
+        <span class="ty">Duration</span>::from_millis(<span class="nm">50</span>),
+        <span class="kw">self</span>.try_subscribe_loop()
+    ).<span class="fn">await</span>
+    .map_err(|_| <span class="ty">LeaderError</span>::<span class="ty">SubscribeTimeout</span>)?
+}
+
+<span class="kw">pub fn</span> <span class="fn">apply_authority</span>(
+    &amp;<span class="kw">self</span>, action: ...
+) -&gt; <span class="ty">Result</span>&lt;(), <span class="ty">LeaderError</span>&gt; {
+    <span class="kw">self</span>.broadcast.send(action)
+        .map_err(|_| <span class="ty">LeaderError</span>::<span class="ty">BroadcastOffline</span>)
+}</code></pre>
+    </div>
+  </div>
+
+  <!-- 6c. StateMaintainWorker -->
+  <h3>6c. StateMaintainWorker — propagate lag to supervisor</h3>
+  <p>
+    Currently the worker silently <code>break</code>s on <code>Lagged</code>, leaving <code>SharedState</code>
+    frozen. In the rewrite it returns a typed error that the supervisor can act on:
+  </p>
+
+  <div class="diff">
+    <div class="diff-header">cluster/leader.rs — StateMaintainWorker::run</div>
+    <div class="diff-body">
+<span class="diff-del">- Err(SequencedRecvError::Lagged) => {</span>
+<span class="diff-del">-     tracing::error!("state maintain worker lagged, giving up");</span>
+<span class="diff-del">-     break;  // SharedState silently freezes</span>
+<span class="diff-del">- }</span>
+<span class="diff-add">+ Err(SequencedRecvError::Lagged) => {</span>
+<span class="diff-add">+     return Err(WorkerError::StateMaintainLagged);</span>
+<span class="diff-add">+     // supervisor receives this, cancels all workers,</span>
+<span class="diff-add">+     // and sets NodeStatus::Failed { reason: "state worker lagged" }</span>
+<span class="diff-add">+ }</span>
+    </div>
+  </div>
+
+  <!-- 6d. NodeActionSender -->
+  <h3>6d. NodeActionSender — M3 fix (NoLeader + timing)</h3>
+  <p>This is the fix described verbatim in <code>plan.txt</code>, incorporated into the rewrite:</p>
+
+  <div class="split">
+    <div class="split-before">
+      <div class="split-label">Before</div>
+      <pre><code><span class="kw">pub enum</span> <span class="ty">SendActionError</span> {
+    Closed,
+}
+
+<span class="kw">pub struct</span> <span class="ty">NodeActionSender</span>&lt;Action&gt; {
+    tx: <span class="ty">mpsc</span>::<span class="ty">Sender</span>&lt;Action&gt;,
+}
+
+<span class="kw">pub async fn</span> <span class="fn">send</span>(&amp;<span class="kw">self</span>, action: Action)
+    -&gt; <span class="ty">Result</span>&lt;(), <span class="ty">SendActionError</span>&gt;
+{
+    <span class="kw">self</span>.tx.send(action).<span class="fn">await</span>
+        .map_err(|_| <span class="ty">SendActionError</span>::<span class="ty">Closed</span>)
+}
+
+<span class="cm">// action_pump (node.rs:391)</span>
+tokio::time::sleep(
+    <span class="ty">Duration</span>::from_millis(<span class="nm">500</span>) <span class="cm">// hardcoded</span>
+).<span class="fn">await</span>;</code></pre>
+    </div>
+    <div class="split-after">
+      <div class="split-label">After (cluster/action_pump.rs)</div>
+      <pre><code><span class="kw">pub enum</span> <span class="ty">SendActionError</span> {
+    Closed,
+    NoLeader,   <span class="cm">// new: fast-fail during leaderless period</span>
+}
+
+<span class="kw">pub struct</span> <span class="ty">NodeActionSender</span>&lt;Action, A: <span class="ty">SyncIOAddress</span>&gt; {
+    tx: <span class="ty">mpsc</span>::<span class="ty">Sender</span>&lt;Action&gt;,
+    leader: <span class="ty">watch</span>::<span class="ty">Receiver</span>&lt;<span class="ty">LeaderInfoMessage</span>&lt;A&gt;&gt;,
+}
+
+<span class="kw">pub async fn</span> <span class="fn">send</span>(&amp;<span class="kw">self</span>, action: Action)
+    -&gt; <span class="ty">Result</span>&lt;(), <span class="ty">SendActionError</span>&gt;
+{
+    <span class="kw">if self</span>.leader.borrow().leader.is_none() {
+        <span class="kw">return</span> <span class="ty">Err</span>(<span class="ty">SendActionError</span>::<span class="ty">NoLeader</span>);
+    }
+    <span class="kw">self</span>.tx.send(action).<span class="fn">await</span>
+        .map_err(|_| <span class="ty">SendActionError</span>::<span class="ty">Closed</span>)
+}
+
+<span class="cm">// action_pump uses NodeTiming</span>
+tokio::time::sleep(
+    timing.follow_retry_interval  <span class="cm">// was 500ms hardcoded</span>
+).<span class="fn">await</span>;</code></pre>
+    </div>
+  </div>
+
+  <!-- 6e. Message ID gaps -->
+  <h3>6e. Fix SyncRequest wire ID gaps</h3>
+  <p>
+    Current IDs skip 2 and 5. The rewrite introduces a compatibility decode layer so existing
+    peers using the old IDs continue to work, while new code uses clean sequential IDs:
+  </p>
+
+  <pre><code><span class="cm">// protocol/messages.rs</span>
+<span class="cm">// New canonical IDs (0-12 sequential). read_from() accepts both old and new IDs.</span>
+<span class="kw">fn</span> <span class="fn">id_to_variant</span>(id: <span class="ty">u8</span>) -&gt; <span class="ty">Result</span>&lt;<span class="ty">SyncRequestKind</span>, <span class="ty">io</span>::<span class="ty">Error</span>&gt; {
+    <span class="kw">match</span> id {
+        <span class="nm">0</span>  =&gt; <span class="ty">Ok</span>(<span class="ty">SyncRequestKind</span>::<span class="ty">ProtocolVersion</span>),
+        <span class="nm">1</span>  =&gt; <span class="ty">Ok</span>(<span class="ty">SyncRequestKind</span>::<span class="ty">MyAddress</span>),
+        <span class="cm">// 2 was removed in an old version — accept it as unknown gracefully</span>
+        <span class="nm">2</span>  =&gt; <span class="ty">Err</span>(unknown_id_err(<span class="nm">2</span>)),
+        <span class="nm">3</span>  | <span class="nm">13</span> =&gt; <span class="ty">Ok</span>(<span class="ty">SyncRequestKind</span>::<span class="ty">Ping</span>),  <span class="cm">// 13 = canonical</span>
+        <span class="cm">// ... etc</span>
+    }
+}</code></pre>
+
+  <!-- 7. Bug Fixes -->
+  <h2 id="bug-fixes"><span class="icon">🐛</span> 7. Known Bug Fixes Included</h2>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Bug</th><th>Pain Point</th><th>Fix</th><th>File</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>M3-A</strong></td>
+          <td>P2</td>
+          <td>Replace <code>sleep(500ms)</code> in action pump with <code>timing.follow_retry_interval</code></td>
+          <td class="mono">cluster/action_pump.rs</td>
+        </tr>
+        <tr>
+          <td><strong>M3-B</strong></td>
+          <td>P3</td>
+          <td>Add <code>SendActionError::NoLeader</code>; add <code>watch::Receiver</code> to <code>NodeActionSender</code>; add <code>send_when_leader()</code></td>
+          <td class="mono">cluster/action_pump.rs</td>
+        </tr>
+        <tr>
+          <td><strong>subscribe-panic</strong></td>
+          <td>P4</td>
+          <td>Replace 16-retry panic loop with <code>tokio::time::timeout</code> returning <code>LeaderError::SubscribeTimeout</code></td>
+          <td class="mono">cluster/leader.rs</td>
+        </tr>
+        <tr>
+          <td><strong>broadcast-panic</strong></td>
+          <td>P5</td>
+          <td><code>apply_authority</code> returns <code>Result&lt;(), LeaderError&gt;</code>; error propagates to supervisor</td>
+          <td class="mono">cluster/leader.rs</td>
+        </tr>
+        <tr>
+          <td><strong>silent-lag</strong></td>
+          <td>P6</td>
+          <td><code>StateMaintainWorker</code> returns <code>Err(WorkerError::StateMaintainLagged)</code> instead of silently breaking</td>
+          <td class="mono">cluster/leader.rs</td>
+        </tr>
+        <tr>
+          <td><strong>assert-panic</strong></td>
+          <td>P9</td>
+          <td>Replace <code>assert_eq!</code> in <code>send_message</code> with <code>debug_assert_eq!</code></td>
+          <td class="mono">protocol/framing.rs</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 8. Phases -->
+  <h2 id="phases"><span class="icon">🚀</span> 8. Implementation Phases</h2>
+
+  <div class="callout callout-info">
+    <div class="callout-icon">ℹ</div>
+    <div class="callout-body">
+      Each phase ends with <strong>all existing tests passing</strong>.
+      Phases are ordered from lowest to highest blast radius so at every checkpoint the library
+      is in a shippable state.
+    </div>
+  </div>
+
+  <div class="phases">
+
+    <div class="phase">
+      <div class="phase-dot">1</div>
+      <div class="phase-body">
+        <div class="phase-title">Scaffold new module tree (no logic moved)</div>
+        <div class="phase-desc">
+          Create the new directory structure (<code>cluster/</code>, <code>protocol/</code>, <code>testing/</code>)
+          as empty modules that re-export everything from their current locations. All existing
+          <code>use</code> paths continue to resolve. Zero behaviour change; confirms the Rust module graph
+          compiles cleanly with the new layout.
+        </div>
+        <div class="tag-row">
+          <span class="badge badge-green">~1 day</span>
+          <span class="badge badge-blue">no logic change</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="phase">
+      <div class="phase-dot">2</div>
+      <div class="phase-body">
+        <div class="phase-title">Extract protocol and transport layers</div>
+        <div class="phase-desc">
+          Move <code>messages.rs</code>, <code>message_io.rs</code> → <code>protocol/</code>;
+          move <code>sync_io.rs</code>, <code>message_channel.rs</code>, <code>simulated.rs</code> → <code>transport/</code>.
+          Fix the <code>assert_eq!</code> → <code>debug_assert_eq!</code> in framing (bug P9).
+          Add the wire-ID compatibility decode table (bug P8). All net tests still pass.
+        </div>
+        <div class="tag-row">
+          <span class="badge badge-green">~1 day</span>
+          <span class="badge badge-yellow">1 behavior fix (P9)</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="phase">
+      <div class="phase-dot">3</div>
+      <div class="phase-body">
+        <div class="phase-title">Extract pure-function election modules</div>
+        <div class="phase-desc">
+          Move <code>election.rs</code>, <code>timing.rs</code>, <code>paths.rs</code>,
+          <code>client_policy.rs</code>, <code>follow_policy.rs</code> into
+          <code>cluster/election/</code>. These are already pure functions with their own unit
+          tests — the move is mechanical. All unit tests for these modules still pass without
+          modification.
+        </div>
+        <div class="tag-row">
+          <span class="badge badge-green">~half day</span>
+          <span class="badge badge-blue">pure move, no logic change</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="phase">
+      <div class="phase-dot">4</div>
+      <div class="phase-body">
+        <div class="phase-title">Rewrite AuthorativeState / leader.rs (fix panics P4, P5, P6)</div>
+        <div class="phase-desc">
+          Create <code>cluster/leader.rs</code> as a clean rewrite of <code>authorative_state.rs</code>.
+          Replace the three <code>panic!</code> calls with typed <code>Result</code> returns.
+          Replace <code>StateMaintainWorker</code>'s silent-break with an error that propagates to a
+          <code>NodeSupervisor</code> stub. The stub for now just logs the error; full supervision
+          wiring comes in Phase 7.
+          Run integration tests — they must still pass because <code>NodeState</code> still wraps the old
+          <code>AuthorativeState</code> in this phase.
+        </div>
+        <div class="tag-row">
+          <span class="badge badge-yellow">~2 days</span>
+          <span class="badge badge-red">3 panic fixes (P4, P5, P6)</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="phase">
+      <div class="phase-dot">5</div>
+      <div class="phase-body">
+        <div class="phase-title">Split ControlState; create control.rs (fix lock contention P7)</div>
+        <div class="phase-desc">
+          Introduce <code>cluster/control.rs</code> with <code>PeerMap</code> (<code>RwLock</code>),
+          <code>ElectionState</code> (<code>Mutex</code>), and <code>FollowSlot</code> (<code>Mutex</code>).
+          Thread these through <code>node.rs</code> in place of the single <code>Mutex&lt;ControlState&gt;</code>.
+          The <code>mark_connect_fail</code> double-lock is resolved by combining its two writes into a single
+          lock acquisition. All integration tests still pass.
+        </div>
+        <div class="tag-row">
+          <span class="badge badge-yellow">~2 days</span>
+          <span class="badge badge-yellow">lock contention fix (P7)</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="phase">
+      <div class="phase-dot">6</div>
+      <div class="phase-body">
+        <div class="phase-title">Extract observer.rs, follower.rs, peer_handler.rs from node.rs</div>
+        <div class="phase-desc">
+          This is the heaviest phase — splitting the 1,736-line <code>node.rs</code> into focused files.
+          <ul style="margin-top:8px">
+            <li><strong>cluster/observer.rs</strong> — <code>ClientWorker::run</code>, <code>observe_election_peers</code>, <code>apply_election</code>, <code>ensure_follow_connection</code></li>
+            <li><strong>cluster/follower.rs</strong> — <code>FollowConnection</code> struct + its subscribe/stream lifecycle</li>
+            <li><strong>cluster/peer_handler.rs</strong> — <code>PeerWorker::run</code> + all <code>SyncRequest</code> dispatch arms + subscription streaming task</li>
+          </ul>
+          Each new file receives only the methods that logically belong to it.
+          <code>node.rs</code> shrinks to a thin facade (<code>NodeState</code>, constructors, public methods).
+          After this phase, <code>node.rs</code> should be under 250 lines.
+        </div>
+        <div class="tag-row">
+          <span class="badge badge-red">~3 days</span>
+          <span class="badge badge-red">highest risk phase — most file movement</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="phase">
+      <div class="phase-dot">7</div>
+      <div class="phase-body">
+        <div class="phase-title">Extract action_pump.rs; apply M3 fixes (P2, P3)</div>
+        <div class="phase-desc">
+          Move the local action pump into <code>cluster/action_pump.rs</code>.
+          Apply the M3 fix as documented in <code>plan.txt</code>:
+          <ul style="margin-top:8px">
+            <li>Replace hardcoded <code>sleep(500ms)</code> with <code>timing.follow_retry_interval</code></li>
+            <li>Add <code>SendActionError::NoLeader</code></li>
+            <li>Add <code>watch::Receiver&lt;LeaderInfoMessage&gt;</code> to <code>NodeActionSender</code></li>
+            <li>Add <code>send_when_leader()</code> method</li>
+          </ul>
+          This is a breaking API change (<code>NodeActionSender&lt;A, D&gt;</code> gains the <code>A</code> type param).
+          Update examples and any test code that constructs <code>NodeActionSender</code> directly.
+        </div>
+        <div class="tag-row">
+          <span class="badge badge-yellow">~1.5 days</span>
+          <span class="badge badge-red">breaking API change</span>
+          <span class="badge badge-yellow">2 bug fixes (P2, P3)</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="phase">
+      <div class="phase-dot">8</div>
+      <div class="phase-body">
+        <div class="phase-title">Wire NodeSupervisor; move testing/ module</div>
+        <div class="phase-desc">
+          Connect the error propagation introduced in Phase 4–6 to a real
+          <code>NodeSupervisor</code> that:
+          <ul style="margin-top:8px">
+            <li>Holds <code>JoinHandle</code>s for all workers</li>
+            <li>Publishes <code>NodeStatus</code> via a <code>watch::Sender</code></li>
+            <li>On critical worker failure, cancels remaining workers and sets <code>NodeStatus::Failed</code></li>
+            <li>Exposes <code>node.status() -&gt; watch::Receiver&lt;NodeStatus&gt;</code> on <code>NodeState</code></li>
+          </ul>
+          Also move <code>test_orchestrator.rs</code> → <code>testing/mod.rs</code> + <code>testing/scenarios.rs</code>.
+          Run the full test suite including recorded-scenario replays.
+        </div>
+        <div class="tag-row">
+          <span class="badge badge-yellow">~2 days</span>
+          <span class="badge badge-blue">new public API: NodeStatus</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="phase">
+      <div class="phase-dot">9</div>
+      <div class="phase-body">
+        <div class="phase-title">Cleanup pass + documentation</div>
+        <div class="phase-desc">
+          <ul>
+            <li>Remove any dead code exposed by the refactor</li>
+            <li>Ensure every public type has a doc comment</li>
+            <li>Add a top-level crate doc explaining the architecture layers</li>
+            <li>Run <code>cargo clippy --all-targets -- -D warnings</code> clean</li>
+            <li>Update <code>Cargo.toml</code> to version 1.0.0</li>
+            <li>Verify examples still build and work end-to-end</li>
+          </ul>
+        </div>
+        <div class="tag-row">
+          <span class="badge badge-green">~1 day</span>
+          <span class="badge badge-blue">cosmetic only</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="card" style="margin-top:8px">
+    <table>
+      <thead>
+        <tr><th>Phase</th><th>Estimated Days</th><th>Risk</th><th>Tests Must Pass</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1 — Scaffold</td><td>1</td><td><span class="badge badge-green">Low</span></td><td>All</td></tr>
+        <tr><td>2 — Protocol / Transport</td><td>1</td><td><span class="badge badge-green">Low</span></td><td>All</td></tr>
+        <tr><td>3 — Election pure fns</td><td>0.5</td><td><span class="badge badge-green">Low</span></td><td>All unit + integration</td></tr>
+        <tr><td>4 — leader.rs (panics)</td><td>2</td><td><span class="badge badge-yellow">Medium</span></td><td>All integration</td></tr>
+        <tr><td>5 — control.rs (locks)</td><td>2</td><td><span class="badge badge-yellow">Medium</span></td><td>All integration</td></tr>
+        <tr><td>6 — Split node.rs</td><td>3</td><td><span class="badge badge-red">High</span></td><td>All integration + fuzzy smoke</td></tr>
+        <tr><td>7 — action_pump.rs (M3)</td><td>1.5</td><td><span class="badge badge-yellow">Medium</span></td><td>All integration</td></tr>
+        <tr><td>8 — Supervisor + testing/</td><td>2</td><td><span class="badge badge-yellow">Medium</span></td><td>All + scenario replays</td></tr>
+        <tr><td>9 — Cleanup</td><td>1</td><td><span class="badge badge-green">Low</span></td><td>All + clippy clean</td></tr>
+        <tr><td><strong>Total</strong></td><td><strong>~14 days</strong></td><td>—</td><td>—</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 9. Testing -->
+  <h2 id="testing"><span class="icon">🧪</span> 9. Testing Strategy</h2>
+
+  <h3>Existing test suite as acceptance criteria</h3>
+  <p>
+    The current library has an unusually strong test foundation. These tests are the acceptance
+    criteria for the rewrite — all must pass at the end of every phase:
+  </p>
+
+  <div class="card-grid">
+    <div class="card-sm">
+      <div class="card-title">Unit tests (pure functions)</div>
+      <div class="card-body">
+        8 election algorithm tests, 7 message framing tests, 5 client policy tests, 7 follow policy tests, path validation tests.
+        These are the easiest to preserve — they test pure functions that are not moving.
+      </div>
+    </div>
+    <div class="card-sm">
+      <div class="card-title">Integration tests (SimulatedNet)</div>
+      <div class="card-body">
+        12 named scenario tests in <code>node/test.rs</code> covering leader election, failover, path propagation, and reconnect behaviour.
+        These are the primary regression guard for Phase 6.
+      </div>
+    </div>
+    <div class="card-sm">
+      <div class="card-title">Recorded-scenario replay tests</div>
+      <div class="card-body">
+        3 JSON recordings (<code>new-leader-indirect</code>, <code>leader-return</code>, <code>leader-return2</code>) replayed in <code>test_orchestrator/test.rs</code>.
+        These guard edge-case convergence behaviour from real observed failures.
+      </div>
+    </div>
+    <div class="card-sm">
+      <div class="card-title">Fuzzy stabilization test</div>
+      <div class="card-body">
+        <code>fuzzy_cluster_stabilization_smoke</code> (seeded, 5 s, 3 + 3 nodes) runs in CI.
+        The long variant (300 s) should be run manually before each phase merge.
+      </div>
+    </div>
+  </div>
+
+  <h3>New tests to add</h3>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Test</th><th>What it covers</th><th>Phase</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mono">send_returns_no_leader_when_no_leader</td>
+          <td>Verifies <code>NodeActionSender::send</code> returns <code>NoLeader</code> immediately during a leaderless window, not <code>Closed</code></td>
+          <td>7</td>
+        </tr>
+        <tr>
+          <td class="mono">send_when_leader_unblocks_after_election</td>
+          <td>Verifies <code>send_when_leader</code> suspends until leader is elected then delivers the action</td>
+          <td>7</td>
+        </tr>
+        <tr>
+          <td class="mono">subscribe_timeout_propagates_to_status</td>
+          <td>Verifies that a synthetic subscribe timeout causes <code>NodeStatus::Failed</code>, not a panic</td>
+          <td>8</td>
+        </tr>
+        <tr>
+          <td class="mono">state_worker_lag_sets_node_failed</td>
+          <td>Verifies that <code>StateMaintainWorker</code> lag propagates to <code>NodeStatus::Failed</code></td>
+          <td>8</td>
+        </tr>
+        <tr>
+          <td class="mono">action_pump_uses_follow_retry_interval</td>
+          <td>Verifies the retry sleep duration matches <code>NodeTiming::follow_retry_interval</code> by configuring a very short timing and asserting retry count over a fixed window</td>
+          <td>7</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 10. Public API -->
+  <h2 id="public-api"><span class="icon">📦</span> 10. Public API Compatibility</h2>
+
+  <h3>Unchanged (fully compatible)</h3>
+  <ul>
+    <li><code>DeterministicState</code> trait — unchanged</li>
+    <li><code>NodeState&lt;A, D&gt;</code> constructor and methods: <code>discover_peers</code>, <code>state_reader</code>, <code>create_state_handle</code>, <code>debug_info</code>, <code>start_client</code>, <code>start_listener</code>, <code>handle_client</code></li>
+    <li><code>NodeTiming</code> — unchanged (all four fields)</li>
+    <li><code>SharedStateHandle&lt;D&gt;</code> / <code>SharedStateReader&lt;D&gt;</code></li>
+    <li><code>SyncIO</code> / <code>SyncIOAddress</code> / <code>SyncIOListener</code> traits</li>
+    <li><code>SimulatedNet</code> / <code>SimulatedIo</code> (for external test users)</li>
+    <li><code>SharedStateTestOrchestrator</code></li>
+  </ul>
+
+  <h3>Breaking changes (M3 additions)</h3>
+
+  <div class="callout callout-warn">
+    <div class="callout-icon">⚠</div>
+    <div class="callout-body">
+      <strong>Two breaking changes — both are additive-only and mechanical to adopt</strong>
+      These changes are already planned in <code>plan.txt</code>. Including them in the rewrite avoids a
+      second breaking-change release immediately after.
+    </div>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Type / Method</th><th>Before</th><th>After</th><th>Migration</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mono">NodeActionSender</td>
+          <td class="mono">NodeActionSender&lt;Action&gt;</td>
+          <td class="mono">NodeActionSender&lt;Action, A&gt;</td>
+          <td>Add the second type param at every call site. Callers already know <code>A</code> — it is the address type of their <code>NodeState&lt;A, D&gt;</code>.</td>
+        </tr>
+        <tr>
+          <td class="mono">SendActionError</td>
+          <td>single variant <code>Closed</code></td>
+          <td>adds <code>NoLeader</code></td>
+          <td>Add a <code>NoLeader</code> match arm. Callers that currently treat all errors as fatal now have the option to retry after a leader is elected.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>New public surface (additive)</h3>
+  <ul>
+    <li><code>NodeState::status() -&gt; watch::Receiver&lt;NodeStatus&gt;</code> — observe node health</li>
+    <li><code>NodeActionSender::send_when_leader(action) -&gt; Result&lt;(), SendActionError&gt;</code> — await-until-leader convenience method</li>
+    <li><code>NodeStatus</code> enum — <code>Running</code> / <code>Degraded</code> / <code>Stopped</code> / <code>Failed</code></li>
+  </ul>
+
+  <hr>
+
+  <p style="color:var(--muted);font-size:0.85rem;text-align:center">
+    sharedstate rewrite plan &nbsp;·&nbsp; generated 2026-06-29
+  </p>
+
+</div>
+</body>
+</html>
