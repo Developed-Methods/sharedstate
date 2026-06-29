@@ -9,12 +9,12 @@ use clap::Parser;
 use message_encoding::MessageEncoding;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use sharedstate::{
-    net::{
-        message_channel::NetIoSettings,
-        sync_io::{SyncConnection, SyncIO, SyncIOListener},
-    },
-    shared::node::{NodeActionSender, NodeDebugInfo, NodeState, NodeTiming, SendActionError},
+    cluster::{NodeActionSender, NodeDebugInfo, NodeState, NodeTiming, SendActionError},
     state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
+    transport::{
+        channels::NetIoSettings,
+        traits::{SyncConnection, SyncIO, SyncIOListener},
+    },
 };
 use tokio::net::{
     tcp::{OwnedReadHalf, OwnedWriteHalf},

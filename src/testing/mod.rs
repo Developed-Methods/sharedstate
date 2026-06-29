@@ -10,12 +10,12 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
-    net::{
-        message_channel::NetIoSettings,
+    cluster::{NodeActionSender, NodeDebugInfo, NodeState, NodeTiming, PeerDebugInfo},
+    state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
+    transport::{
+        channels::NetIoSettings,
         simulated::{SimulatedIo, SimulatedNet, SimulatedTopologySnapshot},
     },
-    shared::node::{NodeActionSender, NodeDebugInfo, NodeState, NodeTiming, PeerDebugInfo},
-    state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
 };
 
 const RECORDING_VERSION: u64 = 1;

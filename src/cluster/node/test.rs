@@ -1,12 +1,12 @@
 use super::*;
-use crate::net::{
-    message_channel::NetIoSettings,
-    simulated::{SimulatedIo, SimulatedNet},
-    sync_io::{SyncConnection, SyncIO, SyncIOListener},
-};
 use crate::{
     cluster::election::{valid_local_leader_path, valid_remote_leader_path},
     protocol::messages::SharePeerDetails,
+    transport::{
+        channels::NetIoSettings,
+        simulated::{SimulatedIo, SimulatedNet},
+        traits::{SyncConnection, SyncIO, SyncIOListener},
+    },
     utils::now_ms,
 };
 use std::{collections::BTreeMap, future::Future, num::NonZeroU64, sync::Arc};
