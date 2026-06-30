@@ -10,11 +10,15 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{
+    cluster::{
+        election::NodeTiming,
+        node::{NodeDebugInfo, NodeState, PeerDebugInfo},
+        pump::NodeActionSender,
+    },
     net::{
         message_channel::NetIoSettings,
         simulated::{SimulatedIo, SimulatedNet, SimulatedTopologySnapshot},
     },
-    shared::node::{NodeActionSender, NodeDebugInfo, NodeState, NodeTiming, PeerDebugInfo},
     state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
 };
 
@@ -61,7 +65,7 @@ struct NodeRuntime<D: DeterministicState> {
     _io: Arc<SimulatedIo>,
     listener: JoinHandle<()>,
     client: JoinHandle<()>,
-    actions: NodeActionSender<D::Action>,
+    actions: NodeActionSender<D::Action, u64>,
 }
 
 impl<D: DeterministicState> NodeRuntime<D> {
@@ -578,6 +582,7 @@ where
                         .ok_or_else(|| OrchestratorError::Conflict(format!("node {address} is offline")))?
                 };
                 action_sender
+                    .sender()
                     .send(action)
                     .await
                     .map_err(|_| OrchestratorError::ActionQueueClosed { address })?;

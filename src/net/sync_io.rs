@@ -6,8 +6,8 @@ use tokio::{
 };
 
 use crate::{
+    cluster::messages::{SyncRequest, SyncResponse},
     net::message_channel::{NetIoSettings, ReadChannel, WriteChannel},
-    shared::messages::{SyncRequest, SyncResponse},
     state::determinstic_state::DeterministicState,
 };
 

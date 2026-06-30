@@ -156,10 +156,10 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
     }
 
     buffer.extend((0 as MessageSizeHeader).to_be_bytes());
-    assert_eq!(buffer.len(), MESSAGE_HEADER_SIZE);
+    debug_assert_eq!(buffer.len(), MESSAGE_HEADER_SIZE);
 
     let bytes_written = message.write_to(buffer)?;
-    assert_eq!(bytes_written + MESSAGE_HEADER_SIZE, buffer.len(), "M::write_to returned incorrect number of bytes");
+    debug_assert_eq!(bytes_written + MESSAGE_HEADER_SIZE, buffer.len(), "M::write_to returned incorrect number of bytes");
     if bytes_written >= CLOSE_FRAME_SIZE as usize {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "message too large for framing protocol"));
     }
