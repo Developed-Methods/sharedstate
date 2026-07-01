@@ -15,7 +15,7 @@ use crossterm::{
 use message_encoding::MessageEncoding;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Position},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
@@ -54,9 +54,11 @@ use tokio::{
     },
 };
 use tracing_subscriber::fmt::MakeWriter;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const COMMAND_HELP: &str =
     "commands: help, status, peers, get <key>, set <key> <value>, delete|del|rm <key>, list|print, quit|exit";
+const PROMPT: &str = "kv> ";
 const LOG_LIMIT: usize = 250;
 const RENDER_INTERVAL: Duration = Duration::from_millis(100);
 const SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -214,6 +216,7 @@ impl MessageEncoding for KvStore {
 
 struct App {
     input: String,
+    input_cursor: usize,
     logs: VecDeque<String>,
     should_quit: bool,
 }
@@ -222,6 +225,7 @@ impl App {
     fn new() -> Self {
         Self {
             input: String::new(),
+            input_cursor: 0,
             logs: VecDeque::new(),
             should_quit: false,
         }
@@ -232,6 +236,73 @@ impl App {
         while self.logs.len() > LOG_LIMIT {
             self.logs.pop_front();
         }
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.input.insert(self.input_cursor, ch);
+        self.input_cursor += ch.len_utf8();
+    }
+
+    fn backspace(&mut self) {
+        let Some(prev) = self.prev_cursor() else {
+            return;
+        };
+        self.input.drain(prev..self.input_cursor);
+        self.input_cursor = prev;
+    }
+
+    fn delete(&mut self) {
+        if self.input_cursor >= self.input.len() {
+            return;
+        }
+        let next = self.next_cursor().unwrap_or(self.input.len());
+        self.input.drain(self.input_cursor..next);
+    }
+
+    fn move_left(&mut self) {
+        if let Some(prev) = self.prev_cursor() {
+            self.input_cursor = prev;
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(next) = self.next_cursor() {
+            self.input_cursor = next;
+        }
+    }
+
+    fn move_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.input_cursor = self.input.len();
+    }
+
+    fn clear_before_cursor(&mut self) {
+        self.input.drain(..self.input_cursor);
+        self.input_cursor = 0;
+    }
+
+    fn take_input(&mut self) -> String {
+        let input = self.input.trim().to_owned();
+        self.input.clear();
+        self.input_cursor = 0;
+        input
+    }
+
+    fn prev_cursor(&self) -> Option<usize> {
+        self.input[..self.input_cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+    }
+
+    fn next_cursor(&self) -> Option<usize> {
+        self.input[self.input_cursor..]
+            .chars()
+            .next()
+            .map(|ch| self.input_cursor + ch.len_utf8())
     }
 }
 
@@ -244,7 +315,8 @@ impl TerminalGuard {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        terminal.show_cursor()?;
         Ok(Self { terminal })
     }
 }
@@ -634,14 +706,59 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App, summary: Vec<String>) {
         shell_chunks[0],
     );
 
+    let inner_width = shell_chunks[1].width.saturating_sub(2);
+    let prompt_width = PROMPT.width() as u16;
+    let input_width = inner_width.saturating_sub(prompt_width);
+    let (visible_input, cursor_col) = input_view(&app.input, app.input_cursor, input_width);
     let prompt = Line::from(vec![
-        Span::styled("kv> ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-        Span::raw(app.input.clone()),
+        Span::styled(PROMPT, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::raw(visible_input),
     ]);
     frame.render_widget(
-        Paragraph::new(prompt).block(Block::default().title("Input").borders(Borders::ALL)),
+        Paragraph::new(prompt).block(Block::default().title("Input (focused)").borders(Borders::ALL)),
         shell_chunks[1],
     );
+
+    if shell_chunks[1].height >= 3 && inner_width > 0 {
+        let prompt_col = prompt_width.min(inner_width.saturating_sub(1));
+        let max_x = shell_chunks[1].x + shell_chunks[1].width.saturating_sub(2);
+        let cursor_x = (shell_chunks[1].x + 1 + prompt_col + cursor_col).min(max_x);
+        let cursor_y = shell_chunks[1].y + 1;
+        frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+    }
+}
+
+fn input_view(input: &str, cursor: usize, max_width: u16) -> (String, u16) {
+    let max_width = max_width as usize;
+    if max_width == 0 {
+        return (String::new(), 0);
+    }
+
+    let max_cursor_col = max_width.saturating_sub(1);
+    let mut start = cursor;
+    let mut cursor_width = 0usize;
+    for (index, ch) in input[..cursor].char_indices().rev() {
+        let width = ch.width().unwrap_or(0);
+        if cursor_width + width > max_cursor_col {
+            break;
+        }
+        cursor_width += width;
+        start = index;
+    }
+
+    let mut end = input.len();
+    let mut visible_width = 0usize;
+    for (offset, ch) in input[start..].char_indices() {
+        let width = ch.width().unwrap_or(0);
+        if visible_width + width > max_width {
+            end = start + offset;
+            break;
+        }
+        visible_width += width;
+    }
+
+    let cursor_col = input[start..cursor].width().min(max_cursor_col) as u16;
+    (input[start..end].to_owned(), cursor_col)
 }
 
 async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut StateHandle<KvStore>) -> Vec<String> {
@@ -715,20 +832,27 @@ async fn handle_key(
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_home(),
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => app.move_end(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.clear_before_cursor(),
         KeyCode::Esc => app.should_quit = true,
-        KeyCode::Backspace => {
-            app.input.pop();
-        }
+        KeyCode::Left => app.move_left(),
+        KeyCode::Right => app.move_right(),
+        KeyCode::Home => app.move_home(),
+        KeyCode::End => app.move_end(),
+        KeyCode::Backspace => app.backspace(),
+        KeyCode::Delete => app.delete(),
         KeyCode::Enter => {
-            let command = app.input.trim().to_owned();
-            app.input.clear();
+            let command = app.take_input();
             if !command.is_empty() {
                 app.log(format!("kv> {command}"));
                 run_command(command, app, state, actions_tx, state_handle).await;
             }
         }
         KeyCode::Char(ch) => {
-            app.input.push(ch);
+            if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                app.insert_char(ch);
+            }
         }
         _ => {}
     }
