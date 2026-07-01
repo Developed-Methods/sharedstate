@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     env,
-    io::{self, Error, ErrorKind, Stdout},
+    io::{self, Error, ErrorKind, Stdout, Write},
     iter,
     sync::Arc,
     time::{Duration, Instant},
@@ -53,6 +53,7 @@ use tokio::{
         Mutex,
     },
 };
+use tracing_subscriber::fmt::MakeWriter;
 
 const COMMAND_HELP: &str =
     "commands: help, status, peers, get <key>, set <key> <value>, delete|del|rm <key>, list|print, quit|exit";
@@ -256,9 +257,80 @@ impl Drop for TerminalGuard {
     }
 }
 
+#[derive(Clone)]
+struct TuiLogMakeWriter {
+    tx: UnboundedSender<String>,
+}
+
+struct TuiLogWriter {
+    tx: UnboundedSender<String>,
+    buffer: Vec<u8>,
+}
+
+impl<'a> MakeWriter<'a> for TuiLogMakeWriter {
+    type Writer = TuiLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TuiLogWriter {
+            tx: self.tx.clone(),
+            buffer: Vec::new(),
+        }
+    }
+}
+
+impl TuiLogWriter {
+    fn emit_complete_lines(&mut self) {
+        while let Some(pos) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let line = self.buffer.drain(..=pos).collect::<Vec<_>>();
+            self.emit_line(&line);
+        }
+    }
+
+    fn emit_remainder(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let line = std::mem::take(&mut self.buffer);
+        self.emit_line(&line);
+    }
+
+    fn emit_line(&self, line: &[u8]) {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim_end_matches(['\r', '\n']);
+        if !line.is_empty() {
+            let _ = self.tx.send(line.to_owned());
+        }
+    }
+}
+
+impl Write for TuiLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        self.emit_complete_lines();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.emit_remainder();
+        Ok(())
+    }
+}
+
+impl Drop for TuiLogWriter {
+    fn drop(&mut self) {
+        self.emit_remainder();
+    }
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let _ = tracing_subscriber::fmt().with_writer(io::stderr).try_init();
+    let (log_tx, log_rx) = mpsc::unbounded_channel();
+    let _ = tracing_subscriber::fmt()
+        .compact()
+        .with_ansi(false)
+        .with_writer(TuiLogMakeWriter { tx: log_tx.clone() })
+        .try_init();
+
     let args = parse_args()?;
     let io = Arc::new(LocalhostTcpIo::bind_ephemeral().await?);
     let local_address = io.address;
@@ -304,7 +376,6 @@ async fn main() -> io::Result<()> {
     tokio::spawn(PeerDiscoveryTask::new(state.clone(), peer_connections.clone(), PeerDiscoveryTiming::default()).run());
     tokio::spawn(CurrentLeaderTask::new(state.clone(), CurrentLeaderTiming::default()).run());
 
-    let (log_tx, log_rx) = mpsc::unbounded_channel();
     start_action_router(state.clone(), peer_connections.clone(), actions_rx, log_tx.clone());
     start_follower_subscription(state.clone(), io.clone(), settings.clone(), log_tx.clone());
 
