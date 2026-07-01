@@ -150,6 +150,31 @@ pub fn find_published_leader<A: SyncIOAddress>(input: &ElectionInput<A>) -> Opti
         })
 }
 
+pub fn conflicting_published_leaders<A: SyncIOAddress>(input: &ElectionInput<A>) -> Vec<A> {
+    let mut leaders = BTreeSet::new();
+
+    for observation in fresh_same_term_observations(input) {
+        let Some(leader) = observation.leader else {
+            continue;
+        };
+        let Some(path) = observation.leader_path else {
+            continue;
+        };
+
+        let valid = if observation.observer == input.local_address {
+            valid_local_leader_path(Some(leader), &path, input.local_address)
+        } else {
+            valid_remote_leader_path(Some(leader), &path, observation.observer, input.local_address)
+        };
+
+        if valid {
+            leaders.insert(leader);
+        }
+    }
+
+    leaders.into_iter().collect()
+}
+
 pub fn choose_vote<A: SyncIOAddress>(input: &ElectionInput<A>) -> Option<A> {
     input.known_can_lead.iter().copied().max_by(|a, b| {
         connectivity_score(input, *a)
@@ -455,6 +480,23 @@ mod tests {
         );
 
         assert_eq!(find_published_leader(&input).unwrap().leader, 1);
+    }
+
+    #[test]
+    fn conflicting_published_leaders_returns_distinct_valid_leaders() {
+        let mut input = input(
+            3,
+            true,
+            vec![
+                observation(1, 1, Some(1), Some(vec![1]), Some(1), true, vec![1], 1),
+                observation(2, 1, Some(2), Some(vec![2]), Some(2), true, vec![2], 1),
+                observation(4, 2, Some(4), Some(vec![4]), Some(4), true, vec![4], 1),
+                observation(5, 1, Some(5), Some(vec![6, 5]), Some(5), true, vec![5], 1),
+            ],
+        );
+        input.local_observation = observation(3, 1, Some(1), Some(vec![1, 3]), Some(1), true, vec![1, 3], 1);
+
+        assert_eq!(conflicting_published_leaders(&input), vec![1, 2]);
     }
 
     #[test]

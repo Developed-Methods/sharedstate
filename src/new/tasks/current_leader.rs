@@ -15,8 +15,9 @@ use tokio::sync::Mutex;
 use crate::{
     new::{
         election::{
-            can_lead_majority, choose_vote, find_published_leader, leader_offline_vote_count, peer_is_fresh,
-            tally_votes, ElectionInput, PeerReachability, TimedPeerObservation,
+            can_lead_majority, choose_vote, conflicting_published_leaders, find_published_leader,
+            leader_offline_vote_count, peer_is_fresh, tally_votes, ElectionInput, PeerReachability,
+            TimedPeerObservation,
         },
         node_state::NodeState,
         subscribable_state::StateHandle,
@@ -239,6 +240,10 @@ where
         let snapshot = self.state.leader_status.snapshot().await;
         let input = self.build_election_input(term).await;
 
+        if self.trigger_new_election_on_conflicting_leaders(term, &input).await {
+            return;
+        }
+
         if !term_changed {
             match snapshot.mode {
                 LeaderMode::Following { leader, .. } => {
@@ -258,6 +263,30 @@ where
         }
 
         self.evaluate_term(term, input).await;
+    }
+
+    async fn trigger_new_election_on_conflicting_leaders(&mut self, term: u64, input: &ElectionInput<A>) -> bool {
+        let leaders = conflicting_published_leaders(input);
+        if leaders.len() <= 1 {
+            return false;
+        }
+
+        let new_term = self.state.bump_election_term_after(term);
+        self.last_considered_term = new_term;
+        self.state.leader_status.no_leader().await;
+        let input = self.build_election_input(new_term).await;
+        let vote = self.local_vote(&input);
+        self.state.leader_status.electing(vote).await;
+
+        tracing::debug!(
+            local = ?self.state.my_address,
+            old_term = term,
+            new_term,
+            leaders = ?leaders,
+            vote = ?vote,
+            "bumped election term because multiple leaders were published",
+        );
+        true
     }
 
     async fn evaluate_term(&mut self, term: u64, input: ElectionInput<A>) {
@@ -768,6 +797,23 @@ mod tests {
                 via: 2,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn following_same_term_with_two_published_leaders_bumps_term_and_elects() {
+        let now = now_ms();
+        let mut peers = HashMap::new();
+        peers.insert(2, peer(2, Some(true), ConnectStatus::Connected { epoch_ms: now }, Some(now)));
+        peers.insert(3, observed_peer(3, true, now, observation(3, 1, Some(3), Some(vec![3]), Some(3), true, vec![3])));
+        let state = node_state(1, true, peers, 1);
+        assert!(state.leader_status.follow_remote(2, vec![2, 1], 2).await);
+        let mut task = CurrentLeaderTask::new(state.clone(), timing());
+        task.last_considered_term = 1;
+
+        task.tick().await;
+
+        assert_eq!(state.election_term(), 2);
+        assert!(matches!(state.leader_status.snapshot().await.mode, LeaderMode::Electing { .. }));
     }
 
     #[tokio::test]
