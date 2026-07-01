@@ -343,21 +343,9 @@ fn require_ok<A: SyncIOAddress, D: DeterministicState>(response: SyncResponse<A,
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        io::{Error, ErrorKind, Result},
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        },
-        time::Duration,
-    };
+    use std::{collections::HashMap, io::Result, sync::Arc, time::Duration};
 
     use sequenced_broadcast::SequencedBroadcastSettings;
-    use tokio::{
-        io::{duplex, split, DuplexStream, ReadHalf, WriteHalf},
-        sync::mpsc,
-    };
 
     use super::*;
     use crate::{
@@ -366,7 +354,10 @@ mod tests {
         },
         protocol::messages::PROTOCOL_VERSION,
         state::recoverable_state::RecoverableState,
-        transport::traits::SyncConnection,
+        transport::{
+            simulated::{SimulatedIo, SimulatedNet},
+            traits::SyncIOListener,
+        },
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -412,45 +403,6 @@ mod tests {
         }
     }
 
-    struct FakeIo {
-        address: u64,
-        connect_count: Arc<AtomicUsize>,
-        incoming: mpsc::UnboundedSender<SyncConnection<FakeIo>>,
-        fail_connect: bool,
-    }
-
-    impl SyncIO for FakeIo {
-        type Address = u64;
-        type Read = ReadHalf<DuplexStream>;
-        type Write = WriteHalf<DuplexStream>;
-
-        async fn connect(&self, remote: &Self::Address) -> Result<SyncConnection<Self>> {
-            self.connect_count.fetch_add(1, Ordering::SeqCst);
-
-            if self.fail_connect {
-                return Err(Error::new(ErrorKind::ConnectionRefused, "test connect failure"));
-            }
-
-            let (client, server) = duplex(4096);
-            let (client_read, client_write) = split(client);
-            let (server_read, server_write) = split(server);
-
-            self.incoming
-                .send(SyncConnection {
-                    remote: self.address,
-                    read: server_read,
-                    write: server_write,
-                })
-                .map_err(|_| Error::new(ErrorKind::BrokenPipe, "test server dropped"))?;
-
-            Ok(SyncConnection {
-                remote: *remote,
-                read: client_read,
-                write: client_write,
-            })
-        }
-    }
-
     fn settings() -> NetIoSettings {
         NetIoSettings {
             process_timeout: Duration::from_millis(100),
@@ -472,32 +424,27 @@ mod tests {
         })
     }
 
-    fn peer_connections(
+    async fn peer_connections(
         local_address: u64,
-        fail_connect: bool,
-    ) -> (
-        Arc<PeerConnections<FakeIo, TestState>>,
-        mpsc::UnboundedReceiver<SyncConnection<FakeIo>>,
-        Arc<AtomicUsize>,
-        Arc<NodeState<u64, TestState>>,
-    ) {
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-        let connect_count = Arc::new(AtomicUsize::new(0));
+        remote_address: u64,
+        start_remote: bool,
+    ) -> (Arc<PeerConnections<SimulatedIo, TestState>>, Option<Arc<SimulatedIo>>, Arc<NodeState<u64, TestState>>) {
+        let net = SimulatedNet::new();
+        let local_io = net.start_io(local_address).await;
+        let remote_io = if start_remote {
+            Some(net.start_io(remote_address).await)
+        } else {
+            None
+        };
         let state = node_state(local_address);
-        let io = Arc::new(FakeIo {
-            address: local_address,
-            connect_count: connect_count.clone(),
-            incoming: incoming_tx,
-            fail_connect,
-        });
 
-        (Arc::new(PeerConnections::new(io, settings(), state.clone())), incoming_rx, connect_count, state)
+        (Arc::new(PeerConnections::new(local_io, settings(), state.clone())), remote_io, state)
     }
 
     async fn accept_server(
-        incoming: &mut mpsc::UnboundedReceiver<SyncConnection<FakeIo>>,
+        remote_io: &SimulatedIo,
     ) -> (Sender<SyncResponse<u64, TestState>>, Receiver<SyncRequest<u64, TestState>>) {
-        let conn = tokio::time::timeout(Duration::from_secs(1), incoming.recv())
+        let conn = tokio::time::timeout(Duration::from_secs(1), remote_io.next_client())
             .await
             .unwrap()
             .unwrap();
@@ -532,7 +479,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_subscribe_recovery_rpc_without_connecting() {
-        let (connections, _incoming, connect_count, _state) = peer_connections(1, false);
+        let (connections, remote_io, _state) = peer_connections(1, 2, true).await;
+        let remote_io = remote_io.unwrap();
 
         let result = connections
             .send_rpc(
@@ -542,28 +490,34 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(PeerRpcError::RequestNotAllowedOverRpc)));
-        assert_eq!(connect_count.load(Ordering::SeqCst), 0);
+        assert!(tokio::time::timeout(Duration::from_millis(50), remote_io.next_client())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn rejects_subscribe_fresh_rpc_without_connecting() {
-        let (connections, _incoming, connect_count, _state) = peer_connections(1, false);
+        let (connections, remote_io, _state) = peer_connections(1, 2, true).await;
+        let remote_io = remote_io.unwrap();
 
         let result = connections.send_rpc(2, SyncRequest::SubscribeFresh).await;
 
         assert!(matches!(result, Err(PeerRpcError::RequestNotAllowedOverRpc)));
-        assert_eq!(connect_count.load(Ordering::SeqCst), 0);
+        assert!(tokio::time::timeout(Duration::from_millis(50), remote_io.next_client())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn handshakes_before_first_rpc() {
-        let (connections, mut incoming, _connect_count, _state) = peer_connections(1, false);
+        let (connections, remote_io, _state) = peer_connections(1, 2, true).await;
+        let remote_io = remote_io.unwrap();
         let task = tokio::spawn({
             let connections = connections.clone();
             async move { connections.send_rpc(2, SyncRequest::Ping(42)).await }
         });
 
-        let (write, mut read) = accept_server(&mut incoming).await;
+        let (write, mut read) = accept_server(&remote_io).await;
         expect_handshake(&write, &mut read, 1).await;
 
         match recv_request(&mut read).await {
@@ -577,13 +531,14 @@ mod tests {
 
     #[tokio::test]
     async fn reuses_connection_for_multiple_rpcs() {
-        let (connections, mut incoming, connect_count, _state) = peer_connections(1, false);
+        let (connections, remote_io, _state) = peer_connections(1, 2, true).await;
+        let remote_io = remote_io.unwrap();
 
         let first = tokio::spawn({
             let connections = connections.clone();
             async move { connections.send_rpc(2, SyncRequest::Ping(1)).await }
         });
-        let (write, mut read) = accept_server(&mut incoming).await;
+        let (write, mut read) = accept_server(&remote_io).await;
         expect_handshake(&write, &mut read, 1).await;
 
         match recv_request(&mut read).await {
@@ -604,12 +559,15 @@ mod tests {
         }
         write.send(SyncResponse::Pong(2)).await.unwrap();
         assert!(matches!(second.await.unwrap().unwrap(), SyncResponse::Pong(2)));
-        assert_eq!(connect_count.load(Ordering::SeqCst), 1);
+        assert!(tokio::time::timeout(Duration::from_millis(50), remote_io.next_client())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn pipelines_requests_before_responses_arrive() {
-        let (connections, mut incoming, connect_count, _state) = peer_connections(1, false);
+        let (connections, remote_io, _state) = peer_connections(1, 2, true).await;
+        let remote_io = remote_io.unwrap();
 
         let first = tokio::spawn({
             let connections = connections.clone();
@@ -620,7 +578,7 @@ mod tests {
             async move { connections.send_rpc(2, SyncRequest::Ping(2)).await }
         });
 
-        let (write, mut read) = accept_server(&mut incoming).await;
+        let (write, mut read) = accept_server(&remote_io).await;
         expect_handshake(&write, &mut read, 1).await;
 
         match recv_request(&mut read).await {
@@ -637,12 +595,14 @@ mod tests {
 
         assert!(matches!(first.await.unwrap().unwrap(), SyncResponse::Pong(1)));
         assert!(matches!(second.await.unwrap().unwrap(), SyncResponse::Pong(2)));
-        assert_eq!(connect_count.load(Ordering::SeqCst), 1);
+        assert!(tokio::time::timeout(Duration::from_millis(50), remote_io.next_client())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn connect_failure_propagates_to_queued_rpc() {
-        let (connections, _incoming, _connect_count, _state) = peer_connections(1, true);
+        let (connections, _remote_io, _state) = peer_connections(1, 2, false).await;
 
         let result = tokio::time::timeout(Duration::from_secs(2), connections.send_rpc(2, SyncRequest::Ping(1)))
             .await
@@ -653,13 +613,14 @@ mod tests {
 
     #[tokio::test]
     async fn successful_connection_marks_peer_connected() {
-        let (connections, mut incoming, _connect_count, state) = peer_connections(1, false);
+        let (connections, remote_io, state) = peer_connections(1, 2, true).await;
+        let remote_io = remote_io.unwrap();
         let task = tokio::spawn({
             let connections = connections.clone();
             async move { connections.send_rpc(2, SyncRequest::Ping(42)).await }
         });
 
-        let (write, mut read) = accept_server(&mut incoming).await;
+        let (write, mut read) = accept_server(&remote_io).await;
         expect_handshake(&write, &mut read, 1).await;
 
         match recv_request(&mut read).await {
@@ -675,7 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_failure_marks_peer_disconnected() {
-        let (connections, _incoming, _connect_count, state) = peer_connections(1, true);
+        let (connections, _remote_io, state) = peer_connections(1, 2, false).await;
 
         let result = tokio::time::timeout(Duration::from_secs(2), connections.send_rpc(2, SyncRequest::Ping(1)))
             .await
