@@ -11,7 +11,7 @@ use tokio::sync::{
 };
 
 use crate::{
-    new::node_state::NodeState,
+    new::node_state::{NodeState, PeerState},
     protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::determinstic_state::DeterministicState,
     transport::{
@@ -101,8 +101,13 @@ where
                     }
                 },
                 hash_map::Entry::Vacant(entry) => {
-                    let conn =
-                        Connection::create(peer, self.state.my_address, self.io.clone(), self.conn_settings.clone());
+                    let conn = Connection::create(
+                        peer,
+                        self.state.my_address,
+                        self.state.clone(),
+                        self.io.clone(),
+                        self.conn_settings.clone(),
+                    );
                     entry.insert(conn);
                     pending = Some(msg);
                 }
@@ -127,7 +132,13 @@ where
     D::Action: MessageEncoding,
     D::AuthorityAction: MessageEncoding,
 {
-    pub fn create<I>(remote_addr: A, local_addr: A, io: Arc<I>, settings: NetIoSettings) -> Self
+    pub fn create<I>(
+        remote_addr: A,
+        local_addr: A,
+        state: Arc<NodeState<A, D>>,
+        io: Arc<I>,
+        settings: NetIoSettings,
+    ) -> Self
     where
         I: SyncIO<Address = A>,
     {
@@ -138,6 +149,7 @@ where
                 rx,
                 remote_addr,
                 local_addr,
+                state,
             }
             .run(io, settings),
         );
@@ -161,6 +173,7 @@ struct ConnectionWorker<A: SyncIOAddress, D: DeterministicState> {
     rx: Receiver<RpcMessage<A, D>>,
     remote_addr: A,
     local_addr: A,
+    state: Arc<NodeState<A, D>>,
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> ConnectionWorker<A, D>
@@ -180,6 +193,7 @@ where
                     repeat_failures += 1;
 
                     if repeat_failures > CONNECT_RETRY_LIMIT {
+                        set_peer_connected(&self.state, self.remote_addr, false).await;
                         self.drain_with_error(PeerRpcError::FailedToConnectToPeer).await;
                         return;
                     }
@@ -192,9 +206,12 @@ where
         let (_remote, write, mut read) = connection.client_channels::<D>(settings.clone());
 
         if let Err(error) = self.handshake(&write, &mut read, settings.message_timeout).await {
+            set_peer_connected(&self.state, self.remote_addr, false).await;
             self.drain_with_error(error).await;
             return;
         }
+
+        set_peer_connected(&self.state, self.remote_addr, true).await;
 
         let (response_tx, response_rx) = tokio::sync::mpsc::channel(RPC_QUEUE_CAPACITY);
         tokio::spawn(
@@ -202,18 +219,22 @@ where
                 responses: read,
                 response_senders: response_rx,
                 timeout: settings.message_timeout,
+                remote_addr: self.remote_addr,
+                state: self.state.clone(),
             }
             .run(),
         );
 
         while let Some(msg) = self.rx.recv().await {
             if write.send(msg.request).await.is_err() {
+                set_peer_connected(&self.state, self.remote_addr, false).await;
                 let _ = msg.response.send(Err(PeerRpcError::FailedToSendRequest));
                 self.drain_with_error(PeerRpcError::FailedToSendRequest).await;
                 return;
             }
 
             if let Err(error) = response_tx.send(msg.response).await {
+                set_peer_connected(&self.state, self.remote_addr, false).await;
                 let _ = error.0.send(Err(PeerRpcError::FailedToReceiveResponse));
                 self.drain_with_error(PeerRpcError::FailedToReceiveResponse).await;
                 return;
@@ -254,6 +275,8 @@ struct ResponseReader<A: SyncIOAddress, D: DeterministicState> {
     responses: Receiver<SyncResponse<A, D>>,
     response_senders: Receiver<RpcResponseSender<A, D>>,
     timeout: Duration,
+    remote_addr: A,
+    state: Arc<NodeState<A, D>>,
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> ResponseReader<A, D> {
@@ -264,6 +287,7 @@ impl<A: SyncIOAddress, D: DeterministicState> ResponseReader<A, D> {
             let _ = response_sender.send(response);
 
             if let Some(error) = fatal_error {
+                set_peer_connected(&self.state, self.remote_addr, false).await;
                 self.drain_with_error(error).await;
                 return;
             }
@@ -276,6 +300,27 @@ impl<A: SyncIOAddress, D: DeterministicState> ResponseReader<A, D> {
             let _ = response_sender.send(Err(error.clone()));
         }
     }
+}
+
+async fn set_peer_connected<A, D>(state: &NodeState<A, D>, peer: A, is_connected: bool)
+where
+    A: SyncIOAddress,
+    D: DeterministicState,
+{
+    let mut peers = state.peers.lock().await;
+    peers
+        .entry(peer)
+        .and_modify(|peer_state| {
+            peer_state.is_connected = is_connected;
+        })
+        .or_insert_with(|| PeerState {
+            addr: peer,
+            latency: None,
+            can_lead: None,
+            is_connected,
+            last_global_connectivity: None,
+            leader_observation: None,
+        });
 }
 
 async fn read_response<A: SyncIOAddress, D: DeterministicState>(
@@ -430,10 +475,15 @@ mod tests {
     fn peer_connections(
         local_address: u64,
         fail_connect: bool,
-    ) -> (Arc<PeerConnections<FakeIo, TestState>>, mpsc::UnboundedReceiver<SyncConnection<FakeIo>>, Arc<AtomicUsize>)
-    {
+    ) -> (
+        Arc<PeerConnections<FakeIo, TestState>>,
+        mpsc::UnboundedReceiver<SyncConnection<FakeIo>>,
+        Arc<AtomicUsize>,
+        Arc<NodeState<u64, TestState>>,
+    ) {
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let connect_count = Arc::new(AtomicUsize::new(0));
+        let state = node_state(local_address);
         let io = Arc::new(FakeIo {
             address: local_address,
             connect_count: connect_count.clone(),
@@ -441,7 +491,7 @@ mod tests {
             fail_connect,
         });
 
-        (Arc::new(PeerConnections::new(io, settings(), node_state(local_address))), incoming_rx, connect_count)
+        (Arc::new(PeerConnections::new(io, settings(), state.clone())), incoming_rx, connect_count, state)
     }
 
     async fn accept_server(
@@ -482,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_subscribe_recovery_rpc_without_connecting() {
-        let (connections, _incoming, connect_count) = peer_connections(1, false);
+        let (connections, _incoming, connect_count, _state) = peer_connections(1, false);
 
         let result = connections
             .send_rpc(
@@ -497,7 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_subscribe_fresh_rpc_without_connecting() {
-        let (connections, _incoming, connect_count) = peer_connections(1, false);
+        let (connections, _incoming, connect_count, _state) = peer_connections(1, false);
 
         let result = connections.send_rpc(2, SyncRequest::SubscribeFresh).await;
 
@@ -507,7 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshakes_before_first_rpc() {
-        let (connections, mut incoming, _connect_count) = peer_connections(1, false);
+        let (connections, mut incoming, _connect_count, _state) = peer_connections(1, false);
         let task = tokio::spawn({
             let connections = connections.clone();
             async move { connections.send_rpc(2, SyncRequest::Ping(42)).await }
@@ -527,7 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn reuses_connection_for_multiple_rpcs() {
-        let (connections, mut incoming, connect_count) = peer_connections(1, false);
+        let (connections, mut incoming, connect_count, _state) = peer_connections(1, false);
 
         let first = tokio::spawn({
             let connections = connections.clone();
@@ -559,7 +609,7 @@ mod tests {
 
     #[tokio::test]
     async fn pipelines_requests_before_responses_arrive() {
-        let (connections, mut incoming, connect_count) = peer_connections(1, false);
+        let (connections, mut incoming, connect_count, _state) = peer_connections(1, false);
 
         let first = tokio::spawn({
             let connections = connections.clone();
@@ -592,12 +642,48 @@ mod tests {
 
     #[tokio::test]
     async fn connect_failure_propagates_to_queued_rpc() {
-        let (connections, _incoming, _connect_count) = peer_connections(1, true);
+        let (connections, _incoming, _connect_count, _state) = peer_connections(1, true);
 
         let result = tokio::time::timeout(Duration::from_secs(2), connections.send_rpc(2, SyncRequest::Ping(1)))
             .await
             .unwrap();
 
         assert!(matches!(result, Err(PeerRpcError::FailedToConnectToPeer)));
+    }
+
+    #[tokio::test]
+    async fn successful_connection_marks_peer_connected() {
+        let (connections, mut incoming, _connect_count, state) = peer_connections(1, false);
+        let task = tokio::spawn({
+            let connections = connections.clone();
+            async move { connections.send_rpc(2, SyncRequest::Ping(42)).await }
+        });
+
+        let (write, mut read) = accept_server(&mut incoming).await;
+        expect_handshake(&write, &mut read, 1).await;
+
+        match recv_request(&mut read).await {
+            SyncRequest::Ping(id) => assert_eq!(id, 42),
+            other => panic!("expected ping request, got {other:?}"),
+        }
+        write.send(SyncResponse::Pong(42)).await.unwrap();
+        assert!(matches!(task.await.unwrap().unwrap(), SyncResponse::Pong(42)));
+
+        let peers = state.peers.lock().await;
+        assert!(peers.get(&2).is_some_and(|peer| peer.is_connected));
+    }
+
+    #[tokio::test]
+    async fn connect_failure_marks_peer_disconnected() {
+        let (connections, _incoming, _connect_count, state) = peer_connections(1, true);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), connections.send_rpc(2, SyncRequest::Ping(1)))
+            .await
+            .unwrap();
+
+        assert!(matches!(result, Err(PeerRpcError::FailedToConnectToPeer)));
+
+        let peers = state.peers.lock().await;
+        assert!(peers.get(&2).is_some_and(|peer| !peer.is_connected));
     }
 }
