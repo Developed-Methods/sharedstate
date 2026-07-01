@@ -24,6 +24,7 @@ use crate::{
 const RPC_QUEUE_CAPACITY: usize = 512;
 const CONNECT_RETRY_LIMIT: u64 = 3;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
+const CONNECT_FAIL_HOLD_DELAY: Duration = Duration::from_secs(5);
 
 pub struct PeerConnections<I: SyncIO, D: DeterministicState> {
     io: Arc<I>,
@@ -278,6 +279,7 @@ where
 {
     async fn run<I: SyncIO<Address = A>>(mut self, io: Arc<I>, settings: NetIoSettings) {
         let mut repeat_failures = 0;
+        let mut retry_wait = CONNECT_RETRY_DELAY;
 
         let connection = loop {
             match io.connect(&self.remote_addr).await {
@@ -289,10 +291,12 @@ where
                     if repeat_failures > CONNECT_RETRY_LIMIT {
                         self.state.set_peer_connected(self.remote_addr, false).await;
                         self.drain_with_error(PeerRpcError::FailedToConnectToPeer).await;
+                        tokio::time::sleep(CONNECT_FAIL_HOLD_DELAY).await;
                         return;
                     }
 
-                    tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                    tokio::time::sleep(retry_wait).await;
+                    retry_wait += CONNECT_RETRY_DELAY;
                 }
             }
         };
