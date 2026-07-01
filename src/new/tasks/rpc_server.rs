@@ -14,6 +14,7 @@ use crate::{
     new::{
         node_state::{NodeState, PeerState},
         subscribable_state::StateHandle,
+        tasks::current_leader::local_leader_observation,
     },
     protocol::messages::{SharePeerDetails, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
@@ -65,23 +66,7 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
             },
 
             SyncRequest::ShareLeaderInfo => {
-                let peers = self.state.peers.lock().await;
-                let recover_details = self.state_handle.lock().await.recover_details();
-                let mut reachable_can_lead = peers
-                    .iter()
-                    .filter_map(|(_, peer)| (peer.is_connected && peer.can_lead == Some(true)).then_some(peer.addr))
-                    .collect::<Vec<_>>();
-                if self.state.can_lead {
-                    reachable_can_lead.push(self.state.my_address);
-                }
-                drop(peers);
-
-                SyncResponse::LeaderInfo(
-                    self.state
-                        .leader_status
-                        .local_observation(self.state.can_lead, reachable_can_lead, recover_details)
-                        .await,
-                )
+                SyncResponse::LeaderInfo(local_leader_observation(&self.state, &self.state_handle).await)
             }
             SyncRequest::Action { source, action } => {
                 if self.actions_tx.try_send((source, action)).is_ok() {
@@ -94,7 +79,10 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
                 let mut peers = self.state.peers.lock().await;
                 match peers.entry(source) {
                     hash_map::Entry::Occupied(o) => {
-                        o.into_mut().leader_observation = Some(info);
+                        let state = o.into_mut();
+                        state.can_lead = Some(info.can_lead);
+                        state.last_global_connectivity = NonZeroU64::new(now_ms());
+                        state.leader_observation = Some(info);
                     }
                     hash_map::Entry::Vacant(entry) => {
                         entry.insert(PeerState {

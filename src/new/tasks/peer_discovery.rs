@@ -1,14 +1,4 @@
-use std::{
-    collections::{BTreeSet, HashMap},
-    hash::{DefaultHasher, Hash, Hasher},
-    iter,
-    num::NonZeroU64,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{num::NonZeroU64, sync::Arc, time::Duration};
 
 use futures_util::{stream, StreamExt};
 use message_encoding::MessageEncoding;
@@ -16,44 +6,39 @@ use tokio::sync::Mutex;
 
 use crate::{
     new::{
-        election::{decide_election, ElectionDecision, ElectionInput, PeerReachability, TimedPeerObservation},
         node_state::{NodeState, PeerState},
         subscribable_state::StateHandle,
-        tasks::peer_connections::PeerConnections,
+        tasks::{current_leader::local_leader_observation, peer_connections::PeerConnections},
     },
     protocol::messages::{SharePeerDetails, SyncRequest, SyncResponse},
-    state::{determinstic_state::DeterministicState, recoverable_state::RecoverableStateAction},
+    state::determinstic_state::DeterministicState,
     transport::traits::{SyncIO, SyncIOAddress},
     utils::now_ms,
 };
 
-static GENERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-pub struct PeerDiscoveryElectionTask<I: SyncIO, D: DeterministicState> {
+pub struct PeerDiscoveryTask<I: SyncIO, D: DeterministicState> {
     state: Arc<NodeState<I::Address, D>>,
     peer_connections: Arc<PeerConnections<I, D>>,
-    timing: PeerDiscoveryElectionTiming,
+    timing: PeerDiscoveryTiming,
     state_handle: Mutex<StateHandle<D>>,
 }
 
 #[derive(Clone, Debug)]
-pub struct PeerDiscoveryElectionTiming {
+pub struct PeerDiscoveryTiming {
     pub observation_interval: Duration,
-    pub observation_stale_after: Duration,
     pub max_concurrent_observations: usize,
 }
 
-impl Default for PeerDiscoveryElectionTiming {
+impl Default for PeerDiscoveryTiming {
     fn default() -> Self {
         Self {
             observation_interval: Duration::from_secs(3),
-            observation_stale_after: Duration::from_secs(15),
             max_concurrent_observations: 8,
         }
     }
 }
 
-impl<I, D> PeerDiscoveryElectionTask<I, D>
+impl<I, D> PeerDiscoveryTask<I, D>
 where
     I: SyncIO,
     D: DeterministicState + MessageEncoding,
@@ -63,7 +48,7 @@ where
     pub fn new(
         state: Arc<NodeState<I::Address, D>>,
         peer_connections: Arc<PeerConnections<I, D>>,
-        timing: PeerDiscoveryElectionTiming,
+        timing: PeerDiscoveryTiming,
     ) -> Self {
         let state_handle = Mutex::new(state.state.create_handle());
         Self {
@@ -78,9 +63,8 @@ where
         tracing::debug!(
             local = ?self.state.my_address,
             interval_ms = self.timing.observation_interval.as_millis(),
-            stale_after_ms = self.timing.observation_stale_after.as_millis(),
             max_concurrent = self.timing.max_concurrent_observations,
-            "starting peer discovery and election task",
+            "starting peer discovery task",
         );
 
         loop {
@@ -90,10 +74,9 @@ where
     }
 
     pub async fn tick(&self) {
-        tracing::debug!(local = ?self.state.my_address, "starting peer discovery election tick");
+        tracing::debug!(local = ?self.state.my_address, "starting peer discovery tick");
         self.observe_peers().await;
-        self.apply_election().await;
-        tracing::debug!(local = ?self.state.my_address, "finished peer discovery election tick");
+        tracing::debug!(local = ?self.state.my_address, "finished peer discovery tick");
     }
 
     pub async fn observe_peers(&self) {
@@ -104,6 +87,7 @@ where
         }
 
         let share_peers = self.local_share_peers().await;
+        let local_observation = local_leader_observation(&self.state, &self.state_handle).await;
         let max_concurrent = self.timing.max_concurrent_observations.max(1);
         tracing::debug!(
             local = ?self.state.my_address,
@@ -117,159 +101,15 @@ where
             let state = self.state.clone();
             let peer_connections = self.peer_connections.clone();
             let share_peers = share_peers.clone();
+            let local_observation = local_observation.clone();
 
             async move {
-                observe_peer(state, peer_connections, peer, share_peers).await;
+                observe_peer(state, peer_connections, peer, share_peers, local_observation).await;
             }
         }))
         .buffer_unordered(max_concurrent)
         .collect::<Vec<_>>()
         .await;
-    }
-
-    pub async fn apply_election(&self) {
-        let now = now_ms();
-        let stale_after_ms = self.timing.observation_stale_after.as_millis() as u64;
-        let recover_details = self.state_handle.lock().await.recover_details();
-
-        let (known_can_lead, reachable_can_lead, peer_observations, peer_reachability) = {
-            let peers = self.state.peers.lock().await;
-            let mut known_can_lead = peers
-                .values()
-                .filter_map(|peer| (peer.can_lead == Some(true)).then_some(peer.addr))
-                .collect::<BTreeSet<_>>();
-            let mut reachable_can_lead = peers
-                .values()
-                .filter_map(|peer| (peer.is_connected && peer.can_lead == Some(true)).then_some(peer.addr))
-                .collect::<Vec<_>>();
-
-            if self.state.can_lead {
-                known_can_lead.insert(self.state.my_address);
-                reachable_can_lead.push(self.state.my_address);
-            }
-
-            let peer_observations = peers
-                .values()
-                .filter_map(|peer| {
-                    peer.leader_observation.clone().map(|observation| TimedPeerObservation {
-                        observer: peer.addr,
-                        last_activity_ms: peer.last_global_connectivity.map(NonZeroU64::get),
-                        observation,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let peer_reachability = peers
-                .values()
-                .map(|peer| {
-                    (
-                        peer.addr,
-                        PeerReachability {
-                            last_activity_ms: peer.last_global_connectivity.map(NonZeroU64::get),
-                        },
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-
-            (known_can_lead, reachable_can_lead, peer_observations, peer_reachability)
-        };
-
-        let local_observation = self
-            .state
-            .leader_status
-            .local_observation(self.state.can_lead, reachable_can_lead, recover_details)
-            .await;
-        let election_term = self.state.leader_status.current_term().await;
-
-        tracing::debug!(
-            local = ?self.state.my_address,
-            can_lead = self.state.can_lead,
-            election_term,
-            local_leader = ?local_observation.leader,
-            local_leader_path = ?local_observation.leader_path,
-            known_can_lead = ?known_can_lead,
-            peer_observation_count = peer_observations.len(),
-            peer_reachability_count = peer_reachability.len(),
-            stale_after_ms,
-            "applying leader election",
-        );
-
-        let decision = decide_election(ElectionInput {
-            local_address: self.state.my_address,
-            can_lead: self.state.can_lead,
-            known_can_lead,
-            local_observation,
-            peer_observations,
-            peer_reachability,
-            election_term,
-            now_ms: now,
-            stale_after_ms,
-        });
-        tracing::debug!(
-            local = ?self.state.my_address,
-            ?decision,
-            "leader election decision",
-        );
-
-        match decision {
-            ElectionDecision::PromoteSelf { observed_term } => {
-                if self.state.leader_status.leader().await == Some(self.state.my_address) {
-                    tracing::debug!(
-                        local = ?self.state.my_address,
-                        observed_term,
-                        "already leading; skipping self-promotion",
-                    );
-                    return;
-                }
-
-                let term = self.state.leader_status.begin_election(observed_term).await;
-                let new_id = new_generation_id(self.state.my_address, term);
-                tracing::debug!(
-                    local = ?self.state.my_address,
-                    observed_term,
-                    term,
-                    new_id,
-                    "promoting self to leader",
-                );
-                self.state
-                    .state
-                    .update(iter::once(RecoverableStateAction::BumpGeneration { new_id }))
-                    .await;
-                self.state.leader_status.promote_self(term).await;
-            }
-            ElectionDecision::FollowRemote {
-                leader,
-                term,
-                path,
-                via,
-            } => {
-                let accepted = self
-                    .state
-                    .leader_status
-                    .follow_remote(leader, term, path.clone(), via)
-                    .await;
-                tracing::debug!(
-                    local = ?self.state.my_address,
-                    ?leader,
-                    term,
-                    ?path,
-                    ?via,
-                    accepted,
-                    "following remote leader",
-                );
-            }
-            ElectionDecision::ClearRemoteLeader { leader } => {
-                let cleared = self.state.leader_status.clear_if_leader(leader).await;
-                tracing::debug!(
-                    local = ?self.state.my_address,
-                    ?leader,
-                    cleared,
-                    "clearing remote leader status",
-                );
-            }
-            ElectionDecision::NoChange => {
-                tracing::debug!(local = ?self.state.my_address, "leader election made no state change");
-            }
-        }
     }
 
     async fn observation_targets(&self) -> Vec<I::Address> {
@@ -328,6 +168,7 @@ async fn observe_peer<I, D>(
     peer_connections: Arc<PeerConnections<I, D>>,
     peer: I::Address,
     share_peers: Vec<SharePeerDetails<I::Address>>,
+    local_observation: crate::protocol::messages::LeaderWithElectionInfo<I::Address>,
 ) where
     I: SyncIO,
     D: DeterministicState + MessageEncoding,
@@ -406,6 +247,46 @@ async fn observe_peer<I, D>(
         }
     }
 
+    match peer_connections
+        .send_rpc(
+            peer,
+            SyncRequest::LeaderInformation {
+                source: state.my_address,
+                info: local_observation,
+            },
+        )
+        .await
+    {
+        Ok(SyncResponse::Ok) => {
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                "peer accepted local leader information",
+            );
+        }
+        Ok(response) => {
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                response = response_name(&response),
+                "leader information push returned unexpected response",
+            );
+            peer_connections.kill_connection(peer).await;
+            clear_failed_observation(&state, peer).await;
+            return;
+        }
+        Err(error) => {
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                ?error,
+                "leader information push failed",
+            );
+            clear_failed_observation(&state, peer).await;
+            return;
+        }
+    }
+
     match peer_connections.send_rpc(peer, SyncRequest::ShareLeaderInfo).await {
         Ok(SyncResponse::LeaderInfo(info)) if info.observer == peer => {
             tracing::debug!(
@@ -419,11 +300,7 @@ async fn observe_peer<I, D>(
                 reachable_can_lead = ?info.reachable_can_lead,
                 "peer shared leader info",
             );
-            let mut peers = state.peers.lock().await;
-            let peer_state = peers.entry(peer).or_insert_with(|| empty_peer_state(peer));
-            peer_state.can_lead = Some(info.can_lead);
-            peer_state.last_global_connectivity = NonZeroU64::new(now_ms());
-            peer_state.leader_observation = Some(info);
+            record_leader_observation(&state, peer, info).await;
         }
         Ok(response) => {
             tracing::debug!(
@@ -445,6 +322,21 @@ async fn observe_peer<I, D>(
             clear_failed_observation(&state, peer).await;
         }
     }
+}
+
+async fn record_leader_observation<A, D>(
+    state: &NodeState<A, D>,
+    peer: A,
+    info: crate::protocol::messages::LeaderWithElectionInfo<A>,
+) where
+    A: SyncIOAddress,
+    D: DeterministicState,
+{
+    let mut peers = state.peers.lock().await;
+    let peer_state = peers.entry(peer).or_insert_with(|| empty_peer_state(peer));
+    peer_state.can_lead = Some(info.can_lead);
+    peer_state.last_global_connectivity = NonZeroU64::new(now_ms());
+    peer_state.leader_observation = Some(info);
 }
 
 async fn mark_peer_observed<A, D>(state: &NodeState<A, D>, peer: A, latency: Option<NonZeroU64>)
@@ -551,25 +443,13 @@ fn empty_peer_state<A: SyncIOAddress>(addr: A) -> PeerState<A> {
     }
 }
 
-fn new_generation_id<A: SyncIOAddress + Hash>(local: A, term: u64) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    local.hash(&mut hasher);
-    term.hash(&mut hasher);
-    now_ms().hash(&mut hasher);
-    GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
-    hasher.finish()
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, io::Result, sync::Arc, time::Duration};
 
     use message_encoding::MessageEncoding;
     use sequenced_broadcast::SequencedBroadcastSettings;
-    use tokio::{
-        io::{DuplexStream, ReadHalf, WriteHalf},
-        sync::Mutex,
-    };
+    use tokio::sync::{mpsc::Receiver, mpsc::Sender, Mutex};
 
     use super::*;
     use crate::{
@@ -580,9 +460,13 @@ mod tests {
                 peer_connections::PeerConnections,
             },
         },
-        protocol::messages::LeaderWithElectionInfo,
+        protocol::messages::{LeaderWithElectionInfo, PROTOCOL_VERSION},
         state::recoverable_state::{RecoverableState, RecoverableStateDetails},
-        transport::{channels::NetIoSettings, traits::SyncConnection},
+        transport::{
+            channels::NetIoSettings,
+            simulated::{SimulatedIo, SimulatedNet},
+            traits::SyncIOListener,
+        },
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -628,18 +512,6 @@ mod tests {
         }
     }
 
-    struct TestIo;
-
-    impl SyncIO for TestIo {
-        type Address = u64;
-        type Read = ReadHalf<DuplexStream>;
-        type Write = WriteHalf<DuplexStream>;
-
-        async fn connect(&self, _remote: &Self::Address) -> Result<SyncConnection<Self>> {
-            unreachable!("peer discovery unit tests do not open network connections")
-        }
-    }
-
     fn settings() -> NetIoSettings {
         NetIoSettings {
             process_timeout: Duration::from_millis(100),
@@ -661,9 +533,83 @@ mod tests {
         })
     }
 
-    fn task(state: Arc<NodeState<u64, TestState>>) -> PeerDiscoveryElectionTask<TestIo, TestState> {
-        let connections = Arc::new(PeerConnections::new(Arc::new(TestIo), settings(), state.clone()));
-        PeerDiscoveryElectionTask::new(state, connections, PeerDiscoveryElectionTiming::default())
+    async fn simulated_task(
+        state: Arc<NodeState<u64, TestState>>,
+        remote_address: u64,
+    ) -> (PeerDiscoveryTask<SimulatedIo, TestState>, Arc<PeerConnections<SimulatedIo, TestState>>, Arc<SimulatedIo>)
+    {
+        let net = SimulatedNet::new();
+        let local_io = net.start_io(state.my_address).await;
+        let remote_io = net.start_io(remote_address).await;
+        let connections = Arc::new(PeerConnections::new(local_io, settings(), state.clone()));
+        let task = PeerDiscoveryTask::new(state, connections.clone(), PeerDiscoveryTiming::default());
+        (task, connections, remote_io)
+    }
+
+    async fn accept_server(
+        remote_io: &SimulatedIo,
+    ) -> (Sender<SyncResponse<u64, TestState>>, Receiver<SyncRequest<u64, TestState>>) {
+        let conn = tokio::time::timeout(Duration::from_secs(1), remote_io.next_client())
+            .await
+            .unwrap()
+            .unwrap();
+        let (_remote, write, read) = conn.server_channels::<TestState>(settings());
+        (write, read)
+    }
+
+    async fn recv_request(read: &mut Receiver<SyncRequest<u64, TestState>>) -> SyncRequest<u64, TestState> {
+        tokio::time::timeout(Duration::from_secs(1), read.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn expect_handshake(
+        write: &Sender<SyncResponse<u64, TestState>>,
+        read: &mut Receiver<SyncRequest<u64, TestState>>,
+        expected_local: u64,
+    ) {
+        match recv_request(read).await {
+            SyncRequest::ProtocolVersion(version) => assert_eq!(version, PROTOCOL_VERSION),
+            other => panic!("expected protocol version request, got {other:?}"),
+        }
+        write.send(SyncResponse::Ok).await.unwrap();
+
+        match recv_request(read).await {
+            SyncRequest::MyAddress(address) => assert_eq!(address, expected_local),
+            other => panic!("expected my-address request, got {other:?}"),
+        }
+        write.send(SyncResponse::Ok).await.unwrap();
+    }
+
+    fn one_peer_task_state() -> Arc<NodeState<u64, TestState>> {
+        let mut peers = HashMap::new();
+        peers.insert(2, peer(2, Some(true), false));
+        node_state(1, true, peers)
+    }
+
+    async fn expect_ping_share_and_leader_push(
+        write: &Sender<SyncResponse<u64, TestState>>,
+        read: &mut Receiver<SyncRequest<u64, TestState>>,
+    ) {
+        match recv_request(read).await {
+            SyncRequest::Ping(id) => write.send(SyncResponse::Pong(id)).await.unwrap(),
+            other => panic!("expected ping request, got {other:?}"),
+        }
+
+        match recv_request(read).await {
+            SyncRequest::SharePeers(_) => write.send(SyncResponse::Peers(Vec::new())).await.unwrap(),
+            other => panic!("expected share-peers request, got {other:?}"),
+        }
+
+        match recv_request(read).await {
+            SyncRequest::LeaderInformation { source, info } => {
+                assert_eq!(source, 1);
+                assert_eq!(info.observer, 1);
+                write.send(SyncResponse::Ok).await.unwrap();
+            }
+            other => panic!("expected leader-information request, got {other:?}"),
+        }
     }
 
     fn peer(addr: u64, can_lead: Option<bool>, is_connected: bool) -> PeerState<u64> {
@@ -690,64 +636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn can_lead_node_promotes_when_no_reachable_leader() {
-        let state = node_state(1, true, HashMap::new());
-        let task = task(state.clone());
-
-        task.apply_election().await;
-
-        match state.leader_status.snapshot().await.mode {
-            LeaderMode::Leading { path, .. } => assert_eq!(path, vec![1]),
-            mode => panic!("expected leading mode, got {mode:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn already_leading_node_does_not_advance_term() {
-        let state = node_state(1, true, HashMap::new());
-        let task = task(state.clone());
-
-        task.apply_election().await;
-        let first_term = state.leader_status.current_term().await;
-        task.apply_election().await;
-
-        assert_eq!(state.leader_status.current_term().await, first_term);
-    }
-
-    #[tokio::test]
-    async fn non_leader_node_does_not_promote() {
-        let state = node_state(1, false, HashMap::new());
-        let task = task(state.clone());
-
-        task.apply_election().await;
-
-        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::NoLeader { term: 0 });
-    }
-
-    #[tokio::test]
-    async fn follows_reachable_remote_leader() {
-        let mut peers = HashMap::new();
-        let mut peer_two = peer(2, Some(true), true);
-        peer_two.leader_observation = Some(leader_observation(2, 3, 2, vec![2]));
-        peers.insert(2, peer_two);
-        let state = node_state(1, true, peers);
-        let task = task(state.clone());
-
-        task.apply_election().await;
-
-        assert_eq!(
-            state.leader_status.snapshot().await.mode,
-            LeaderMode::Following {
-                term: 3,
-                leader: 2,
-                path: vec![2, 1],
-                via: 2,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn clears_inaccessible_current_leader() {
+    async fn clear_failed_observation_clears_path_state_without_changing_connected() {
         let mut peers = HashMap::new();
         peers.insert(2, peer(2, Some(true), true));
         let state = node_state(1, false, peers);
@@ -778,5 +667,107 @@ mod tests {
         let peer = peers.get(&2).unwrap();
         assert_eq!(peer.can_lead, Some(true));
         assert_eq!(peer.last_global_connectivity, NonZeroU64::new(10));
+    }
+
+    #[tokio::test]
+    async fn records_leader_observation() {
+        let state = node_state(1, true, HashMap::new());
+
+        record_leader_observation(&state, 2, leader_observation(2, 3, 2, vec![2])).await;
+
+        let peers = state.peers.lock().await;
+        let peer = peers.get(&2).unwrap();
+        assert_eq!(peer.can_lead, Some(true));
+        assert_eq!(peer.leader_observation.as_ref().unwrap().leader, Some(2));
+    }
+
+    #[tokio::test]
+    async fn pushes_local_leader_information_to_peer() {
+        let state = one_peer_task_state();
+        let (task, _connections, remote_io) = simulated_task(state.clone(), 2).await;
+        let task_handle = tokio::spawn(async move {
+            task.observe_peers().await;
+        });
+
+        let (write, mut read) = accept_server(&remote_io).await;
+        expect_handshake(&write, &mut read, 1).await;
+        expect_ping_share_and_leader_push(&write, &mut read).await;
+
+        match recv_request(&mut read).await {
+            SyncRequest::ShareLeaderInfo => {
+                write
+                    .send(SyncResponse::LeaderInfo(leader_observation(2, 1, 2, vec![2])))
+                    .await
+                    .unwrap();
+            }
+            other => panic!("expected share-leader-info request, got {other:?}"),
+        }
+
+        task_handle.await.unwrap();
+        let peers = state.peers.lock().await;
+        assert_eq!(peers.get(&2).unwrap().leader_observation.as_ref().unwrap().observer, 2);
+    }
+
+    #[tokio::test]
+    async fn unexpected_response_kills_connection() {
+        let state = one_peer_task_state();
+        let (task, connections, remote_io) = simulated_task(state, 2).await;
+        let task_handle = tokio::spawn(async move {
+            task.observe_peers().await;
+        });
+
+        let (write, mut read) = accept_server(&remote_io).await;
+        expect_handshake(&write, &mut read, 1).await;
+
+        match recv_request(&mut read).await {
+            SyncRequest::Ping(id) => write.send(SyncResponse::Pong(id)).await.unwrap(),
+            other => panic!("expected ping request, got {other:?}"),
+        }
+        match recv_request(&mut read).await {
+            SyncRequest::SharePeers(_) => write.send(SyncResponse::UnexpectedRequest).await.unwrap(),
+            other => panic!("expected share-peers request, got {other:?}"),
+        }
+        task_handle.await.unwrap();
+
+        let rpc = tokio::spawn({
+            let connections = connections.clone();
+            async move { connections.send_rpc(2, SyncRequest::Ping(9)).await }
+        });
+        let (write, mut read) = accept_server(&remote_io).await;
+        expect_handshake(&write, &mut read, 1).await;
+        match recv_request(&mut read).await {
+            SyncRequest::Ping(id) => {
+                assert_eq!(id, 9);
+                write.send(SyncResponse::Pong(9)).await.unwrap();
+            }
+            other => panic!("expected ping request after reconnect, got {other:?}"),
+        }
+        assert!(matches!(rpc.await.unwrap().unwrap(), SyncResponse::Pong(9)));
+    }
+
+    #[tokio::test]
+    async fn rpc_error_clears_observation_without_killing_explicitly() {
+        let mut peers = HashMap::new();
+        let mut peer_two = peer(2, Some(true), true);
+        peer_two.leader_observation = Some(leader_observation(2, 1, 2, vec![2]));
+        peers.insert(2, peer_two);
+        let state = node_state(1, true, peers);
+        let (task, _connections, remote_io) = simulated_task(state.clone(), 2).await;
+        let task_handle = tokio::spawn(async move {
+            task.observe_peers().await;
+        });
+
+        let (write, mut read) = accept_server(&remote_io).await;
+        expect_handshake(&write, &mut read, 1).await;
+        expect_ping_share_and_leader_push(&write, &mut read).await;
+
+        match recv_request(&mut read).await {
+            SyncRequest::ShareLeaderInfo => {}
+            other => panic!("expected share-leader-info request, got {other:?}"),
+        }
+
+        task_handle.await.unwrap();
+        let peers = state.peers.lock().await;
+        assert!(peers.get(&2).is_some_and(|peer| peer.leader_observation.is_none()));
     }
 }
