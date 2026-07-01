@@ -12,7 +12,7 @@ use tokio::sync::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    new::node_state::{NodeState, PeerState},
+    new::node_state::NodeState,
     protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::determinstic_state::DeterministicState,
     transport::{
@@ -222,7 +222,7 @@ where
                     repeat_failures += 1;
 
                     if repeat_failures > CONNECT_RETRY_LIMIT {
-                        set_peer_connected(&self.state, self.remote_addr, false).await;
+                        self.state.set_peer_connected(self.remote_addr, false).await;
                         self.drain_with_error(PeerRpcError::FailedToConnectToPeer).await;
                         return;
                     }
@@ -235,12 +235,12 @@ where
         let (_remote, write, mut read) = connection.client_channels::<D>(settings.clone());
 
         if let Err(error) = self.handshake(&write, &mut read, settings.message_timeout).await {
-            set_peer_connected(&self.state, self.remote_addr, false).await;
+            self.state.set_peer_connected(self.remote_addr, false).await;
             self.drain_with_error(error).await;
             return;
         }
 
-        set_peer_connected(&self.state, self.remote_addr, true).await;
+        self.state.set_peer_connected(self.remote_addr, true).await;
 
         let (response_tx, response_rx) = tokio::sync::mpsc::channel(RPC_QUEUE_CAPACITY);
         tokio::spawn(
@@ -280,7 +280,7 @@ where
             }
         }
 
-        set_peer_connected(&self.state, self.remote_addr, false).await;
+        self.state.set_peer_connected(self.remote_addr, false).await;
         self.cancel.cancel();
     }
 
@@ -341,27 +341,6 @@ impl<A: SyncIOAddress, D: DeterministicState> ResponseReader<A, D> {
             let _ = response_sender.send(Err(error.clone()));
         }
     }
-}
-
-async fn set_peer_connected<A, D>(state: &NodeState<A, D>, peer: A, is_connected: bool)
-where
-    A: SyncIOAddress,
-    D: DeterministicState,
-{
-    let mut peers = state.peers.lock().await;
-    peers
-        .entry(peer)
-        .and_modify(|peer_state| {
-            peer_state.is_connected = is_connected;
-        })
-        .or_insert_with(|| PeerState {
-            addr: peer,
-            latency: None,
-            can_lead: None,
-            is_connected,
-            last_global_connectivity: None,
-            leader_observation: None,
-        });
 }
 
 async fn read_response<A: SyncIOAddress, D: DeterministicState>(

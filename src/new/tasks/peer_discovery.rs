@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     new::{
-        node_state::{NodeState, PeerState},
+        node_state::NodeState,
         subscribable_state::StateHandle,
         tasks::{current_leader::local_leader_observation, peer_connections::PeerConnections},
     },
@@ -142,18 +142,7 @@ where
     }
 
     async fn local_share_peers(&self) -> Vec<SharePeerDetails<I::Address>> {
-        let peers = self.state.peers.lock().await;
-        let mut share = Vec::with_capacity(peers.len() + 1);
-        share.push(SharePeerDetails {
-            address: self.state.my_address,
-            can_be_leader: Some(self.state.can_lead),
-            last_global_activity: NonZeroU64::new(now_ms()),
-        });
-        share.extend(peers.values().map(|peer| SharePeerDetails {
-            address: peer.addr,
-            can_be_leader: peer.can_lead,
-            last_global_activity: peer.last_global_connectivity,
-        }));
+        let share = self.state.local_and_known_peer_details().await;
         tracing::debug!(
             local = ?self.state.my_address,
             share_peer_count = share.len(),
@@ -186,7 +175,13 @@ async fn observe_peer<I, D>(
                 latency_ms = latency.map(NonZeroU64::get),
                 "peer ping succeeded",
             );
-            mark_peer_observed(&state, peer, latency).await;
+            state.mark_peer_observed(peer, latency).await;
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                latency_ms = latency.map(NonZeroU64::get),
+                "marked peer observed",
+            );
         }
         Ok(response) => {
             tracing::debug!(
@@ -196,7 +191,8 @@ async fn observe_peer<I, D>(
                 "peer ping returned unexpected response",
             );
             peer_connections.kill_connection(peer).await;
-            clear_failed_observation(&state, peer).await;
+            state.clear_peer_leader_observation(peer).await;
+            tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
             return;
         }
         Err(error) => {
@@ -206,7 +202,8 @@ async fn observe_peer<I, D>(
                 ?error,
                 "peer ping failed",
             );
-            clear_failed_observation(&state, peer).await;
+            state.clear_peer_leader_observation(peer).await;
+            tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
             return;
         }
     }
@@ -222,7 +219,16 @@ async fn observe_peer<I, D>(
                 peer_count = peers.len(),
                 "peer shared peer details",
             );
-            merge_peer_details(&state, peers).await;
+            let merge_result = state.merge_peer_details(peers).await;
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                shared_count = merge_result.shared_count,
+                inserted = merge_result.inserted,
+                updated = merge_result.updated,
+                skipped_local = merge_result.skipped_local,
+                "merged shared peer details",
+            );
         }
         Ok(response) => {
             tracing::debug!(
@@ -232,7 +238,8 @@ async fn observe_peer<I, D>(
                 "share peers returned unexpected response",
             );
             peer_connections.kill_connection(peer).await;
-            clear_failed_observation(&state, peer).await;
+            state.clear_peer_leader_observation(peer).await;
+            tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
             return;
         }
         Err(error) => {
@@ -242,7 +249,8 @@ async fn observe_peer<I, D>(
                 ?error,
                 "share peers request failed",
             );
-            clear_failed_observation(&state, peer).await;
+            state.clear_peer_leader_observation(peer).await;
+            tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
             return;
         }
     }
@@ -272,7 +280,8 @@ async fn observe_peer<I, D>(
                 "leader information push returned unexpected response",
             );
             peer_connections.kill_connection(peer).await;
-            clear_failed_observation(&state, peer).await;
+            state.clear_peer_leader_observation(peer).await;
+            tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
             return;
         }
         Err(error) => {
@@ -282,7 +291,8 @@ async fn observe_peer<I, D>(
                 ?error,
                 "leader information push failed",
             );
-            clear_failed_observation(&state, peer).await;
+            state.clear_peer_leader_observation(peer).await;
+            tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
             return;
         }
     }
@@ -300,7 +310,7 @@ async fn observe_peer<I, D>(
                 reachable_can_lead = ?info.reachable_can_lead,
                 "peer shared leader info",
             );
-            record_leader_observation(&state, peer, info).await;
+            state.record_leader_observation(peer, info).await;
         }
         Ok(response) => {
             tracing::debug!(
@@ -310,7 +320,8 @@ async fn observe_peer<I, D>(
                 "share leader info returned unexpected response",
             );
             peer_connections.kill_connection(peer).await;
-            clear_failed_observation(&state, peer).await;
+            state.clear_peer_leader_observation(peer).await;
+            tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
         }
         Err(error) => {
             tracing::debug!(
@@ -319,95 +330,10 @@ async fn observe_peer<I, D>(
                 ?error,
                 "share leader info request failed",
             );
-            clear_failed_observation(&state, peer).await;
+            state.clear_peer_leader_observation(peer).await;
+            tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
         }
     }
-}
-
-async fn record_leader_observation<A, D>(
-    state: &NodeState<A, D>,
-    peer: A,
-    info: crate::protocol::messages::LeaderWithElectionInfo<A>,
-) where
-    A: SyncIOAddress,
-    D: DeterministicState,
-{
-    let mut peers = state.peers.lock().await;
-    let peer_state = peers.entry(peer).or_insert_with(|| empty_peer_state(peer));
-    peer_state.can_lead = Some(info.can_lead);
-    peer_state.last_global_connectivity = NonZeroU64::new(now_ms());
-    peer_state.leader_observation = Some(info);
-}
-
-async fn mark_peer_observed<A, D>(state: &NodeState<A, D>, peer: A, latency: Option<NonZeroU64>)
-where
-    A: SyncIOAddress,
-    D: DeterministicState,
-{
-    let mut peers = state.peers.lock().await;
-    let peer_state = peers.entry(peer).or_insert_with(|| empty_peer_state(peer));
-    peer_state.latency = latency;
-    peer_state.last_global_connectivity = NonZeroU64::new(now_ms());
-    tracing::debug!(
-        local = ?state.my_address,
-        ?peer,
-        latency_ms = latency.map(NonZeroU64::get),
-        "marked peer connected",
-    );
-}
-
-async fn clear_failed_observation<A, D>(state: &NodeState<A, D>, peer: A)
-where
-    A: SyncIOAddress,
-    D: DeterministicState,
-{
-    {
-        let mut peers = state.peers.lock().await;
-        let peer_state = peers.entry(peer).or_insert_with(|| empty_peer_state(peer));
-        peer_state.leader_observation = None;
-    }
-    tracing::debug!(
-        local = ?state.my_address,
-        ?peer,
-        "cleared failed peer observation",
-    );
-}
-
-async fn merge_peer_details<A, D>(state: &NodeState<A, D>, shared_peers: Vec<SharePeerDetails<A>>)
-where
-    A: SyncIOAddress,
-    D: DeterministicState,
-{
-    let mut peers = state.peers.lock().await;
-    let shared_count = shared_peers.len();
-    let mut inserted = 0usize;
-    let mut updated = 0usize;
-    for shared in shared_peers {
-        if shared.address == state.my_address {
-            continue;
-        }
-
-        let peer_state = peers.entry(shared.address).or_insert_with(|| {
-            inserted += 1;
-            empty_peer_state(shared.address)
-        });
-        updated += 1;
-        if let Some(can_lead) = shared.can_be_leader {
-            peer_state.can_lead = Some(can_lead);
-        }
-        peer_state.last_global_connectivity = match (peer_state.last_global_connectivity, shared.last_global_activity) {
-            (None, Some(activity)) | (Some(activity), None) => Some(activity),
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (None, None) => None,
-        };
-    }
-    tracing::debug!(
-        local = ?state.my_address,
-        shared_count,
-        inserted,
-        updated,
-        "merged shared peer details",
-    );
 }
 
 fn response_name<A: SyncIOAddress, D: DeterministicState>(response: &SyncResponse<A, D>) -> &'static str {
@@ -428,17 +354,6 @@ fn response_name<A: SyncIOAddress, D: DeterministicState>(response: &SyncRespons
     }
 }
 
-fn empty_peer_state<A: SyncIOAddress>(addr: A) -> PeerState<A> {
-    PeerState {
-        addr,
-        latency: None,
-        can_lead: None,
-        is_connected: false,
-        last_global_connectivity: None,
-        leader_observation: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, io::Result, sync::Arc, time::Duration};
@@ -450,11 +365,9 @@ mod tests {
     use super::*;
     use crate::{
         new::{
+            node_state::PeerState,
             subscribable_state::SubscribableState,
-            tasks::{
-                current_leader::{CurrentLeaderStatus, LeaderMode},
-                peer_connections::PeerConnections,
-            },
+            tasks::{current_leader::CurrentLeaderStatus, peer_connections::PeerConnections},
         },
         protocol::messages::{LeaderWithElectionInfo, PROTOCOL_VERSION},
         state::recoverable_state::{RecoverableState, RecoverableStateDetails},
@@ -629,60 +542,6 @@ mod tests {
             reachable_can_lead: vec![observer],
             recover_details: RecoverableStateDetails::new(observer, 1),
         }
-    }
-
-    #[tokio::test]
-    async fn clear_failed_observation_does_not_change_leader_status_or_connected() {
-        let mut peers = HashMap::new();
-        peers.insert(2, peer(2, Some(true), true));
-        let state = node_state(1, false, peers);
-        assert!(state.leader_status.follow_remote(2, 3, vec![2, 1], 2).await);
-
-        clear_failed_observation(&state, 2).await;
-
-        assert_eq!(
-            state.leader_status.snapshot().await.mode,
-            LeaderMode::Following {
-                term: 3,
-                leader: 2,
-                path: vec![2, 1],
-                via: 2,
-            }
-        );
-        let peers = state.peers.lock().await;
-        assert!(peers.get(&2).is_some_and(|peer| peer.is_connected));
-    }
-
-    #[tokio::test]
-    async fn discovers_peers_from_share_peers() {
-        let state = node_state(1, true, HashMap::new());
-
-        merge_peer_details(
-            &state,
-            vec![SharePeerDetails {
-                address: 2,
-                can_be_leader: Some(true),
-                last_global_activity: NonZeroU64::new(10),
-            }],
-        )
-        .await;
-
-        let peers = state.peers.lock().await;
-        let peer = peers.get(&2).unwrap();
-        assert_eq!(peer.can_lead, Some(true));
-        assert_eq!(peer.last_global_connectivity, NonZeroU64::new(10));
-    }
-
-    #[tokio::test]
-    async fn records_leader_observation() {
-        let state = node_state(1, true, HashMap::new());
-
-        record_leader_observation(&state, 2, leader_observation(2, 3, 2, vec![2])).await;
-
-        let peers = state.peers.lock().await;
-        let peer = peers.get(&2).unwrap();
-        assert_eq!(peer.can_lead, Some(true));
-        assert_eq!(peer.leader_observation.as_ref().unwrap().leader, Some(2));
     }
 
     #[tokio::test]

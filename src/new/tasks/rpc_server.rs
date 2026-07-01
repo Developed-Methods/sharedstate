@@ -1,4 +1,4 @@
-use std::{collections::hash_map, num::NonZeroU64, sync::Arc};
+use std::sync::Arc;
 
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::SequencedReceiver;
@@ -11,12 +11,8 @@ use tokio::{
 };
 
 use crate::{
-    new::{
-        node_state::{NodeState, PeerState},
-        subscribable_state::StateHandle,
-        tasks::current_leader::local_leader_observation,
-    },
-    protocol::messages::{SharePeerDetails, SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    new::{node_state::NodeState, subscribable_state::StateHandle, tasks::current_leader::local_leader_observation},
+    protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         determinstic_state::DeterministicState,
         recoverable_state::{RecoverableState, RecoverableStateAction},
@@ -25,7 +21,6 @@ use crate::{
         channels::NetIoSettings,
         traits::{SyncConnection, SyncIO, SyncIOAddress, SyncIOListener},
     },
-    utils::now_ms,
 };
 
 pub struct RpcServer<A: SyncIOAddress, D: DeterministicState> {
@@ -46,14 +41,8 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
     }
 
     pub async fn handle(&self, peer_addr: A, request: SyncRequest<A, D>) -> ResponseOrFeed<A, D> {
-        {
-            let mut peers = self.state.peers.lock().await;
-
-            if let Some(state) = peers.get_mut(&peer_addr) {
-                state.last_global_connectivity = NonZeroU64::new(now_ms());
-            } else {
-                tracing::error!("got message from peer but they are not in state");
-            }
+        if !self.state.note_known_peer_activity(peer_addr).await {
+            tracing::error!("got message from peer but they are not in state");
         }
 
         let resp = match request {
@@ -76,26 +65,7 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
                 }
             }
             SyncRequest::LeaderInformation { source, info } => {
-                let mut peers = self.state.peers.lock().await;
-                match peers.entry(source) {
-                    hash_map::Entry::Occupied(o) => {
-                        let state = o.into_mut();
-                        state.can_lead = Some(info.can_lead);
-                        state.last_global_connectivity = NonZeroU64::new(now_ms());
-                        state.leader_observation = Some(info);
-                    }
-                    hash_map::Entry::Vacant(entry) => {
-                        entry.insert(PeerState {
-                            addr: info.observer,
-                            latency: None,
-                            can_lead: Some(info.can_lead),
-                            is_connected: false,
-                            last_global_connectivity: NonZeroU64::new(now_ms()),
-                            leader_observation: Some(info),
-                        });
-                    }
-                }
-
+                self.state.record_leader_observation(source, info).await;
                 SyncResponse::Ok
             }
             SyncRequest::SubscribeRecovery(details) => match self.state.state.subscribe(details).await {
@@ -111,46 +81,8 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
             }
             SyncRequest::Ping(id) => SyncResponse::Pong(id),
             SyncRequest::SharePeers(shared_peers) => {
-                let mut peers = self.state.peers.lock().await;
-
-                for peer in shared_peers {
-                    match peers.entry(peer.address) {
-                        hash_map::Entry::Occupied(o) => {
-                            let state = o.into_mut();
-
-                            if let Some(can_lead) = peer.can_be_leader {
-                                state.can_lead = Some(can_lead);
-                            }
-
-                            state.last_global_connectivity =
-                                match (state.last_global_connectivity, peer.last_global_activity) {
-                                    (None, Some(a)) | (Some(a), None) => Some(a),
-                                    (Some(a), Some(b)) => Some(a.max(b)),
-                                    _ => None,
-                                };
-                        }
-                        hash_map::Entry::Vacant(v) => {
-                            v.insert(PeerState {
-                                addr: peer.address,
-                                latency: None,
-                                can_lead: peer.can_be_leader,
-                                is_connected: false,
-                                last_global_connectivity: peer.last_global_activity,
-                                leader_observation: None,
-                            });
-                        }
-                    }
-                }
-
-                let share_peer_details = peers
-                    .iter()
-                    .map(|(_, peer)| SharePeerDetails {
-                        address: peer.addr,
-                        can_be_leader: peer.can_lead,
-                        last_global_activity: peer.last_global_connectivity,
-                    })
-                    .collect::<Vec<_>>();
-
+                self.state.merge_peer_details(shared_peers).await;
+                let share_peer_details = self.state.known_peer_details().await;
                 SyncResponse::Peers(share_peer_details)
             }
         };
@@ -305,7 +237,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        new::{subscribable_state::SubscribableState, tasks::current_leader::CurrentLeaderStatus},
+        new::{
+            node_state::PeerState, subscribable_state::SubscribableState, tasks::current_leader::CurrentLeaderStatus,
+        },
         protocol::messages::PROTOCOL_VERSION,
         state::recoverable_state::RecoverableState,
         transport::traits::SyncConnection,
