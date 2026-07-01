@@ -1,13 +1,13 @@
 use std::collections::{BTreeSet, HashMap};
 
-use crate::{protocol::messages::ElectionObservation, transport::traits::SyncIOAddress};
+use crate::{protocol::messages::LeaderWithElectionInfo, transport::traits::SyncIOAddress};
 
 use super::paths::{append_path, valid_local_leader_path, valid_remote_leader_path};
 
 pub(crate) struct ElectionState<A: SyncIOAddress> {
     pub term: u64,
     pub known_can_lead: BTreeSet<A>,
-    pub observations: HashMap<A, ElectionObservation<A>>,
+    pub observations: HashMap<A, LeaderWithElectionInfo<A>>,
     pub last_promoted_leader: Option<A>,
 }
 
@@ -24,7 +24,7 @@ pub(crate) struct ElectionInput<A: SyncIOAddress> {
     pub local_address: A,
     pub can_lead: bool,
     pub known_can_lead: BTreeSet<A>,
-    pub local_observation: ElectionObservation<A>,
+    pub local_observation: LeaderWithElectionInfo<A>,
     pub peer_observations: Vec<TimedPeerObservation<A>>,
     pub peer_reachability: HashMap<A, PeerReachability>,
     pub election_term: u64,
@@ -36,7 +36,7 @@ pub(crate) struct ElectionInput<A: SyncIOAddress> {
 pub(crate) struct TimedPeerObservation<A: SyncIOAddress> {
     pub observer: A,
     pub last_activity_ms: Option<u64>,
-    pub observation: ElectionObservation<A>,
+    pub observation: LeaderWithElectionInfo<A>,
 }
 
 #[derive(Clone, Debug)]
@@ -176,7 +176,7 @@ fn fresh_observation<A: SyncIOAddress>(
     now_ms: u64,
     stale_after_ms: u64,
     timed: TimedPeerObservation<A>,
-) -> Option<ElectionObservation<A>> {
+) -> Option<LeaderWithElectionInfo<A>> {
     if timed.observer != timed.observation.observer {
         return None;
     }
@@ -197,8 +197,8 @@ mod tests {
         leader: Option<u64>,
         path: Option<Vec<u64>>,
         state_accept_seq: u64,
-    ) -> ElectionObservation<u64> {
-        ElectionObservation {
+    ) -> LeaderWithElectionInfo<u64> {
+        LeaderWithElectionInfo {
             observer,
             term,
             leader,
@@ -209,7 +209,7 @@ mod tests {
         }
     }
 
-    fn input(local: u64, can_lead: bool, observations: Vec<ElectionObservation<u64>>) -> ElectionInput<u64> {
+    fn input(local: u64, can_lead: bool, observations: Vec<LeaderWithElectionInfo<u64>>) -> ElectionInput<u64> {
         let local_observation = observation(local, 1, Some(local), Some(vec![local]), 1);
         ElectionInput {
             local_address: local,

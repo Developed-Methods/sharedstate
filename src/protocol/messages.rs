@@ -16,20 +16,19 @@ pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
     MyAddress(A),
     Ping(u64),
     SharePeers(Vec<SharePeerDetails<A>>),
-    WhoIsLeader,
     ShareLeaderPath,
-    ShareElection,
+    ShareLeaderInfo,
     SubscribeFresh,
     SubscribeRecovery(RecoverableStateDetails),
     Action { source: A, action: D::Action },
-    LeaderStatus { address: A, status: LeaderStatus<A> },
+    LeaderInformation { source: A, info: LeaderWithElectionInfo<A> },
 }
 
 #[derive(Clone, Debug)]
 pub enum LeaderStatus<A: SyncIOAddress> {
     Promoted { term: u64, leader: A },
     Offline { term: u64, leader: A },
-    Observation(ElectionObservation<A>),
+    Observation(LeaderWithElectionInfo<A>),
 }
 
 #[derive(Clone, Debug)]
@@ -40,14 +39,14 @@ pub struct LeaderInfoMessage<A: SyncIOAddress> {
 }
 
 #[derive(Clone, Debug)]
-pub struct ElectionObservation<A: SyncIOAddress> {
+pub struct LeaderWithElectionInfo<A: SyncIOAddress> {
     pub observer: A,
     pub term: u64,
     pub leader: Option<A>,
     pub leader_path: Option<Vec<A>>,
     pub can_lead: bool,
     pub reachable_can_lead: Vec<A>,
-    pub state_accept_seq: u64,
+    pub recover_details: RecoverableStateDetails,
 }
 
 #[derive(Clone, Debug)]
@@ -76,11 +75,11 @@ impl<A: SyncIOAddress, D: DeterministicState> Debug for SyncRequest<A, D> {
             Self::SharePeers(peers) => write!(f, "SharePeers({peers:?})"),
             Self::WhoIsLeader => write!(f, "WhoIsLeader"),
             Self::ShareLeaderPath => write!(f, "ShareLeaderPath"),
-            Self::ShareElection => write!(f, "ShareElection"),
+            Self::ShareLeaderInfo => write!(f, "ShareElection"),
             Self::SubscribeFresh => write!(f, "SubscribeFresh"),
             Self::SubscribeRecovery(details) => write!(f, "SubscribeRecovery({details:?})"),
             Self::Action { source, .. } => write!(f, "Action(source: {source:?})"),
-            Self::LeaderStatus { address, status } => {
+            Self::LeaderInformation { address, status } => {
                 write!(f, "LeaderStatus({address:?} {status:?})")
             }
         }
@@ -90,16 +89,17 @@ impl<A: SyncIOAddress, D: DeterministicState> Debug for SyncRequest<A, D> {
 pub enum SyncResponse<A: SyncIOAddress, D: DeterministicState> {
     Pong(u64),
     Ok,
+    FailedToQueueAction { source: A },
     Peers(Vec<SharePeerDetails<A>>),
-    LeaderInfo(LeaderInfoMessage<A>),
-    Election(ElectionObservation<A>),
+    LeaderInfo(LeaderWithElectionInfo<A>),
     LeaderPath(Vec<A>),
     NoPathToLeader,
     Accepted(u64),
-    RecoveryFailed(RecoverableStateDetails),
+    RecoveryFailed,
     FreshState(RecoverableState<D>),
     AuthorityAction(u64, RecoverableStateAction<D::AuthorityAction>),
     ActionStreamClosed,
+    UnexpectedRequest,
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> MessageEncoding for SyncRequest<A, D>
@@ -136,13 +136,13 @@ where
                 sum += 9u16.write_to(out)?;
                 version.write_to(out)?
             }
-            Self::LeaderStatus { address, status } => {
+            Self::LeaderInformation { address, status } => {
                 sum += 10u16.write_to(out)?;
                 sum += address.write_to(out)?;
                 status.write_to(out)?
             }
             Self::WhoIsLeader => 11u16.write_to(out)?,
-            Self::ShareElection => 12u16.write_to(out)?,
+            Self::ShareLeaderInfo => 12u16.write_to(out)?,
         };
 
         Ok(sum)
@@ -161,12 +161,12 @@ where
                 action: MessageEncoding::read_from(read)?,
             },
             9 => Self::ProtocolVersion(MessageEncoding::read_from(read)?),
-            10 => Self::LeaderStatus {
+            10 => Self::LeaderInformation {
                 address: MessageEncoding::read_from(read)?,
                 status: MessageEncoding::read_from(read)?,
             },
             11 => Self::WhoIsLeader,
-            12 => Self::ShareElection,
+            12 => Self::ShareLeaderInfo,
             other => return Err(unknown_id_err(other, "SyncRequest")),
         })
     }
@@ -234,7 +234,7 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderInfoMessage<A> {
     }
 }
 
-impl<A: SyncIOAddress> MessageEncoding for ElectionObservation<A> {
+impl<A: SyncIOAddress> MessageEncoding for LeaderWithElectionInfo<A> {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
         sum += 2u16.write_to(out)?;
@@ -337,7 +337,7 @@ where
                 sum += 11u16.write_to(out)?;
                 info.write_to(out)?
             }
-            Self::Election(observation) => {
+            Self::LeaderInfo(observation) => {
                 sum += 12u16.write_to(out)?;
                 observation.write_to(out)?
             }
@@ -359,7 +359,7 @@ where
             9 => Self::RecoveryFailed(MessageEncoding::read_from(read)?),
             10 => Self::NoPathToLeader,
             11 => Self::LeaderInfo(MessageEncoding::read_from(read)?),
-            12 => Self::Election(MessageEncoding::read_from(read)?),
+            12 => Self::LeaderInfo(MessageEncoding::read_from(read)?),
             other => return Err(unknown_id_err(other, "SyncResponse")),
         })
     }

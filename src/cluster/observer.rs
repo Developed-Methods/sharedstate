@@ -135,8 +135,8 @@ where
             }
         }
 
-        if write.send(SyncRequest::ShareElection).await.is_ok() {
-            if let Some(SyncResponse::Election(observation)) =
+        if write.send(SyncRequest::ShareLeaderInfo).await.is_ok() {
+            if let Some(SyncResponse::LeaderInfo(observation)) =
                 recv_timeout(&mut read, self.inner.timing.rpc_timeout).await
             {
                 self.inner.record_observation(observation).await;

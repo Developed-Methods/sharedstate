@@ -12,7 +12,7 @@ use tokio::{
 
 use crate::{
     cluster::leader::AuthorativeState,
-    protocol::messages::{ElectionObservation, LeaderInfoMessage, SyncRequest, SyncResponse},
+    protocol::messages::{LeaderWithElectionInfo, LeaderInfoMessage, SyncRequest, SyncResponse},
     state::{
         determinstic_state::DeterministicState,
         recoverable_state::RecoverableState,
@@ -57,7 +57,7 @@ pub struct NodeDebugInfo<A: SyncIOAddress> {
     pub follow_leader_path: Option<Vec<A>>,
     pub known_can_lead: Vec<A>,
     pub last_promoted_leader: Option<A>,
-    pub observations: Vec<ElectionObservation<A>>,
+    pub observations: Vec<LeaderWithElectionInfo<A>>,
     pub peers: Vec<PeerDebugInfo<A>>,
 }
 

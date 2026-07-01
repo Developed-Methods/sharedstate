@@ -60,9 +60,9 @@ where
                         break;
                     }
                 }
-                SyncRequest::ShareElection => {
+                SyncRequest::ShareLeaderInfo => {
                     let observation = self.inner.local_observation().await;
-                    if !self.send(SyncResponse::Election(observation)).await {
+                    if !self.send(SyncResponse::LeaderInfo(observation)).await {
                         break;
                     }
                 }
@@ -100,7 +100,7 @@ where
                 SyncRequest::Action { source, action } => {
                     self.handle_action(source, action).await;
                 }
-                SyncRequest::LeaderStatus { address, status } => {
+                SyncRequest::LeaderInformation { address, status } => {
                     self.handle_leader_status(address, status).await;
 
                     if !self.send(SyncResponse::Ok).await {

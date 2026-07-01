@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    protocol::messages::{ElectionObservation, LeaderInfoMessage, SharePeerDetails, SyncRequest},
+    protocol::messages::{LeaderInfoMessage, LeaderWithElectionInfo, SharePeerDetails, SyncRequest},
     state::{determinstic_state::DeterministicState, recoverable_state::RecoverableStateAction},
     transport::traits::SyncIOAddress,
     utils::now_ms,
@@ -49,7 +49,7 @@ pub(crate) struct PeerDetails<A: SyncIOAddress> {
     pub(crate) can_lead: bool,
     pub(crate) connected: bool,
     pub(crate) active_connections: u64,
-    pub(crate) last_observation: Option<ElectionObservation<A>>,
+    pub(crate) last_observation: Option<LeaderWithElectionInfo<A>>,
 }
 
 pub(crate) struct FollowConnection<A: SyncIOAddress, D: DeterministicState> {
@@ -235,7 +235,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         }
     }
 
-    pub(crate) async fn local_observation(&self) -> ElectionObservation<A> {
+    pub(crate) async fn local_observation(&self) -> LeaderWithElectionInfo<A> {
         let (term, leader_addr, leader_path, reachable_can_lead) = {
             let control = self.control.lock().await;
             let leader = control.leader.clone();
@@ -266,7 +266,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         };
         let state_accept_seq = self.state.lock().await.state_clone().await.state().accept_seq();
 
-        ElectionObservation {
+        LeaderWithElectionInfo {
             observer: self.address,
             term,
             leader: leader_addr,
@@ -277,7 +277,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Inner<A, D> {
         }
     }
 
-    pub(crate) async fn record_observation(&self, mut observation: ElectionObservation<A>) {
+    pub(crate) async fn record_observation(&self, mut observation: LeaderWithElectionInfo<A>) {
         let mut control = self.control.lock().await;
         if observation.can_lead {
             control.election.known_can_lead.insert(observation.observer);

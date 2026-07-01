@@ -10,4 +10,6 @@ pub mod state;
 pub mod testing;
 pub mod transport;
 
+pub mod new;
+
 mod utils;
