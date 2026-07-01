@@ -303,6 +303,7 @@ mod tests {
             term,
             leader: Some(leader),
             leader_path: Some(path),
+            vote: Some(leader),
             can_lead: true,
             reachable_can_lead: vec![observer],
             recover_details: RecoverableStateDetails::new(observer, 1),
@@ -482,7 +483,7 @@ mod tests {
         peer.leader_observation = Some(leader_observation(2, 1, 2, vec![2]));
         peers.insert(2, peer);
         let state = node_state(1, false, peers);
-        assert!(state.leader_status.follow_remote(2, 3, vec![2, 1], 2).await);
+        assert!(state.leader_status.follow_remote(2, vec![2, 1], 2).await);
 
         state.clear_peer_leader_observation(2).await;
 

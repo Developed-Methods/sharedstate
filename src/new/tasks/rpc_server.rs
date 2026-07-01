@@ -367,6 +367,7 @@ mod tests {
             term,
             leader: Some(leader),
             leader_path: Some(path),
+            vote: Some(leader),
             can_lead: true,
             reachable_can_lead: vec![observer],
             recover_details: RecoverableStateDetails::new(observer, 1),

@@ -3,7 +3,10 @@ use std::{
     env,
     io::{self, Error, ErrorKind, Stdout, Write},
     iter,
-    sync::{atomic::AtomicU64, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -778,7 +781,7 @@ async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut 
 
     let mut lines = vec![
         format!("address: 127.0.0.1:{}  can_lead: {}", state.my_address, state.can_lead),
-        format!("leader: {}", leader_mode_line(&snapshot.mode)),
+        format!("leader: term={} {}", state.election_term.load(Ordering::Acquire), leader_mode_line(&snapshot.mode)),
         format!("kv: seq={seq} items={item_count}"),
     ];
     if !values_preview.is_empty() {
@@ -791,13 +794,14 @@ async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut 
     } else {
         for peer in peers.values() {
             lines.push(format!(
-                "  {} status={} can_lead={:?} latency_ms={:?} last_global={:?} observed_leader={:?} observed_term={:?}",
+                "  {} status={} can_lead={:?} latency_ms={:?} last_global={:?} observed_leader={:?} observed_vote={:?} observed_term={:?}",
                 peer.addr,
                 connect_status_line(peer.connect_status),
                 peer.can_lead,
                 peer.latency.map(|latency| latency.get()),
                 peer.last_global_connectivity.map(|value| value.get()),
                 peer.leader_observation.as_ref().and_then(|info| info.leader),
+                peer.leader_observation.as_ref().and_then(|info| info.vote),
                 peer.leader_observation.as_ref().map(|info| info.term),
             ));
         }
@@ -816,16 +820,11 @@ fn connect_status_line(status: ConnectStatus) -> String {
 
 fn leader_mode_line(mode: &LeaderMode<u16>) -> String {
     match mode {
-        LeaderMode::NoLeader { term } => format!("NoLeader term={term}"),
-        LeaderMode::Electing { term } => format!("Electing term={term}"),
-        LeaderMode::Leading { term, path } => format!("Leading term={term} path={path:?}"),
-        LeaderMode::Following {
-            term,
-            leader,
-            path,
-            via,
-        } => {
-            format!("Following term={term} leader={leader} via={via} path={path:?}")
+        LeaderMode::NoLeader => "NoLeader".to_owned(),
+        LeaderMode::Electing { vote } => format!("Electing vote={vote:?}"),
+        LeaderMode::Leading { path } => format!("Leading path={path:?}"),
+        LeaderMode::Following { leader, path, via } => {
+            format!("Following leader={leader} via={via} path={path:?}")
         }
     }
 }

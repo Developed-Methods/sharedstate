@@ -2,20 +2,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{protocol::messages::LeaderWithElectionInfo, transport::traits::SyncIOAddress};
 
-#[derive(Clone)]
-struct CandidateRoute<A: SyncIOAddress> {
-    path: Vec<A>,
-    via: A,
-    recover_next_seq: u64,
-}
-
-struct CandidateEvidence<A: SyncIOAddress> {
-    leader: A,
-    agreement_count: u64,
-    max_recover_next_seq: u64,
-    best_route: Option<CandidateRoute<A>>,
-}
-
 #[derive(Clone, Debug)]
 pub struct ElectionInput<A: SyncIOAddress> {
     pub local_address: A,
@@ -24,7 +10,6 @@ pub struct ElectionInput<A: SyncIOAddress> {
     pub local_observation: LeaderWithElectionInfo<A>,
     pub peer_observations: Vec<TimedPeerObservation<A>>,
     pub peer_reachability: HashMap<A, PeerReachability>,
-    pub current_leader: Option<A>,
     pub election_term: u64,
     pub now_ms: u64,
     pub stale_after_ms: u64,
@@ -43,167 +28,190 @@ pub struct PeerReachability {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ElectionDecision<A: SyncIOAddress> {
-    PromoteSelf { term: u64 },
-    FollowRemote { leader: A, term: u64, path: Vec<A>, via: A },
-    BumpTerm { previous_term: u64, inaccessible_leader: A },
-    NoChange,
+pub struct PublishedLeader<A: SyncIOAddress> {
+    pub leader: A,
+    pub path: Vec<A>,
+    pub via: Option<A>,
 }
 
-pub fn decide_election<A: SyncIOAddress>(input: ElectionInput<A>) -> ElectionDecision<A> {
-    let mut candidates: HashMap<A, CandidateEvidence<A>> = HashMap::new();
-    let now_ms = input.now_ms;
-    let stale_after_ms = input.stale_after_ms;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoteTally<A: SyncIOAddress> {
+    pub candidate: A,
+    pub votes: usize,
+    pub majority: usize,
+}
 
-    for observation in std::iter::once(input.local_observation.clone()).chain(
+#[derive(Clone)]
+struct PublishedLeaderEvidence<A: SyncIOAddress> {
+    leader: A,
+    count: usize,
+    max_recover_next_seq: u64,
+    best_path: Option<Vec<A>>,
+    best_via: Option<A>,
+}
+
+pub fn fresh_same_term_observations<A: SyncIOAddress>(input: &ElectionInput<A>) -> Vec<LeaderWithElectionInfo<A>> {
+    let mut observations = Vec::with_capacity(input.peer_observations.len() + 1);
+
+    if input.local_observation.term == input.election_term {
+        observations.push(input.local_observation.clone());
+    }
+
+    observations.extend(
         input
             .peer_observations
             .iter()
             .cloned()
-            .filter_map(|timed| fresh_observation(now_ms, stale_after_ms, timed)),
-    ) {
-        if observation.term != input.election_term {
-            continue;
-        }
+            .filter_map(|timed| fresh_observation(input.now_ms, input.stale_after_ms, timed))
+            .filter(|observation| observation.term == input.election_term),
+    );
+
+    observations
+}
+
+pub fn find_published_leader<A: SyncIOAddress>(input: &ElectionInput<A>) -> Option<PublishedLeader<A>> {
+    let mut evidence: HashMap<A, PublishedLeaderEvidence<A>> = HashMap::new();
+
+    for observation in fresh_same_term_observations(input) {
         let Some(leader) = observation.leader else {
             continue;
         };
-        let Some(path) = &observation.leader_path else {
+        let Some(path) = observation.leader_path.clone() else {
             continue;
         };
 
-        if observation.observer == input.local_address {
-            if !valid_local_leader_path(Some(leader), path, input.local_address) {
+        let route = if observation.observer == input.local_address {
+            if !valid_local_leader_path(Some(leader), &path, input.local_address) {
                 continue;
             }
-        } else if !valid_remote_leader_path(Some(leader), path, observation.observer, input.local_address) {
-            continue;
-        }
+
+            (leader == input.local_address).then_some((path, None))
+        } else {
+            if !valid_remote_leader_path(Some(leader), &path, observation.observer, input.local_address) {
+                continue;
+            }
+
+            Some((append_path(path, input.local_address), Some(observation.observer)))
+        };
 
         let recover_next_seq = observation.recover_details.next_seq();
-        let route = (observation.observer != input.local_address).then(|| CandidateRoute {
-            path: append_path(path.clone(), input.local_address),
-            via: observation.observer,
-            recover_next_seq,
-        });
-
-        candidates
+        evidence
             .entry(leader)
             .and_modify(|candidate| {
-                candidate.agreement_count += 1;
+                candidate.count += 1;
+                let previous_max_recover_next_seq = candidate.max_recover_next_seq;
                 candidate.max_recover_next_seq = candidate.max_recover_next_seq.max(recover_next_seq);
-                if let Some(route) = route.clone() {
-                    let replace_route = candidate.best_route.as_ref().is_none_or(|best_route| {
-                        route
-                            .recover_next_seq
-                            .cmp(&best_route.recover_next_seq)
-                            .then_with(|| best_route.path.len().cmp(&route.path.len()))
-                            .then_with(|| best_route.via.cmp(&route.via))
-                            .is_gt()
-                    });
-                    if replace_route {
-                        candidate.best_route = Some(route);
+                if let Some((path, via)) = &route {
+                    if should_replace_published_route(
+                        candidate.best_path.as_ref(),
+                        candidate.best_via,
+                        previous_max_recover_next_seq,
+                        path,
+                        *via,
+                        recover_next_seq,
+                    ) {
+                        candidate.best_path = Some(path.clone());
+                        candidate.best_via = *via;
                     }
                 }
             })
-            .or_insert_with(|| CandidateEvidence {
-                leader,
-                agreement_count: 1,
-                max_recover_next_seq: recover_next_seq,
-                best_route: route,
+            .or_insert_with(|| {
+                let (best_path, best_via) = route.unzip();
+                PublishedLeaderEvidence {
+                    leader,
+                    count: 1,
+                    max_recover_next_seq: recover_next_seq,
+                    best_path,
+                    best_via: best_via.flatten(),
+                }
             });
     }
 
-    let selected = candidates.into_values().max_by(|a, b| {
-        a.agreement_count
-            .cmp(&b.agreement_count)
-            .then(a.max_recover_next_seq.cmp(&b.max_recover_next_seq))
-            .then_with(|| b.leader.cmp(&a.leader))
-    });
-
-    let reachable_count = input
-        .known_can_lead
-        .iter()
-        .filter(|addr| {
-            peer_is_fresh(**addr, input.local_address, &input.peer_reachability, input.now_ms, input.stale_after_ms)
+    evidence
+        .into_values()
+        .filter(|candidate| candidate.leader == input.local_address || candidate.best_via.is_some())
+        .max_by(|a, b| {
+            a.count
+                .cmp(&b.count)
+                .then(a.max_recover_next_seq.cmp(&b.max_recover_next_seq))
+                .then_with(|| {
+                    let a_len = a.best_path.as_ref().map(Vec::len).unwrap_or(usize::MAX);
+                    let b_len = b.best_path.as_ref().map(Vec::len).unwrap_or(usize::MAX);
+                    b_len.cmp(&a_len)
+                })
+                .then_with(|| b.leader.cmp(&a.leader))
         })
-        .count();
-    let active_can_lead_count = reachable_count.max(usize::from(input.can_lead));
-    let majority = active_can_lead_count / 2 + 1;
-
-    if let Some(candidate) = selected {
-        if candidate.leader == input.local_address {
-            return if input.can_lead && majority <= reachable_count {
-                ElectionDecision::PromoteSelf {
-                    term: input.election_term,
-                }
-            } else {
-                ElectionDecision::NoChange
-            };
-        }
-
-        if let Some(route) = candidate.best_route {
-            return ElectionDecision::FollowRemote {
+        .and_then(|candidate| {
+            Some(PublishedLeader {
                 leader: candidate.leader,
-                term: input.election_term,
-                path: route.path,
-                via: route.via,
-            };
-        }
-
-        return if input.current_leader == Some(candidate.leader)
-            && !peer_is_fresh(
-                candidate.leader,
-                input.local_address,
-                &input.peer_reachability,
-                input.now_ms,
-                input.stale_after_ms,
-            ) {
-            ElectionDecision::BumpTerm {
-                previous_term: input.election_term,
-                inaccessible_leader: candidate.leader,
-            }
-        } else {
-            ElectionDecision::NoChange
-        };
-    }
-
-    if let Some(inaccessible_leader) = inaccessible_current_leader(&input) {
-        return ElectionDecision::BumpTerm {
-            previous_term: input.election_term,
-            inaccessible_leader,
-        };
-    }
-
-    if input
-        .known_can_lead
-        .iter()
-        .find(|addr| {
-            peer_is_fresh(**addr, input.local_address, &input.peer_reachability, input.now_ms, input.stale_after_ms)
+                path: candidate.best_path?,
+                via: candidate.best_via,
+            })
         })
-        .is_some_and(|candidate| *candidate == input.local_address)
-        && input.can_lead
-        && majority <= reachable_count
-    {
-        return ElectionDecision::PromoteSelf {
-            term: input.election_term,
-        };
-    }
-
-    ElectionDecision::NoChange
 }
 
-fn inaccessible_current_leader<A: SyncIOAddress>(input: &ElectionInput<A>) -> Option<A> {
-    let current_leader = input.current_leader?;
-    (current_leader != input.local_address
-        && !peer_is_fresh(
-            current_leader,
-            input.local_address,
-            &input.peer_reachability,
-            input.now_ms,
-            input.stale_after_ms,
-        ))
-    .then_some(current_leader)
+pub fn choose_vote<A: SyncIOAddress>(input: &ElectionInput<A>) -> Option<A> {
+    input.known_can_lead.iter().copied().max_by(|a, b| {
+        connectivity_score(input, *a)
+            .cmp(&connectivity_score(input, *b))
+            .then_with(|| b.cmp(a))
+    })
+}
+
+pub fn tally_votes<A: SyncIOAddress>(input: &ElectionInput<A>) -> Option<VoteTally<A>> {
+    let majority = can_lead_majority(&input.known_can_lead);
+    let mut votes: HashMap<A, usize> = HashMap::new();
+
+    for observation in fresh_same_term_observations(input)
+        .into_iter()
+        .filter(|observation| observation.can_lead)
+    {
+        let Some(candidate) = observation.vote else {
+            continue;
+        };
+        if !input.known_can_lead.contains(&candidate) {
+            continue;
+        }
+        *votes.entry(candidate).or_default() += 1;
+    }
+
+    votes
+        .into_iter()
+        .max_by(|(a_candidate, a_votes), (b_candidate, b_votes)| {
+            a_votes.cmp(b_votes).then_with(|| b_candidate.cmp(a_candidate))
+        })
+        .map(|(candidate, votes)| VoteTally {
+            candidate,
+            votes,
+            majority,
+        })
+}
+
+pub fn leader_offline_vote_count<A: SyncIOAddress>(input: &ElectionInput<A>, leader: A) -> usize {
+    fresh_same_term_observations(input)
+        .into_iter()
+        .filter(|observation| observation.can_lead)
+        .filter(|observation| !observation.reachable_can_lead.contains(&leader))
+        .count()
+}
+
+pub fn can_lead_majority<A: SyncIOAddress>(known_can_lead: &BTreeSet<A>) -> usize {
+    known_can_lead.len() / 2 + 1
+}
+
+pub fn peer_is_fresh<A: SyncIOAddress>(
+    addr: A,
+    local: A,
+    reachability: &HashMap<A, PeerReachability>,
+    now_ms: u64,
+    stale_after_ms: u64,
+) -> bool {
+    addr == local
+        || reachability
+            .get(&addr)
+            .and_then(|reachability| reachability.last_activity_ms)
+            .map(|ts| now_ms.saturating_sub(ts) <= stale_after_ms)
+            .unwrap_or(false)
 }
 
 pub fn valid_remote_leader_path<A: SyncIOAddress>(leader: Option<A>, path: &[A], remote: A, local: A) -> bool {
@@ -253,19 +261,40 @@ pub fn append_path<A: SyncIOAddress>(mut path: Vec<A>, local: A) -> Vec<A> {
     path
 }
 
-fn peer_is_fresh<A: SyncIOAddress>(
-    addr: A,
-    local: A,
-    reachability: &HashMap<A, PeerReachability>,
-    now_ms: u64,
-    stale_after_ms: u64,
+fn connectivity_score<A: SyncIOAddress>(input: &ElectionInput<A>, candidate: A) -> usize {
+    fresh_same_term_observations(input)
+        .into_iter()
+        .filter(|observation| observation.can_lead)
+        .filter(|observation| observation.reachable_can_lead.contains(&candidate))
+        .count()
+}
+
+fn should_replace_published_route<A: SyncIOAddress>(
+    best_path: Option<&Vec<A>>,
+    best_via: Option<A>,
+    best_recover_next_seq: u64,
+    path: &[A],
+    via: Option<A>,
+    recover_next_seq: u64,
 ) -> bool {
-    addr == local
-        || reachability
-            .get(&addr)
-            .and_then(|reachability| reachability.last_activity_ms)
-            .map(|ts| now_ms.saturating_sub(ts) <= stale_after_ms)
-            .unwrap_or(false)
+    let Some(best_path) = best_path else {
+        return true;
+    };
+
+    recover_next_seq
+        .cmp(&best_recover_next_seq)
+        .then_with(|| best_path.len().cmp(&path.len()))
+        .then_with(|| compare_optional_via(best_via, via))
+        .is_gt()
+}
+
+fn compare_optional_via<A: SyncIOAddress>(a: Option<A>, b: Option<A>) -> std::cmp::Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => b.cmp(&a),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
 }
 
 fn fresh_observation<A: SyncIOAddress>(
@@ -302,6 +331,9 @@ mod tests {
         term: u64,
         leader: Option<u64>,
         path: Option<Vec<u64>>,
+        vote: Option<u64>,
+        can_lead: bool,
+        reachable_can_lead: Vec<u64>,
         recover_next_seq: u64,
     ) -> LeaderWithElectionInfo<u64> {
         LeaderWithElectionInfo {
@@ -309,14 +341,15 @@ mod tests {
             term,
             leader,
             leader_path: path,
-            can_lead: observer <= 3,
-            reachable_can_lead: vec![],
+            vote,
+            can_lead,
+            reachable_can_lead,
             recover_details: details(recover_next_seq),
         }
     }
 
     fn input(local: u64, can_lead: bool, observations: Vec<LeaderWithElectionInfo<u64>>) -> ElectionInput<u64> {
-        let local_observation = observation(local, 1, Some(local), Some(vec![local]), 1);
+        let local_observation = observation(local, 1, None, None, None, can_lead, vec![local], 1);
         ElectionInput {
             local_address: local,
             can_lead,
@@ -341,7 +374,6 @@ mod tests {
                     )
                 })
                 .collect(),
-            current_leader: None,
             election_term: 1,
             now_ms: 100,
             stale_after_ms: 50,
@@ -366,159 +398,145 @@ mod tests {
     }
 
     #[test]
-    fn agreement_count_beats_higher_term() {
-        let decision = decide_election(input(
+    fn fresh_same_term_observations_ignore_stale_and_other_terms() {
+        let mut input = input(
             1,
             true,
             vec![
-                observation(2, 1, Some(2), Some(vec![2]), 9),
-                observation(3, 1, Some(1), Some(vec![1, 3]), 1),
+                observation(2, 1, None, None, Some(2), true, vec![2], 1),
+                observation(3, 2, None, None, Some(3), true, vec![3], 1),
             ],
-        ));
-
-        assert_eq!(decision, ElectionDecision::PromoteSelf { term: 1 });
-    }
-
-    #[test]
-    fn ignores_observations_from_other_terms() {
-        let decision = decide_election(input(1, true, vec![observation(2, 2, Some(2), Some(vec![2]), 9)]));
-
-        assert_eq!(decision, ElectionDecision::PromoteSelf { term: 1 });
-    }
-
-    #[test]
-    fn follows_existing_remote_leader_for_target_term() {
-        let decision = decide_election(input(
-            3,
-            true,
-            vec![
-                observation(1, 1, Some(1), Some(vec![1]), 1),
-                observation(2, 1, Some(2), Some(vec![2]), 9),
-            ],
-        ));
-
-        assert_eq!(
-            decision,
-            ElectionDecision::FollowRemote {
-                leader: 2,
-                term: 1,
-                path: vec![2, 3],
-                via: 2,
-            }
         );
+        input.peer_observations[0].last_activity_ms = Some(40);
+
+        let observations = fresh_same_term_observations(&input);
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].observer, 1);
     }
 
     #[test]
-    fn lower_address_breaks_exact_tie() {
-        let decision = decide_election(input(
+    fn find_published_leader_returns_remote_route() {
+        let input = input(
             3,
             true,
-            vec![
-                observation(1, 1, Some(1), Some(vec![1]), 1),
-                observation(2, 1, Some(2), Some(vec![2]), 1),
-            ],
-        ));
+            vec![observation(
+                2,
+                1,
+                Some(1),
+                Some(vec![1, 2]),
+                Some(1),
+                true,
+                vec![1, 2],
+                1,
+            )],
+        );
 
         assert_eq!(
-            decision,
-            ElectionDecision::FollowRemote {
+            find_published_leader(&input),
+            Some(PublishedLeader {
                 leader: 1,
-                term: 1,
-                path: vec![1, 3],
-                via: 1,
-            }
+                path: vec![1, 2, 3],
+                via: Some(2),
+            })
         );
     }
 
     #[test]
-    fn stale_observations_are_ignored() {
-        let mut input = input(1, true, vec![observation(2, 9, Some(2), Some(vec![2]), 9)]);
-        input.peer_observations[0].last_activity_ms = Some(1);
-
-        assert_eq!(decide_election(input), ElectionDecision::PromoteSelf { term: 1 });
-    }
-
-    #[test]
-    fn invalid_paths_are_ignored() {
-        let decision = decide_election(input(1, true, vec![observation(2, 1, Some(2), Some(vec![2, 1]), 9)]));
-
-        assert_eq!(decision, ElectionDecision::PromoteSelf { term: 1 });
-    }
-
-    #[test]
-    fn no_leader_waits_for_lower_remote_candidate_to_publish() {
-        let mut input = input(2, true, vec![observation(1, 1, None, None, 1)]);
-        input.local_observation.leader = None;
-        input.local_observation.leader_path = None;
-
-        assert_eq!(decide_election(input), ElectionDecision::NoChange);
-    }
-
-    #[test]
-    fn local_promotion_requires_can_lead() {
-        let decision = decide_election(input(4, false, vec![]));
-
-        assert_eq!(decision, ElectionDecision::NoChange);
-    }
-
-    #[test]
-    fn local_restatement_of_remote_leader_without_route_does_not_clear() {
-        let mut input = input(1, false, vec![]);
-        input.local_observation = observation(1, 1, Some(2), Some(vec![2, 1]), 1);
-        input.current_leader = Some(2);
-
-        assert_eq!(decide_election(input), ElectionDecision::NoChange);
-    }
-
-    #[test]
-    fn inaccessible_current_leader_requests_term_bump() {
-        let mut input = input(1, false, vec![]);
-        input.local_observation = observation(1, 1, Some(2), Some(vec![2, 1]), 1);
-        input.current_leader = Some(2);
-        input.peer_reachability.insert(
-            2,
-            PeerReachability {
-                last_activity_ms: Some(1),
-            },
-        );
-
-        assert_eq!(
-            decide_election(input),
-            ElectionDecision::BumpTerm {
-                previous_term: 1,
-                inaccessible_leader: 2,
-            }
-        );
-    }
-
-    #[test]
-    fn no_leader_promotes_local_lowest_fresh_candidate_for_term() {
-        let mut input = input(1, true, vec![]);
-        input.local_observation.leader = None;
-        input.local_observation.leader_path = None;
-
-        assert_eq!(decide_election(input), ElectionDecision::PromoteSelf { term: 1 });
-    }
-
-    #[test]
-    fn same_term_candidate_tie_uses_agreement_then_recover_then_address() {
-        let decision = decide_election(input(
+    fn find_published_leader_prefers_most_published_observations() {
+        let input = input(
             4,
             true,
             vec![
-                observation(1, 1, Some(1), Some(vec![1]), 1),
-                observation(2, 1, Some(2), Some(vec![2]), 9),
+                observation(1, 1, Some(1), Some(vec![1]), Some(1), true, vec![1], 1),
+                observation(2, 1, Some(2), Some(vec![2]), Some(2), true, vec![2], 9),
+                observation(3, 1, Some(1), Some(vec![1, 3]), Some(1), true, vec![1, 3], 1),
             ],
-        ));
+        );
+
+        assert_eq!(find_published_leader(&input).unwrap().leader, 1);
+    }
+
+    #[test]
+    fn choose_vote_prefers_candidate_with_most_reachable_can_lead_reports() {
+        let input = input(
+            1,
+            true,
+            vec![
+                observation(2, 1, None, None, None, true, vec![2, 3], 1),
+                observation(3, 1, None, None, None, true, vec![3], 1),
+            ],
+        );
+
+        assert_eq!(choose_vote(&input), Some(3));
+    }
+
+    #[test]
+    fn choose_vote_breaks_tie_by_lowest_address() {
+        let input = input(
+            1,
+            true,
+            vec![
+                observation(2, 1, None, None, None, true, vec![2], 1),
+                observation(3, 1, None, None, None, true, vec![3], 1),
+            ],
+        );
+
+        assert_eq!(choose_vote(&input), Some(1));
+    }
+
+    #[test]
+    fn tally_votes_counts_only_can_lead_observers() {
+        let input = input(
+            1,
+            true,
+            vec![
+                observation(2, 1, None, None, Some(2), true, vec![2], 1),
+                observation(4, 1, None, None, Some(2), false, vec![2], 1),
+            ],
+        );
 
         assert_eq!(
-            decision,
-            ElectionDecision::FollowRemote {
-                leader: 2,
-                term: 1,
-                path: vec![2, 4],
-                via: 2,
-            }
+            tally_votes(&input),
+            Some(VoteTally {
+                candidate: 2,
+                votes: 1,
+                majority: 2,
+            })
         );
+    }
+
+    #[test]
+    fn tally_votes_detects_majority() {
+        let mut input = input(
+            1,
+            true,
+            vec![
+                observation(2, 1, None, None, Some(2), true, vec![2], 1),
+                observation(3, 1, None, None, Some(2), true, vec![2], 1),
+            ],
+        );
+        input.local_observation.vote = Some(1);
+
+        let tally = tally_votes(&input).unwrap();
+
+        assert_eq!(tally.candidate, 2);
+        assert_eq!(tally.votes, 2);
+        assert_eq!(tally.majority, 2);
+    }
+
+    #[test]
+    fn leader_offline_vote_count_counts_can_lead_observers_missing_leader() {
+        let input = input(
+            1,
+            true,
+            vec![
+                observation(2, 1, None, None, Some(2), true, vec![2], 1),
+                observation(3, 1, None, None, Some(3), true, vec![3], 1),
+                observation(4, 1, None, None, Some(3), false, vec![3], 1),
+            ],
+        );
+
+        assert_eq!(leader_offline_vote_count(&input, 1), 2);
     }
 }

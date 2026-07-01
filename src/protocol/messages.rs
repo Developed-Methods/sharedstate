@@ -46,6 +46,7 @@ pub struct LeaderWithElectionInfo<A: SyncIOAddress> {
     pub term: u64,
     pub leader: Option<A>,
     pub leader_path: Option<Vec<A>>,
+    pub vote: Option<A>,
     pub can_lead: bool,
     pub reachable_can_lead: Vec<A>,
     pub recover_details: RecoverableStateDetails,
@@ -256,11 +257,12 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderInfoMessage<A> {
 impl<A: SyncIOAddress> MessageEncoding for LeaderWithElectionInfo<A> {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
-        sum += 2u16.write_to(out)?;
+        sum += 3u16.write_to(out)?;
         sum += self.observer.write_to(out)?;
         sum += self.term.write_to(out)?;
         sum += self.leader.write_to(out)?;
         sum += write_opt_vec(&self.leader_path, out)?;
+        sum += self.vote.write_to(out)?;
         sum += self.can_lead.write_to(out)?;
         sum += write_vec(&self.reachable_can_lead, out)?;
         sum += self.recover_details.write_to(out)?;
@@ -269,7 +271,7 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderWithElectionInfo<A> {
 
     fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
         let version = u16::read_from(read)?;
-        if version != 2 {
+        if version != 3 {
             return Err(unknown_version_err(version, "ElectionObservation"));
         }
 
@@ -278,6 +280,7 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderWithElectionInfo<A> {
             term: MessageEncoding::read_from(read)?,
             leader: MessageEncoding::read_from(read)?,
             leader_path: read_opt_vec(read)?,
+            vote: MessageEncoding::read_from(read)?,
             can_lead: MessageEncoding::read_from(read)?,
             reachable_can_lead: read_vec(read)?,
             recover_details: MessageEncoding::read_from(read)?,
@@ -473,6 +476,7 @@ mod tests {
             term: 2,
             leader: Some(3),
             leader_path: Some(vec![3, 1]),
+            vote: Some(3),
             can_lead: true,
             reachable_can_lead: vec![1, 3],
             recover_details: RecoverableStateDetails::new(1, 1),
@@ -483,6 +487,26 @@ mod tests {
         let mut bytes = Vec::new();
         message.write_to(&mut bytes).unwrap();
         u16::read_from(&mut &bytes[..]).unwrap()
+    }
+
+    #[test]
+    fn leader_info_encoding_version_three_roundtrips_vote() {
+        let info = leader_info();
+        let mut bytes = Vec::new();
+
+        info.write_to(&mut bytes).unwrap();
+
+        assert_eq!(u16::read_from(&mut &bytes[..]).unwrap(), 3);
+
+        let decoded: LeaderWithElectionInfo<u64> = LeaderWithElectionInfo::read_from(&mut &bytes[..]).unwrap();
+        assert_eq!(decoded.observer, info.observer);
+        assert_eq!(decoded.term, info.term);
+        assert_eq!(decoded.leader, info.leader);
+        assert_eq!(decoded.leader_path, info.leader_path);
+        assert_eq!(decoded.vote, info.vote);
+        assert_eq!(decoded.can_lead, info.can_lead);
+        assert_eq!(decoded.reachable_can_lead, info.reachable_can_lead);
+        assert_eq!(decoded.recover_details.next_seq(), info.recover_details.next_seq());
     }
 
     #[test]
