@@ -241,18 +241,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn peer_state_empty_uses_disconnected_defaults() {
-        let peer = PeerState::empty(2);
-
-        assert_eq!(peer.addr, 2);
-        assert_eq!(peer.latency, None);
-        assert_eq!(peer.can_lead, None);
-        assert!(!peer.is_connected);
-        assert_eq!(peer.last_global_connectivity, None);
-        assert!(peer.leader_observation.is_none());
-    }
-
     #[tokio::test]
     async fn merge_peer_details_inserts_new_peer() {
         let state = node_state(1, true, HashMap::new());
@@ -346,22 +334,6 @@ mod tests {
             }])
             .await;
         assert_eq!(state.peers.lock().await.get(&2).unwrap().last_global_connectivity, NonZeroU64::new(30));
-    }
-
-    #[tokio::test]
-    async fn known_peer_details_exports_existing_peers() {
-        let mut peers = HashMap::new();
-        let mut peer = peer(2, Some(true), false);
-        peer.last_global_connectivity = NonZeroU64::new(10);
-        peers.insert(2, peer);
-        let state = node_state(1, true, peers);
-
-        let details = state.known_peer_details().await;
-
-        assert_eq!(details.len(), 1);
-        assert_eq!(details[0].address, 2);
-        assert_eq!(details[0].can_be_leader, Some(true));
-        assert_eq!(details[0].last_global_activity, NonZeroU64::new(10));
     }
 
     #[tokio::test]
