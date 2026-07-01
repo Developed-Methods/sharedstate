@@ -75,6 +75,14 @@ where
     }
 
     pub async fn run(self) {
+        tracing::debug!(
+            local = ?self.state.my_address,
+            interval_ms = self.timing.observation_interval.as_millis(),
+            stale_after_ms = self.timing.observation_stale_after.as_millis(),
+            max_concurrent = self.timing.max_concurrent_observations,
+            "starting peer discovery and election task",
+        );
+
         loop {
             self.tick().await;
             tokio::time::sleep(self.timing.observation_interval).await;
@@ -82,18 +90,28 @@ where
     }
 
     pub async fn tick(&self) {
+        tracing::debug!(local = ?self.state.my_address, "starting peer discovery election tick");
         self.observe_peers().await;
         self.apply_election().await;
+        tracing::debug!(local = ?self.state.my_address, "finished peer discovery election tick");
     }
 
     pub async fn observe_peers(&self) {
         let targets = self.observation_targets().await;
         if targets.is_empty() {
+            tracing::debug!(local = ?self.state.my_address, "no peer discovery observation targets");
             return;
         }
 
         let share_peers = self.local_share_peers().await;
         let max_concurrent = self.timing.max_concurrent_observations.max(1);
+        tracing::debug!(
+            local = ?self.state.my_address,
+            ?targets,
+            share_peer_count = share_peers.len(),
+            max_concurrent,
+            "observing peers",
+        );
 
         stream::iter(targets.into_iter().map(|peer| {
             let state = self.state.clone();
@@ -162,7 +180,20 @@ where
             .await;
         let election_term = self.state.leader_status.current_term().await;
 
-        match decide_election(ElectionInput {
+        tracing::debug!(
+            local = ?self.state.my_address,
+            can_lead = self.state.can_lead,
+            election_term,
+            local_leader = ?local_observation.leader,
+            local_leader_path = ?local_observation.leader_path,
+            known_can_lead = ?known_can_lead,
+            peer_observation_count = peer_observations.len(),
+            peer_reachability_count = peer_reachability.len(),
+            stale_after_ms,
+            "applying leader election",
+        );
+
+        let decision = decide_election(ElectionInput {
             local_address: self.state.my_address,
             can_lead: self.state.can_lead,
             known_can_lead,
@@ -172,14 +203,33 @@ where
             election_term,
             now_ms: now,
             stale_after_ms,
-        }) {
+        });
+        tracing::debug!(
+            local = ?self.state.my_address,
+            ?decision,
+            "leader election decision",
+        );
+
+        match decision {
             ElectionDecision::PromoteSelf { observed_term } => {
                 if self.state.leader_status.leader().await == Some(self.state.my_address) {
+                    tracing::debug!(
+                        local = ?self.state.my_address,
+                        observed_term,
+                        "already leading; skipping self-promotion",
+                    );
                     return;
                 }
 
                 let term = self.state.leader_status.begin_election(observed_term).await;
                 let new_id = new_generation_id(self.state.my_address, term);
+                tracing::debug!(
+                    local = ?self.state.my_address,
+                    observed_term,
+                    term,
+                    new_id,
+                    "promoting self to leader",
+                );
                 self.state
                     .state
                     .update(iter::once(RecoverableStateAction::BumpGeneration { new_id }))
@@ -192,12 +242,33 @@ where
                 path,
                 via,
             } => {
-                self.state.leader_status.follow_remote(leader, term, path, via).await;
+                let accepted = self
+                    .state
+                    .leader_status
+                    .follow_remote(leader, term, path.clone(), via)
+                    .await;
+                tracing::debug!(
+                    local = ?self.state.my_address,
+                    ?leader,
+                    term,
+                    ?path,
+                    ?via,
+                    accepted,
+                    "following remote leader",
+                );
             }
             ElectionDecision::ClearRemoteLeader { leader } => {
-                self.state.leader_status.clear_if_leader(leader).await;
+                let cleared = self.state.leader_status.clear_if_leader(leader).await;
+                tracing::debug!(
+                    local = ?self.state.my_address,
+                    ?leader,
+                    cleared,
+                    "clearing remote leader status",
+                );
             }
-            ElectionDecision::NoChange => {}
+            ElectionDecision::NoChange => {
+                tracing::debug!(local = ?self.state.my_address, "leader election made no state change");
+            }
         }
     }
 
@@ -208,7 +279,7 @@ where
         let mut targets = if self.state.can_lead || leader_path.is_none() {
             peers.keys().copied().collect::<Vec<_>>()
         } else {
-            let mut targets = leader_path.unwrap_or_default();
+            let mut targets = leader_path.clone().unwrap_or_default();
             targets.extend(
                 peers
                     .values()
@@ -220,6 +291,13 @@ where
         targets.retain(|addr| *addr != self.state.my_address);
         targets.sort();
         targets.dedup();
+        tracing::debug!(
+            local = ?self.state.my_address,
+            can_lead = self.state.can_lead,
+            leader_path = ?leader_path,
+            ?targets,
+            "selected peer discovery observation targets",
+        );
         targets
     }
 
@@ -236,6 +314,11 @@ where
             can_be_leader: peer.can_lead,
             last_global_activity: peer.last_global_connectivity,
         }));
+        tracing::debug!(
+            local = ?self.state.my_address,
+            share_peer_count = share.len(),
+            "built local peer discovery share list",
+        );
         share
     }
 }
@@ -251,13 +334,36 @@ async fn observe_peer<I, D>(
     D::Action: MessageEncoding,
     D::AuthorityAction: MessageEncoding,
 {
+    tracing::debug!(local = ?state.my_address, ?peer, "observing peer");
     let started = now_ms();
     match peer_connections.send_rpc(peer, SyncRequest::Ping(started)).await {
         Ok(SyncResponse::Pong(id)) if id == started => {
             let latency = NonZeroU64::new(now_ms().saturating_sub(started).max(1));
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                latency_ms = latency.map(NonZeroU64::get),
+                "peer ping succeeded",
+            );
             mark_connected(&state, peer, latency).await;
         }
-        _ => {
+        Ok(response) => {
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                response = response_name(&response),
+                "peer ping returned unexpected response",
+            );
+            mark_disconnected(&state, peer).await;
+            return;
+        }
+        Err(error) => {
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                ?error,
+                "peer ping failed",
+            );
             mark_disconnected(&state, peer).await;
             return;
         }
@@ -267,8 +373,32 @@ async fn observe_peer<I, D>(
         .send_rpc(peer, SyncRequest::SharePeers(share_peers))
         .await
     {
-        Ok(SyncResponse::Peers(peers)) => merge_peer_details(&state, peers).await,
-        _ => {
+        Ok(SyncResponse::Peers(peers)) => {
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                peer_count = peers.len(),
+                "peer shared peer details",
+            );
+            merge_peer_details(&state, peers).await;
+        }
+        Ok(response) => {
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                response = response_name(&response),
+                "share peers returned unexpected response",
+            );
+            mark_disconnected(&state, peer).await;
+            return;
+        }
+        Err(error) => {
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                ?error,
+                "share peers request failed",
+            );
             mark_disconnected(&state, peer).await;
             return;
         }
@@ -276,6 +406,17 @@ async fn observe_peer<I, D>(
 
     match peer_connections.send_rpc(peer, SyncRequest::ShareLeaderInfo).await {
         Ok(SyncResponse::LeaderInfo(info)) if info.observer == peer => {
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                observer = ?info.observer,
+                leader = ?info.leader,
+                leader_path = ?info.leader_path,
+                term = info.term,
+                can_lead = info.can_lead,
+                reachable_can_lead = ?info.reachable_can_lead,
+                "peer shared leader info",
+            );
             let mut peers = state.peers.lock().await;
             let peer_state = peers.entry(peer).or_insert_with(|| empty_peer_state(peer));
             peer_state.is_connected = true;
@@ -283,7 +424,22 @@ async fn observe_peer<I, D>(
             peer_state.last_global_connectivity = NonZeroU64::new(now_ms());
             peer_state.leader_observation = Some(info);
         }
-        _ => {
+        Ok(response) => {
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                response = response_name(&response),
+                "share leader info returned unexpected response",
+            );
+            mark_disconnected(&state, peer).await;
+        }
+        Err(error) => {
+            tracing::debug!(
+                local = ?state.my_address,
+                ?peer,
+                ?error,
+                "share leader info request failed",
+            );
             mark_disconnected(&state, peer).await;
         }
     }
@@ -299,6 +455,12 @@ where
     peer_state.is_connected = true;
     peer_state.latency = latency;
     peer_state.last_global_connectivity = NonZeroU64::new(now_ms());
+    tracing::debug!(
+        local = ?state.my_address,
+        ?peer,
+        latency_ms = latency.map(NonZeroU64::get),
+        "marked peer connected",
+    );
 }
 
 async fn mark_disconnected<A, D>(state: &NodeState<A, D>, peer: A)
@@ -312,8 +474,15 @@ where
         peer_state.is_connected = false;
         peer_state.leader_observation = None;
     }
-    state.leader_status.clear_if_via(peer).await;
-    state.leader_status.clear_if_leader(peer).await;
+    let cleared_via = state.leader_status.clear_if_via(peer).await;
+    let cleared_leader = state.leader_status.clear_if_leader(peer).await;
+    tracing::debug!(
+        local = ?state.my_address,
+        ?peer,
+        cleared_via,
+        cleared_leader,
+        "marked peer disconnected",
+    );
 }
 
 async fn merge_peer_details<A, D>(state: &NodeState<A, D>, shared_peers: Vec<SharePeerDetails<A>>)
@@ -322,14 +491,19 @@ where
     D: DeterministicState,
 {
     let mut peers = state.peers.lock().await;
+    let shared_count = shared_peers.len();
+    let mut inserted = 0usize;
+    let mut updated = 0usize;
     for shared in shared_peers {
         if shared.address == state.my_address {
             continue;
         }
 
-        let peer_state = peers
-            .entry(shared.address)
-            .or_insert_with(|| empty_peer_state(shared.address));
+        let peer_state = peers.entry(shared.address).or_insert_with(|| {
+            inserted += 1;
+            empty_peer_state(shared.address)
+        });
+        updated += 1;
         if let Some(can_lead) = shared.can_be_leader {
             peer_state.can_lead = Some(can_lead);
         }
@@ -338,6 +512,31 @@ where
             (Some(a), Some(b)) => Some(a.max(b)),
             (None, None) => None,
         };
+    }
+    tracing::debug!(
+        local = ?state.my_address,
+        shared_count,
+        inserted,
+        updated,
+        "merged shared peer details",
+    );
+}
+
+fn response_name<A: SyncIOAddress, D: DeterministicState>(response: &SyncResponse<A, D>) -> &'static str {
+    match response {
+        SyncResponse::Pong(_) => "Pong",
+        SyncResponse::Ok => "Ok",
+        SyncResponse::FailedToQueueAction { .. } => "FailedToQueueAction",
+        SyncResponse::Peers(_) => "Peers",
+        SyncResponse::LeaderInfo(_) => "LeaderInfo",
+        SyncResponse::LeaderPath(_) => "LeaderPath",
+        SyncResponse::NoPathToLeader => "NoPathToLeader",
+        SyncResponse::Accepted(_) => "Accepted",
+        SyncResponse::RecoveryFailed => "RecoveryFailed",
+        SyncResponse::FreshState(_) => "FreshState",
+        SyncResponse::AuthorityAction(_, _) => "AuthorityAction",
+        SyncResponse::ActionStreamClosed => "ActionStreamClosed",
+        SyncResponse::UnexpectedRequest => "UnexpectedRequest",
     }
 }
 
