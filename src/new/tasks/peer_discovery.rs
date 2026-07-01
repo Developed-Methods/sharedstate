@@ -6,15 +6,22 @@ use tokio::sync::Mutex;
 
 use crate::{
     new::{
-        node_state::NodeState,
+        node_state::{ConnectStatus, NodeState, PeerState},
         subscribable_state::StateHandle,
         tasks::{current_leader::local_leader_observation, peer_connections::PeerConnections},
     },
     protocol::messages::SharePeerDetails,
     state::determinstic_state::DeterministicState,
-    transport::traits::SyncIO,
+    transport::traits::{SyncIO, SyncIOAddress},
     utils::now_ms,
 };
+
+const RECENT_GLOBAL_CONNECTIVITY_WINDOW: Duration = Duration::from_secs(60);
+const STALE_GLOBAL_CONNECTIVITY_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+const FAILED_CONNECT_RETRY_RECENT: Duration = Duration::from_secs(10);
+const FAILED_CONNECT_RETRY_STALE: Duration = Duration::from_secs(30);
+const FAILED_CONNECT_RETRY_OLD_OR_UNKNOWN: Duration = Duration::from_secs(60);
 
 pub struct PeerDiscoveryTask<I: SyncIO, D: DeterministicState> {
     state: Arc<NodeState<I::Address, D>>,
@@ -131,11 +138,27 @@ where
         targets.retain(|addr| *addr != self.state.my_address);
         targets.sort();
         targets.dedup();
+
+        let now = now_ms();
+        let mut skipped_failed_connect = Vec::new();
+        targets.retain(|addr| {
+            let Some(peer) = peers.get(addr) else {
+                return true;
+            };
+
+            let include = should_observe_peer(peer, now);
+            if !include {
+                skipped_failed_connect.push(*addr);
+            }
+            include
+        });
+
         tracing::debug!(
             local = ?self.state.my_address,
             can_lead = self.state.can_lead,
             leader_path = ?leader_path,
             ?targets,
+            ?skipped_failed_connect,
             "selected peer discovery observation targets",
         );
         targets
@@ -150,6 +173,35 @@ where
         );
         share
     }
+}
+
+fn should_observe_peer<A: SyncIOAddress>(peer: &PeerState<A>, now: u64) -> bool {
+    match peer.connect_status {
+        ConnectStatus::Connected { .. } | ConnectStatus::NotConnected => true,
+        ConnectStatus::FailedToConnect { epoch_ms } => {
+            let retry_delay = failed_connect_retry_delay(peer.last_global_connectivity, now);
+            now.saturating_sub(epoch_ms) >= duration_ms(retry_delay)
+        }
+    }
+}
+
+fn failed_connect_retry_delay(last_global_connectivity: Option<NonZeroU64>, now: u64) -> Duration {
+    let Some(last_global_connectivity) = last_global_connectivity else {
+        return FAILED_CONNECT_RETRY_OLD_OR_UNKNOWN;
+    };
+
+    let age = now.saturating_sub(last_global_connectivity.get());
+    if age <= duration_ms(RECENT_GLOBAL_CONNECTIVITY_WINDOW) {
+        FAILED_CONNECT_RETRY_RECENT
+    } else if age <= duration_ms(STALE_GLOBAL_CONNECTIVITY_WINDOW) {
+        FAILED_CONNECT_RETRY_STALE
+    } else {
+        FAILED_CONNECT_RETRY_OLD_OR_UNKNOWN
+    }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 async fn observe_peer<I, D>(
@@ -296,7 +348,6 @@ mod tests {
     use super::*;
     use crate::{
         new::{
-            node_state::{ConnectStatus, PeerState},
             subscribable_state::SubscribableState,
             tasks::{current_leader::CurrentLeaderStatus, peer_connections::PeerConnections},
         },
@@ -454,16 +505,30 @@ mod tests {
     }
 
     fn peer(addr: u64, can_lead: Option<bool>, connected: bool) -> PeerState<u64> {
-        PeerState {
+        peer_with_status(
             addr,
-            latency: None,
             can_lead,
-            connect_status: if connected {
+            if connected {
                 ConnectStatus::Connected { epoch_ms: 100 }
             } else {
                 ConnectStatus::NotConnected
             },
-            last_global_connectivity: connected.then(|| NonZeroU64::new(now_ms()).unwrap()),
+            connected.then(|| NonZeroU64::new(now_ms()).unwrap()),
+        )
+    }
+
+    fn peer_with_status(
+        addr: u64,
+        can_lead: Option<bool>,
+        connect_status: ConnectStatus,
+        last_global_connectivity: Option<NonZeroU64>,
+    ) -> PeerState<u64> {
+        PeerState {
+            addr,
+            latency: None,
+            can_lead,
+            connect_status,
+            last_global_connectivity,
             leader_observation: None,
         }
     }
@@ -478,6 +543,118 @@ mod tests {
             reachable_can_lead: vec![observer],
             recover_details: RecoverableStateDetails::new(observer, 1),
         }
+    }
+
+    #[test]
+    fn failed_connect_retry_delay_is_short_for_recent_global_connectivity() {
+        let now = 100_000;
+        let last_global_connectivity = NonZeroU64::new(now - 1_000);
+
+        assert_eq!(failed_connect_retry_delay(last_global_connectivity, now), FAILED_CONNECT_RETRY_RECENT);
+    }
+
+    #[test]
+    fn failed_connect_retry_delay_is_medium_for_stale_global_connectivity() {
+        let now = 200_000;
+        let last_global_connectivity = NonZeroU64::new(now - 120_000);
+
+        assert_eq!(failed_connect_retry_delay(last_global_connectivity, now), FAILED_CONNECT_RETRY_STALE);
+    }
+
+    #[test]
+    fn failed_connect_retry_delay_is_long_for_old_or_unknown_global_connectivity() {
+        let now = 400_000;
+
+        assert_eq!(failed_connect_retry_delay(None, now), FAILED_CONNECT_RETRY_OLD_OR_UNKNOWN);
+        assert_eq!(
+            failed_connect_retry_delay(NonZeroU64::new(now - duration_ms(STALE_GLOBAL_CONNECTIVITY_WINDOW) - 1), now),
+            FAILED_CONNECT_RETRY_OLD_OR_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn should_observe_peer_skips_recent_failed_connect() {
+        let now = 100_000;
+        let peer = peer_with_status(2, Some(true), ConnectStatus::FailedToConnect { epoch_ms: now - 1_000 }, None);
+
+        assert!(!should_observe_peer(&peer, now));
+    }
+
+    #[test]
+    fn should_observe_peer_retries_failed_connect_after_delay() {
+        let now = 100_000;
+        let peer = peer_with_status(2, Some(true), ConnectStatus::FailedToConnect { epoch_ms: now - 61_000 }, None);
+
+        assert!(should_observe_peer(&peer, now));
+    }
+
+    #[test]
+    fn should_observe_peer_includes_connected_and_not_connected() {
+        let now = 100_000;
+        let connected = peer_with_status(2, Some(true), ConnectStatus::Connected { epoch_ms: 1 }, None);
+        let not_connected = peer_with_status(3, Some(true), ConnectStatus::NotConnected, None);
+
+        assert!(should_observe_peer(&connected, now));
+        assert!(should_observe_peer(&not_connected, now));
+    }
+
+    #[tokio::test]
+    async fn observation_targets_skip_failed_connect_until_retry_delay() {
+        let mut peers = HashMap::new();
+        peers.insert(2, peer_with_status(2, Some(true), ConnectStatus::FailedToConnect { epoch_ms: now_ms() }, None));
+        let state = node_state(1, true, peers);
+        let (task, _connections, _remote_io) = simulated_task(state, 2).await;
+
+        assert!(!task.observation_targets().await.contains(&2));
+    }
+
+    #[tokio::test]
+    async fn observation_targets_include_failed_connect_after_retry_delay() {
+        let mut peers = HashMap::new();
+        peers.insert(
+            2,
+            peer_with_status(
+                2,
+                Some(true),
+                ConnectStatus::FailedToConnect {
+                    epoch_ms: now_ms() - 61_000,
+                },
+                None,
+            ),
+        );
+        let state = node_state(1, true, peers);
+        let (task, _connections, _remote_io) = simulated_task(state, 2).await;
+
+        assert!(task.observation_targets().await.contains(&2));
+    }
+
+    #[tokio::test]
+    async fn observation_targets_recently_reachable_failed_peer_uses_short_retry() {
+        let now = now_ms();
+        let mut peers = HashMap::new();
+        peers.insert(
+            2,
+            peer_with_status(
+                2,
+                Some(true),
+                ConnectStatus::FailedToConnect { epoch_ms: now - 11_000 },
+                NonZeroU64::new(now - 1_000),
+            ),
+        );
+        let state = node_state(1, true, peers);
+        let (task, _connections, _remote_io) = simulated_task(state, 2).await;
+
+        assert!(task.observation_targets().await.contains(&2));
+    }
+
+    #[tokio::test]
+    async fn observation_targets_do_not_skip_not_connected_peer() {
+        let mut peers = HashMap::new();
+        peers.insert(2, peer_with_status(2, Some(true), ConnectStatus::NotConnected, None));
+        let state = node_state(1, true, peers);
+        let (task, _connections, _remote_io) = simulated_task(state, 2).await;
+
+        assert!(task.observation_targets().await.contains(&2));
     }
 
     #[tokio::test]
