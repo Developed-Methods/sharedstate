@@ -15,7 +15,7 @@ use crate::{
         node_state::{NodeState, PeerState},
         subscribable_state::StateHandle,
     },
-    protocol::messages::{LeaderWithElectionInfo, SharePeerDetails, SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{SharePeerDetails, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         determinstic_state::DeterministicState,
         recoverable_state::{RecoverableState, RecoverableStateAction},
@@ -59,31 +59,29 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
             SyncRequest::ProtocolVersion(_) => SyncResponse::UnexpectedRequest,
             SyncRequest::MyAddress(_) => SyncResponse::UnexpectedRequest,
 
-            SyncRequest::ShareLeaderPath => {
-                let leader = self.state.leader_state.lock().await;
-                match &leader.path_to_leader {
-                    Some(v) => SyncResponse::LeaderPath(v.clone()),
-                    None => SyncResponse::NoPathToLeader,
-                }
-            }
+            SyncRequest::ShareLeaderPath => match self.state.leader_status.path_to_leader().await {
+                Some(v) => SyncResponse::LeaderPath(v),
+                None => SyncResponse::NoPathToLeader,
+            },
 
             SyncRequest::ShareLeaderInfo => {
-                let leader = self.state.leader_state.lock().await;
                 let peers = self.state.peers.lock().await;
                 let recover_details = self.state_handle.lock().await.recover_details();
+                let mut reachable_can_lead = peers
+                    .iter()
+                    .filter_map(|(_, peer)| (peer.is_connected && peer.can_lead == Some(true)).then_some(peer.addr))
+                    .collect::<Vec<_>>();
+                if self.state.can_lead {
+                    reachable_can_lead.push(self.state.my_address);
+                }
+                drop(peers);
 
-                SyncResponse::LeaderInfo(LeaderWithElectionInfo {
-                    observer: self.state.my_address,
-                    term: leader.term,
-                    leader: leader.path_to_leader.as_ref().and_then(|v| v.last()).cloned(),
-                    leader_path: leader.path_to_leader.clone(),
-                    can_lead: self.state.can_lead,
-                    reachable_can_lead: peers
-                        .iter()
-                        .filter_map(|(_, peer)| peer.is_connected.then_some(peer.addr))
-                        .collect(),
-                    recover_details,
-                })
+                SyncResponse::LeaderInfo(
+                    self.state
+                        .leader_status
+                        .local_observation(self.state.can_lead, reachable_can_lead, recover_details)
+                        .await,
+                )
             }
             SyncRequest::Action { source, action } => {
                 if self.actions_tx.try_send((source, action)).is_ok() {
@@ -319,7 +317,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        new::{node_state::LeaderState, subscribable_state::SubscribableState},
+        new::{subscribable_state::SubscribableState, tasks::current_leader::CurrentLeaderStatus},
         protocol::messages::PROTOCOL_VERSION,
         state::recoverable_state::RecoverableState,
         transport::traits::SyncConnection,
@@ -410,10 +408,7 @@ mod tests {
                 SequencedBroadcastSettings::default(),
             )
             .unwrap(),
-            leader_state: Mutex::new(LeaderState {
-                path_to_leader: None,
-                term: 0,
-            }),
+            leader_status: Arc::new(CurrentLeaderStatus::new(address)),
         })
     }
 

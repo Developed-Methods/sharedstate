@@ -317,8 +317,7 @@ mod tests {
     use super::*;
     use crate::{
         new::{
-            node_state::{LeaderState, NodeState},
-            subscribable_state::SubscribableState,
+            node_state::NodeState, subscribable_state::SubscribableState, tasks::current_leader::CurrentLeaderStatus,
         },
         protocol::messages::PROTOCOL_VERSION,
         state::recoverable_state::RecoverableState,
@@ -424,10 +423,7 @@ mod tests {
                 SequencedBroadcastSettings::default(),
             )
             .unwrap(),
-            leader_state: Mutex::new(LeaderState {
-                path_to_leader: None,
-                term: 0,
-            }),
+            leader_status: Arc::new(CurrentLeaderStatus::new(address)),
         })
     }
 
