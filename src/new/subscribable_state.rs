@@ -65,7 +65,7 @@ impl<D: DeterministicState> SubscribableState<D> {
         let (broadcast, broadcast_sender) =
             SequencedBroadcast::new(new_recover_details.next_seq(), self.broadcast_settings.clone()).unwrap();
 
-        std::mem::replace(&mut *broadcast_locked, broadcast);
+        *broadcast_locked = broadcast;
         let mut old_sender = std::mem::replace(&mut *sender_locked, broadcast_sender);
         old_sender.close();
     }
@@ -128,7 +128,7 @@ impl<D: DeterministicState> SubscribableState<D> {
 
         self.state.queue_updates(read_for_state);
         for action in batch {
-            sender.send(action).await;
+            let _ = sender.send(action).await;
         }
     }
 }

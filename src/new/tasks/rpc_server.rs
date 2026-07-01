@@ -163,7 +163,7 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
     }
 }
 
-enum ResponseOrFeed<A: SyncIOAddress, D: DeterministicState> {
+pub enum ResponseOrFeed<A: SyncIOAddress, D: DeterministicState> {
     Response(SyncResponse<A, D>),
     FreshState {
         state: RecoverableState<D>,
