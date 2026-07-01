@@ -257,31 +257,31 @@ where
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => {
-                    set_peer_connected(&self.state, self.remote_addr, false).await;
                     self.drain_with_error(PeerRpcError::FailedToReceiveResponse).await;
-                    return;
+                    break;
                 }
                 msg = self.rx.recv() => {
                     let Some(msg) = msg else {
-                        return;
+                        break;
                     };
 
                     if write.send(msg.request).await.is_err() {
-                        set_peer_connected(&self.state, self.remote_addr, false).await;
                         let _ = msg.response.send(Err(PeerRpcError::FailedToSendRequest));
                         self.drain_with_error(PeerRpcError::FailedToSendRequest).await;
-                        return;
+                        break;
                     }
 
                     if let Err(error) = response_tx.send(msg.response).await {
-                        set_peer_connected(&self.state, self.remote_addr, false).await;
                         let _ = error.0.send(Err(PeerRpcError::FailedToReceiveResponse));
                         self.drain_with_error(PeerRpcError::FailedToReceiveResponse).await;
-                        return;
+                        break;
                     }
                 }
             }
         }
+
+        set_peer_connected(&self.state, self.remote_addr, false).await;
+        self.cancel.cancel();
     }
 
     async fn handshake(
