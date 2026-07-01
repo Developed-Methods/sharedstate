@@ -40,6 +40,8 @@ struct RpcMessage<A: SyncIOAddress, D: DeterministicState> {
     response: oneshot::Sender<Result<SyncResponse<A, D>, PeerRpcError>>,
 }
 
+type RpcResponseSender<A, D> = oneshot::Sender<Result<SyncResponse<A, D>, PeerRpcError>>;
+
 impl<I, D> PeerConnections<I, D>
 where
     I: SyncIO,
@@ -194,6 +196,16 @@ where
             return;
         }
 
+        let (response_tx, response_rx) = tokio::sync::mpsc::channel(RPC_QUEUE_CAPACITY);
+        tokio::spawn(
+            ResponseReader::<A, D> {
+                responses: read,
+                response_senders: response_rx,
+                timeout: settings.message_timeout,
+            }
+            .run(),
+        );
+
         while let Some(msg) = self.rx.recv().await {
             if write.send(msg.request).await.is_err() {
                 let _ = msg.response.send(Err(PeerRpcError::FailedToSendRequest));
@@ -201,12 +213,9 @@ where
                 return;
             }
 
-            let response = Self::read_response(&mut read, settings.message_timeout).await;
-            let fatal_error = response.as_ref().err().cloned();
-            let _ = msg.response.send(response);
-
-            if let Some(error) = fatal_error {
-                self.drain_with_error(error).await;
+            if let Err(error) = response_tx.send(msg.response).await {
+                let _ = error.0.send(Err(PeerRpcError::FailedToReceiveResponse));
+                self.drain_with_error(PeerRpcError::FailedToReceiveResponse).await;
                 return;
             }
         }
@@ -222,26 +231,15 @@ where
             .send(SyncRequest::ProtocolVersion(PROTOCOL_VERSION))
             .await
             .map_err(|_| PeerRpcError::FailedToSendRequest)?;
-        require_ok(Self::read_response(read, timeout).await?)?;
+        require_ok(read_response(read, timeout).await?)?;
 
         write
             .send(SyncRequest::MyAddress(self.local_addr))
             .await
             .map_err(|_| PeerRpcError::FailedToSendRequest)?;
-        require_ok(Self::read_response(read, timeout).await?)?;
+        require_ok(read_response(read, timeout).await?)?;
 
         Ok(())
-    }
-
-    async fn read_response(
-        read: &mut Receiver<SyncResponse<A, D>>,
-        timeout: Duration,
-    ) -> Result<SyncResponse<A, D>, PeerRpcError> {
-        match tokio::time::timeout(timeout, read.recv()).await {
-            Ok(Some(response)) => Ok(response),
-            Ok(None) => Err(PeerRpcError::FailedToReceiveResponse),
-            Err(_) => Err(PeerRpcError::ResponseTimedOut),
-        }
     }
 
     async fn drain_with_error(&mut self, error: PeerRpcError) {
@@ -249,6 +247,45 @@ where
         while let Some(msg) = self.rx.recv().await {
             let _ = msg.response.send(Err(error.clone()));
         }
+    }
+}
+
+struct ResponseReader<A: SyncIOAddress, D: DeterministicState> {
+    responses: Receiver<SyncResponse<A, D>>,
+    response_senders: Receiver<RpcResponseSender<A, D>>,
+    timeout: Duration,
+}
+
+impl<A: SyncIOAddress, D: DeterministicState> ResponseReader<A, D> {
+    async fn run(mut self) {
+        while let Some(response_sender) = self.response_senders.recv().await {
+            let response = read_response(&mut self.responses, self.timeout).await;
+            let fatal_error = response.as_ref().err().cloned();
+            let _ = response_sender.send(response);
+
+            if let Some(error) = fatal_error {
+                self.drain_with_error(error).await;
+                return;
+            }
+        }
+    }
+
+    async fn drain_with_error(&mut self, error: PeerRpcError) {
+        self.response_senders.close();
+        while let Some(response_sender) = self.response_senders.recv().await {
+            let _ = response_sender.send(Err(error.clone()));
+        }
+    }
+}
+
+async fn read_response<A: SyncIOAddress, D: DeterministicState>(
+    read: &mut Receiver<SyncResponse<A, D>>,
+    timeout: Duration,
+) -> Result<SyncResponse<A, D>, PeerRpcError> {
+    match tokio::time::timeout(timeout, read.recv()).await {
+        Ok(Some(response)) => Ok(response),
+        Ok(None) => Err(PeerRpcError::FailedToReceiveResponse),
+        Err(_) => Err(PeerRpcError::ResponseTimedOut),
     }
 }
 
@@ -520,6 +557,39 @@ mod tests {
             other => panic!("expected second ping request, got {other:?}"),
         }
         write.send(SyncResponse::Pong(2)).await.unwrap();
+        assert!(matches!(second.await.unwrap().unwrap(), SyncResponse::Pong(2)));
+        assert_eq!(connect_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pipelines_requests_before_responses_arrive() {
+        let (connections, mut incoming, connect_count) = peer_connections(1, false);
+
+        let first = tokio::spawn({
+            let connections = connections.clone();
+            async move { connections.send_rpc(2, SyncRequest::Ping(1)).await }
+        });
+        let second = tokio::spawn({
+            let connections = connections.clone();
+            async move { connections.send_rpc(2, SyncRequest::Ping(2)).await }
+        });
+
+        let (write, mut read) = accept_server(&mut incoming).await;
+        expect_handshake(&write, &mut read, 1).await;
+
+        match recv_request(&mut read).await {
+            SyncRequest::Ping(id) => assert_eq!(id, 1),
+            other => panic!("expected first pipelined ping request, got {other:?}"),
+        }
+        match recv_request(&mut read).await {
+            SyncRequest::Ping(id) => assert_eq!(id, 2),
+            other => panic!("expected second pipelined ping request, got {other:?}"),
+        }
+
+        write.send(SyncResponse::Pong(1)).await.unwrap();
+        write.send(SyncResponse::Pong(2)).await.unwrap();
+
+        assert!(matches!(first.await.unwrap().unwrap(), SyncResponse::Pong(1)));
         assert!(matches!(second.await.unwrap().unwrap(), SyncResponse::Pong(2)));
         assert_eq!(connect_count.load(Ordering::SeqCst), 1);
     }
