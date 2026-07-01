@@ -9,6 +9,7 @@ use tokio::sync::{
     mpsc::{error::TrySendError, Receiver, Sender},
     oneshot, Mutex,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     new::node_state::{NodeState, PeerState},
@@ -33,7 +34,7 @@ pub struct PeerConnections<I: SyncIO, D: DeterministicState> {
 
 struct Connection<A: SyncIOAddress, D: DeterministicState> {
     tx: Sender<RpcMessage<A, D>>,
-    kill_tx: Sender<()>,
+    cancel: CancellationToken,
 }
 
 struct RpcMessage<A: SyncIOAddress, D: DeterministicState> {
@@ -121,7 +122,6 @@ where
         if let Some(connection) = connection {
             connection.kill();
         }
-        set_peer_connected(&self.state, peer, false).await;
     }
 }
 
@@ -152,12 +152,12 @@ where
         I: SyncIO<Address = A>,
     {
         let (tx, rx) = tokio::sync::mpsc::channel(RPC_QUEUE_CAPACITY);
-        let (kill_tx, kill_rx) = tokio::sync::mpsc::channel(1);
+        let cancel = CancellationToken::new();
 
         tokio::spawn(
             ConnectionWorker {
                 rx,
-                kill_rx,
+                cancel: cancel.clone(),
                 remote_addr,
                 local_addr,
                 state,
@@ -165,11 +165,11 @@ where
             .run(io, settings),
         );
 
-        Self { tx, kill_tx }
+        Self { tx, cancel }
     }
 
     fn kill(self) {
-        let _ = self.kill_tx.try_send(());
+        self.cancel.cancel();
     }
 }
 
@@ -186,7 +186,7 @@ pub enum PeerRpcError {
 
 struct ConnectionWorker<A: SyncIOAddress, D: DeterministicState> {
     rx: Receiver<RpcMessage<A, D>>,
-    kill_rx: Receiver<()>,
+    cancel: CancellationToken,
     remote_addr: A,
     local_addr: A,
     state: Arc<NodeState<A, D>>,
@@ -243,7 +243,7 @@ where
 
         loop {
             tokio::select! {
-                _ = self.kill_rx.recv() => {
+                _ = self.cancel.cancelled() => {
                     set_peer_connected(&self.state, self.remote_addr, false).await;
                     self.drain_with_error(PeerRpcError::FailedToReceiveResponse).await;
                     return;
@@ -682,10 +682,16 @@ mod tests {
         assert!(matches!(first.await.unwrap().unwrap(), SyncResponse::Pong(1)));
 
         connections.kill_connection(2).await;
-        {
-            let peers = state.peers.lock().await;
-            assert!(peers.get(&2).is_some_and(|peer| !peer.is_connected));
-        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state.peers.lock().await.get(&2).is_some_and(|peer| !peer.is_connected) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
         let second = tokio::spawn({
             let connections = connections.clone();
