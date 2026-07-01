@@ -4,8 +4,8 @@ use message_encoding::MessageEncoding;
 
 use crate::{
     state::{
-        determinstic_state::DeterministicState,
-        recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
+        deterministic::DeterministicState,
+        recoverable::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
     },
     transport::traits::SyncIOAddress,
     utils::{unknown_id_err, unknown_version_err},
@@ -109,40 +109,40 @@ where
     fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
         sum += match self {
-            Self::MyAddress(addr) => {
+            Self::ProtocolVersion(version) => {
                 sum += 0u16.write_to(out)?;
+                version.write_to(out)?
+            }
+            Self::MyAddress(addr) => {
+                sum += 1u16.write_to(out)?;
                 addr.write_to(out)?
             }
             Self::Ping(num) => {
-                sum += 1u16.write_to(out)?;
+                sum += 2u16.write_to(out)?;
                 num.write_to(out)?
             }
-            Self::SubscribeFresh => 3u16.write_to(out)?,
-            Self::ShareLeaderPath => 4u16.write_to(out)?,
             Self::SharePeers(peers) => {
-                sum += 6u16.write_to(out)?;
+                sum += 3u16.write_to(out)?;
                 write_vec(peers, out)?
             }
+            Self::WhoIsLeader => 4u16.write_to(out)?,
+            Self::ShareLeaderPath => 5u16.write_to(out)?,
+            Self::ShareElection => 6u16.write_to(out)?,
+            Self::SubscribeFresh => 7u16.write_to(out)?,
             Self::SubscribeRecovery(details) => {
-                sum += 7u16.write_to(out)?;
+                sum += 8u16.write_to(out)?;
                 details.write_to(out)?
             }
             Self::Action { source, action } => {
-                sum += 8u16.write_to(out)?;
+                sum += 9u16.write_to(out)?;
                 sum += source.write_to(out)?;
                 action.write_to(out)?
-            }
-            Self::ProtocolVersion(version) => {
-                sum += 9u16.write_to(out)?;
-                version.write_to(out)?
             }
             Self::LeaderStatus { address, status } => {
                 sum += 10u16.write_to(out)?;
                 sum += address.write_to(out)?;
                 status.write_to(out)?
             }
-            Self::WhoIsLeader => 11u16.write_to(out)?,
-            Self::ShareElection => 12u16.write_to(out)?,
         };
 
         Ok(sum)
@@ -150,23 +150,23 @@ where
 
     fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
         Ok(match u16::read_from(read)? {
-            0 => Self::MyAddress(MessageEncoding::read_from(read)?),
-            1 => Self::Ping(MessageEncoding::read_from(read)?),
-            3 => Self::SubscribeFresh,
-            4 => Self::ShareLeaderPath,
-            6 => Self::SharePeers(read_vec(read)?),
-            7 => Self::SubscribeRecovery(MessageEncoding::read_from(read)?),
-            8 => Self::Action {
+            0 => Self::ProtocolVersion(MessageEncoding::read_from(read)?),
+            1 => Self::MyAddress(MessageEncoding::read_from(read)?),
+            2 => Self::Ping(MessageEncoding::read_from(read)?),
+            3 => Self::SharePeers(read_vec(read)?),
+            4 => Self::WhoIsLeader,
+            5 => Self::ShareLeaderPath,
+            6 => Self::ShareElection,
+            7 => Self::SubscribeFresh,
+            8 => Self::SubscribeRecovery(MessageEncoding::read_from(read)?),
+            9 => Self::Action {
                 source: MessageEncoding::read_from(read)?,
                 action: MessageEncoding::read_from(read)?,
             },
-            9 => Self::ProtocolVersion(MessageEncoding::read_from(read)?),
             10 => Self::LeaderStatus {
                 address: MessageEncoding::read_from(read)?,
                 status: MessageEncoding::read_from(read)?,
             },
-            11 => Self::WhoIsLeader,
-            12 => Self::ShareElection,
             other => return Err(unknown_id_err(other, "SyncRequest")),
         })
     }
@@ -395,5 +395,58 @@ fn read_opt_vec<T: MessageEncoding, R: std::io::Read>(read: &mut R) -> std::io::
         Ok(Some(read_vec(read)?))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct TestState;
+
+    impl DeterministicState for TestState {
+        type Action = u64;
+        type AuthorityAction = u64;
+
+        fn accept_seq(&self) -> u64 {
+            0
+        }
+
+        fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
+            action
+        }
+
+        fn update(&mut self, _action: &Self::AuthorityAction) {}
+    }
+
+    #[test]
+    fn sync_request_tags_are_sequential() {
+        let cases: Vec<(SyncRequest<u64, TestState>, u16)> = vec![
+            (SyncRequest::ProtocolVersion(2), 0),
+            (SyncRequest::MyAddress(1), 1),
+            (SyncRequest::Ping(2), 2),
+            (SyncRequest::SharePeers(vec![SharePeerDetails::from(3)]), 3),
+            (SyncRequest::WhoIsLeader, 4),
+            (SyncRequest::ShareLeaderPath, 5),
+            (SyncRequest::ShareElection, 6),
+            (SyncRequest::SubscribeFresh, 7),
+            (SyncRequest::SubscribeRecovery(RecoverableStateDetails::new(4, 5)), 8),
+            (SyncRequest::Action { source: 6, action: 7 }, 9),
+            (
+                SyncRequest::LeaderStatus {
+                    address: 8,
+                    status: LeaderStatus::Offline { term: 9, leader: 10 },
+                },
+                10,
+            ),
+        ];
+
+        for (request, expected_tag) in cases {
+            let mut bytes = Vec::new();
+            request.write_to(&mut bytes).unwrap();
+
+            assert_eq!(u16::read_from(&mut &bytes[..]).unwrap(), expected_tag);
+        }
     }
 }

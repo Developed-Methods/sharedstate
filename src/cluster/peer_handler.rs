@@ -1,10 +1,14 @@
 use std::{future::Future, num::NonZeroU64, panic::Location, sync::Arc};
 
+use sequenced_broadcast::SequencedReceiver;
 use tokio::sync::mpsc;
 
 use crate::{
     protocol::messages::{LeaderStatus, SyncRequest, SyncResponse},
-    state::{determinstic_state::DeterministicState, recoverable_state::RecoverableStateAction},
+    state::{
+        deterministic::DeterministicState,
+        recoverable::{RecoverableStateAction, RecoverableStateDetails},
+    },
     transport::traits::SyncIOAddress,
     utils::now_ms,
 };
@@ -114,7 +118,7 @@ where
     }
 
     async fn subscribe_fresh(&self) -> bool {
-        let Ok((state, mut feed)) = ({
+        let Ok((state, feed)) = ({
             let state = self.inner.state.lock().await;
             state.subscribe().await
         }) else {
@@ -132,41 +136,13 @@ where
             return false;
         }
 
-        let write = self.write.clone();
-        let mut leader_updates = self.inner.leader_updates.subscribe();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    action = feed.recv() => {
-                        match action {
-                            Ok((seq, action)) => {
-                                if write.send(SyncResponse::AuthorityAction(seq, action)).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    changed = leader_updates.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let info = leader_updates.borrow().clone();
-                        if write.send(SyncResponse::LeaderInfo(info)).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            let _ = write.send(SyncResponse::ActionStreamClosed).await;
-        });
+        self.spawn_subscription_stream(feed);
 
         true
     }
 
-    async fn subscribe_recovery(&self, details: crate::state::recoverable_state::RecoverableStateDetails) -> bool {
-        let leader_state = self.inner.state.lock().await.recoverable_state_details().await;
+    async fn subscribe_recovery(&self, details: RecoverableStateDetails) -> bool {
+        let leader_state = self.inner.state.lock().await.recoverable_details().await;
 
         if !leader_state.can_recover_follower(&details) {
             return self.send(SyncResponse::RecoveryFailed(leader_state)).await;
@@ -177,7 +153,7 @@ where
             state.subscribe_at(details.next_seq()).await
         };
 
-        let Ok(mut feed) = feed else {
+        let Ok(feed) = feed else {
             return self.send(SyncResponse::RecoveryFailed(leader_state)).await;
         };
 
@@ -191,6 +167,12 @@ where
             return false;
         }
 
+        self.spawn_subscription_stream(feed);
+
+        true
+    }
+
+    fn spawn_subscription_stream(&self, mut feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>) {
         let write = self.write.clone();
         let mut leader_updates = self.inner.leader_updates.subscribe();
         tokio::spawn(async move {
@@ -220,8 +202,6 @@ where
 
             let _ = write.send(SyncResponse::ActionStreamClosed).await;
         });
-
-        true
     }
 
     async fn handle_action(&self, source: A, action: D::Action) {

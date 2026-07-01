@@ -5,7 +5,7 @@ use crate::{
         NodeActionSender, NodeState, NodeTiming, SendActionError,
     },
     protocol::messages::{SharePeerDetails, SyncRequest, SyncResponse},
-    state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
+    state::{deterministic::DeterministicState, recoverable::RecoverableState},
     transport::{
         channels::NetIoSettings,
         simulated::{SimulatedIo, SimulatedNet},
@@ -277,6 +277,54 @@ async fn send_when_leader_unblocks_after_election() {
     );
 
     node.stop(&net).await;
+}
+
+#[tokio::test]
+async fn action_pump_uses_follow_retry_interval() {
+    let timing = NodeTiming {
+        observation_stale_after: Duration::from_secs(5),
+        observation_interval: Duration::from_secs(5),
+        follow_retry_interval: Duration::from_millis(300),
+        rpc_timeout: Duration::from_secs(1),
+    };
+    let node = node_with_timing(9003, true, timing).await;
+    let actions = node.action_sender();
+
+    node.inner.start_local_action_pump().await;
+    actions
+        .sender()
+        .send(TestAction::Set {
+            key: "retry-interval".to_owned(),
+            value: "applied".to_owned(),
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    {
+        let mut control = node.inner.control.lock().await;
+        control.leader.leader = Some(9003);
+        control.leader.path = Some(vec![9003]);
+        control.leader.term = 1;
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    {
+        let mut handle = node.create_state_handle();
+        let value = handle.read().state().values.get("retry-interval").cloned();
+        handle.quiescent();
+        assert_eq!(value, None);
+    }
+
+    assert!(
+        wait_until(Duration::from_secs(1), || async {
+            let mut handle = node.create_state_handle();
+            let value = handle.read().state().values.get("retry-interval").cloned();
+            handle.quiescent();
+            value.as_deref() == Some("applied")
+        })
+        .await
+    );
 }
 
 #[path = "node/fuzzy.rs"]

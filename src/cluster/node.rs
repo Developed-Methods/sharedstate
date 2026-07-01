@@ -14,9 +14,9 @@ use crate::{
     cluster::leader::AuthorativeState,
     protocol::messages::{ElectionObservation, LeaderInfoMessage, SyncRequest, SyncResponse},
     state::{
-        determinstic_state::DeterministicState,
-        recoverable_state::RecoverableState,
-        shared_state::{SharedStateHandle, SharedStateReader},
+        deterministic::DeterministicState,
+        hot_reader::{SharedStateHandle, SharedStateReader},
+        recoverable::RecoverableState,
     },
     transport::{
         channels::NetIoSettings,
@@ -24,7 +24,7 @@ use crate::{
     },
 };
 
-pub(crate) const PROTOCOL_VERSION: u64 = 1;
+pub(crate) const PROTOCOL_VERSION: u64 = 2;
 
 pub use super::action_pump::{NodeActionSender, SendActionError};
 use super::control::{ControlState, LeaderInfo, PeerDetails};

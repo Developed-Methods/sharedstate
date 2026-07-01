@@ -1,23 +1,22 @@
-use std::{num::NonZeroU64, sync::Arc};
+use std::sync::Arc;
 
 use futures_util::StreamExt;
 use message_encoding::MessageEncoding;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     protocol::messages::{SyncRequest, SyncResponse},
-    state::determinstic_state::DeterministicState,
+    state::deterministic::DeterministicState,
     transport::{channels::NetIoSettings, traits::SyncIO},
     utils::now_ms,
 };
 
 use super::{
-    control::FollowConnection,
     election::{
         append_path, observation_targets, sort_follow_candidates, valid_remote_leader_path, FollowCandidate,
         ObservationTargetInput, PeerKind,
     },
+    follower::{spawn_follow_reader, FollowConnection},
     node::{recv_timeout, send_expect_ok, Inner, PROTOCOL_VERSION},
 };
 
@@ -266,7 +265,7 @@ where
             .set_remote_leader_path(leader, Some(leader_info.term), local_path.clone(), None)
             .await;
 
-        let details = self.inner.state.lock().await.recoverable_state_details().await;
+        let details = self.inner.state.lock().await.recoverable_details().await;
         if write.send(SyncRequest::SubscribeRecovery(details)).await.is_err() {
             self.mark_connect_fail(target).await;
             return;
@@ -317,183 +316,6 @@ where
 
         self.mark_connected(target, 0).await;
         self.inner.publish_leader_info().await;
-        self.spawn_follow_reader(target, read, cancel);
-    }
-
-    fn spawn_follow_reader(
-        &self,
-        target: I::Address,
-        mut read: mpsc::Receiver<SyncResponse<I::Address, D>>,
-        cancel: CancellationToken,
-    ) {
-        let inner = self.inner.clone();
-
-        tokio::spawn(async move {
-            loop {
-                let msg = tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    msg = read.recv() => msg,
-                };
-
-                match msg {
-                    Some(SyncResponse::AuthorityAction(_, action)) => {
-                        if let Err(error) = inner.state.lock().await.apply_authority(action).await {
-                            tracing::error!(?error, "failed to apply followed authority action");
-                            inner.fail(format!("failed to apply followed authority action: {error:?}"));
-                            break;
-                        }
-                    }
-                    Some(SyncResponse::LeaderInfo(info)) => match (info.leader, info.path) {
-                        (Some(leader_addr), Some(path))
-                            if valid_remote_leader_path(Some(leader_addr), &path, target, inner.address) =>
-                        {
-                            inner
-                                .set_remote_leader_path(
-                                    leader_addr,
-                                    Some(info.term),
-                                    append_path(path, inner.address),
-                                    Some(target),
-                                )
-                                .await;
-                        }
-                        _ => {
-                            if inner.clear_follow_to(target).await {
-                                inner.clear_remote_leader().await;
-                            }
-                        }
-                    },
-                    Some(SyncResponse::LeaderPath(path)) => {
-                        if let Some(leader_addr) = path.first().copied() {
-                            if valid_remote_leader_path(Some(leader_addr), &path, target, inner.address) {
-                                inner
-                                    .set_remote_leader_path(
-                                        leader_addr,
-                                        None,
-                                        append_path(path, inner.address),
-                                        Some(target),
-                                    )
-                                    .await;
-                            }
-                        }
-                    }
-                    Some(SyncResponse::NoPathToLeader) => {
-                        if inner.clear_follow_to(target).await {
-                            inner.clear_remote_leader().await;
-                        }
-                    }
-                    Some(SyncResponse::Peers(peers)) => {
-                        inner.discover_peers(peers.into_iter()).await;
-                    }
-                    Some(SyncResponse::ActionStreamClosed) | None => break,
-                    _ => {}
-                }
-            }
-
-            let closed_follow = { inner.control.lock().await.follow.take() };
-            if let Some(follow) = closed_follow {
-                if follow.remote == target {
-                    follow.cancel.cancel();
-                    if let Some(Some(details)) = inner.control.lock().await.peers.get_mut(&target) {
-                        details.connected = details.active_connections > 0;
-                    }
-                    inner.clear_remote_leader().await;
-                } else {
-                    let _ = inner.control.lock().await.follow.replace(follow);
-                }
-            }
-        });
-    }
-
-    async fn mark_connect_attempt(&self, target: I::Address) {
-        let mut control = self.inner.control.lock().await;
-        if let Some(Some(details)) = control.peers.get_mut(&target) {
-            details.last_connect_attempt = NonZeroU64::new(now_ms());
-        }
-    }
-
-    async fn mark_connect_fail(&self, target: I::Address) {
-        {
-            let mut control = self.inner.control.lock().await;
-            let has_follow_to_target = control.follow.as_ref().is_some_and(|follow| follow.remote == target);
-            if let Some(Some(details)) = control.peers.get_mut(&target) {
-                if !has_follow_to_target && details.active_connections == 0 {
-                    details.last_activity = None;
-                    details.connected = false;
-                }
-                details.last_connect_fail = NonZeroU64::new(now_ms());
-                details.repeat_connect_fails = details.repeat_connect_fails.saturating_add(1);
-                details.last_observation = None;
-            }
-
-            for details in control.peers.values_mut().filter_map(Option::as_mut) {
-                let invalid_target_observation = details
-                    .last_observation
-                    .as_ref()
-                    .filter(|observation| observation.leader == Some(target))
-                    .map(|observation| {
-                        !observation
-                            .leader_path
-                            .as_deref()
-                            .map(|path| {
-                                valid_remote_leader_path(Some(target), path, observation.observer, self.inner.address)
-                            })
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if invalid_target_observation {
-                    details.last_observation = None;
-                }
-            }
-
-            control.election.observations.retain(|observer, observation| {
-                if *observer == target {
-                    return false;
-                }
-                if observation.leader != Some(target) {
-                    return true;
-                }
-                observation
-                    .leader_path
-                    .as_deref()
-                    .map(|path| valid_remote_leader_path(Some(target), path, *observer, self.inner.address))
-                    .unwrap_or(false)
-            });
-            let has_relay_follow = control
-                .follow
-                .as_ref()
-                .is_some_and(|follow| follow.remote != target && follow.leader_path.first().copied() == Some(target));
-            let should_clear = !has_relay_follow
-                && control.leader.leader == Some(target)
-                && control.leader.leader != Some(self.inner.address);
-            if should_clear {
-                control.leader.leader = None;
-                control.leader.path = None;
-            }
-            drop(control);
-            if should_clear {
-                self.inner.publish_leader_info().await;
-            }
-        }
-    }
-
-    async fn mark_connected(&self, target: I::Address, latency_ms: u64) {
-        let mut control = self.inner.control.lock().await;
-        if let Some(Some(details)) = control.peers.get_mut(&target) {
-            details.last_activity = NonZeroU64::new(now_ms());
-            details.last_global_activity = NonZeroU64::new(now_ms());
-            details.repeat_connect_fails = 0;
-            details.latency_ms = Some(latency_ms);
-            details.connected = true;
-        }
-    }
-
-    async fn mark_observed(&self, target: I::Address, latency_ms: u64) {
-        let mut control = self.inner.control.lock().await;
-        if let Some(Some(details)) = control.peers.get_mut(&target) {
-            details.last_activity = NonZeroU64::new(now_ms());
-            details.last_global_activity = NonZeroU64::new(now_ms());
-            details.repeat_connect_fails = 0;
-            details.latency_ms = Some(latency_ms);
-        }
+        spawn_follow_reader(self.inner.clone(), target, read, cancel);
     }
 }

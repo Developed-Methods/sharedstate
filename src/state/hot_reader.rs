@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use hotread::{HotRead, HotReadHandle, HotReadState};
 
-use crate::state::determinstic_state::DeterministicState;
+use crate::state::deterministic::DeterministicState;
 
 pub struct SharedState<D: DeterministicState> {
     inner: Arc<StateInner<D>>,

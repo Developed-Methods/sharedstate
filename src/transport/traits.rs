@@ -7,7 +7,7 @@ use tokio::{
 
 use crate::{
     protocol::messages::{SyncRequest, SyncResponse},
-    state::determinstic_state::DeterministicState,
+    state::deterministic::DeterministicState,
     transport::channels::{NetIoSettings, ReadChannel, WriteChannel},
 };
 

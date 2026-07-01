@@ -10,7 +10,7 @@ use message_encoding::MessageEncoding;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use sharedstate::{
     cluster::{NodeActionSender, NodeDebugInfo, NodeState, NodeTiming, SendActionError},
-    state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
+    state::{deterministic::DeterministicState, recoverable::RecoverableState},
     transport::{
         channels::NetIoSettings,
         traits::{SyncConnection, SyncIO, SyncIOListener},
@@ -276,7 +276,7 @@ async fn handle_set(rest: &str, actions: &NodeActionSender<KvAction, u16>) {
     );
 }
 
-fn handle_get(rest: &str, handle: &mut sharedstate::state::shared_state::SharedStateHandle<RecoverableState<KvStore>>) {
+fn handle_get(rest: &str, handle: &mut sharedstate::state::hot_reader::SharedStateHandle<RecoverableState<KvStore>>) {
     let key = rest.trim();
     if key.is_empty() || key.split_whitespace().nth(1).is_some() {
         println!("usage: get <key>");
@@ -305,7 +305,7 @@ async fn handle_delete(rest: &str, actions: &NodeActionSender<KvAction, u16>) {
     report_send(actions.send(KvAction::Delete { key: key.to_owned() }).await);
 }
 
-fn handle_print(handle: &mut sharedstate::state::shared_state::SharedStateHandle<RecoverableState<KvStore>>) {
+fn handle_print(handle: &mut sharedstate::state::hot_reader::SharedStateHandle<RecoverableState<KvStore>>) {
     let values = {
         let state = handle.read();
         state.state().values.clone()

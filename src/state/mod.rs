@@ -1,3 +1,3 @@
-pub mod determinstic_state;
-pub mod recoverable_state;
-pub mod shared_state;
+pub mod deterministic;
+pub mod hot_reader;
+pub mod recoverable;

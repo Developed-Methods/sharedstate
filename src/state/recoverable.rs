@@ -1,7 +1,9 @@
-use super::determinstic_state::DeterministicState;
+use super::deterministic::DeterministicState;
 use crate::utils::unknown_id_err;
 use message_encoding::{m_opt_sum, MessageEncoding};
 use std::{collections::VecDeque, fmt::Debug};
+
+pub const RECOVERY_HISTORY_LIMIT: usize = 2048;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct RecoverableState<D: DeterministicState> {
@@ -75,8 +77,15 @@ impl RecoverableStateDetails {
     pub fn apply_generation_bump(&mut self, new_id: u64) {
         self.outer_state_next_seq += 1;
 
-        if 2048 <= self.history.len() {
-            let _ = self.history.pop_front();
+        if RECOVERY_HISTORY_LIMIT <= self.history.len() {
+            if let Some(dropped) = self.history.pop_front() {
+                tracing::warn!(
+                    generation = dropped.generation,
+                    next_sequence = dropped.next_sequence,
+                    history_limit = RECOVERY_HISTORY_LIMIT,
+                    "recoverable state history window exhausted; older followers will require full state recovery"
+                );
+            }
         }
 
         self.history.push_back(RecovGenerationEnd {
@@ -114,7 +123,13 @@ impl RecoverableStateDetails {
 
         let depth = (self.generation - follower.generation) as usize;
         if self.history.len() < depth {
-            /* don't have the history to recover */
+            tracing::warn!(
+                follower_generation = follower.generation,
+                local_generation = self.generation,
+                retained_generations = self.history.len(),
+                history_limit = RECOVERY_HISTORY_LIMIT,
+                "follower is outside recoverable history window"
+            );
             return false;
         }
 
@@ -260,7 +275,7 @@ impl<D: MessageEncoding + DeterministicState> MessageEncoding for RecoverableSta
 mod test {
     use message_encoding::{test_assert_valid_encoding, MessageEncoding};
 
-    use crate::state::determinstic_state::DeterministicState;
+    use crate::state::deterministic::DeterministicState;
 
     use super::*;
 
@@ -320,7 +335,7 @@ mod test {
     }
 
     #[test]
-    fn recoverable_state_encoding_test() {
+    fn recoverable_encoding_test() {
         test_assert_valid_encoding(RecoverableState {
             details: RecoverableStateDetails {
                 id: 32145342,
@@ -393,5 +408,18 @@ mod test {
             fork.apply_inner_state_seq(30);
             assert!(!details.can_recover_follower(&fork));
         }
+    }
+
+    #[test]
+    fn generation_history_is_capped() {
+        let follower = RecoverableStateDetails::new(1, 1);
+        let mut details = follower.clone();
+
+        for generation in 0..=RECOVERY_HISTORY_LIMIT {
+            details.apply_generation_bump(generation as u64 + 2);
+        }
+
+        assert_eq!(details.history.len(), RECOVERY_HISTORY_LIMIT);
+        assert!(!details.can_recover_follower(&follower));
     }
 }

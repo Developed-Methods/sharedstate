@@ -19,7 +19,7 @@ use message_encoding::MessageEncoding;
 use serde::{Deserialize, Serialize};
 use sharedstate::{
     cluster::NodeTiming,
-    state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
+    state::{deterministic::DeterministicState, recoverable::RecoverableState},
     testing::{
         AddNodeRequest, NodeView, OrchestratorError, OrchestratorRecording, OrchestratorSnapshot,
         SetBlockedPeersRequest, SetNetworkingRequest, SharedStateTestOrchestrator, SharedStateTestOrchestratorConfig,

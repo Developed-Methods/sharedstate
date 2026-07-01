@@ -5,9 +5,9 @@ use tokio::{sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::state::{
-    determinstic_state::DeterministicState,
-    recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
-    shared_state::{SharedState, SharedStateHandle, SharedStateReader},
+    deterministic::DeterministicState,
+    hot_reader::{SharedState, SharedStateHandle, SharedStateReader},
+    recoverable::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
 };
 
 #[derive(Debug)]
@@ -39,15 +39,15 @@ impl<D: DeterministicState> AuthorativeState<D> {
 
         let (authority_broadcast, authority_tx) = Self::new_authority_broadcast(next_seq).await;
 
-        let shared_state = SharedState::new(state);
-        let state_reader = shared_state.create_reader();
+        let hot_reader = SharedState::new(state);
+        let state_reader = hot_reader.create_reader();
         let state_handle = state_reader.create_handle();
 
         let cancel = CancellationToken::new();
 
         let worker = StateMaintainWorker {
             actions_rx: Self::subscribe_worker(&authority_broadcast, next_seq).await,
-            state: shared_state,
+            state: hot_reader,
             cancel: cancel.clone(),
         };
 
@@ -102,7 +102,7 @@ impl<D: DeterministicState> AuthorativeState<D> {
         cloned
     }
 
-    pub async fn recoverable_state_details(&self) -> RecoverableStateDetails {
+    pub async fn recoverable_details(&self) -> RecoverableStateDetails {
         let mut handle = self.state_handle.lock().await;
 
         let details = handle.read().details().clone();
@@ -160,19 +160,19 @@ impl<D: DeterministicState> AuthorativeState<D> {
             return Err(LeaderError::MissingStateWorker);
         };
 
-        let mut shared_state = join_handle
+        let mut hot_reader = join_handle
             .await
             .map_err(|_| LeaderError::StateWorkerJoinFailed)?
             .map_err(LeaderError::StateWorkerFailed)?;
 
         let next_seq = state.accept_seq();
-        shared_state.reset(state);
+        hot_reader.reset(state);
 
         let (authority_broadcast, authority_tx) = Self::new_authority_broadcast(next_seq).await;
 
         let worker = StateMaintainWorker {
             actions_rx: Self::subscribe_worker(&authority_broadcast, next_seq).await,
-            state: shared_state,
+            state: hot_reader,
             cancel: self.cancel.clone(),
         };
 

@@ -4,7 +4,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::{
     protocol::messages::{LeaderInfoMessage, SyncRequest},
-    state::{determinstic_state::DeterministicState, recoverable_state::RecoverableStateAction},
+    state::{deterministic::DeterministicState, recoverable::RecoverableStateAction},
     transport::traits::SyncIOAddress,
 };
 
