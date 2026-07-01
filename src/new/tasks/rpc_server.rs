@@ -113,7 +113,7 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
                 SyncResponse::Ok
             }
             SyncRequest::SubscribeRecovery(details) => match self.state.state.subscribe(details).await {
-                Ok(feed) => return ResponseOrFeed::Subscribtion { feed },
+                Ok(feed) => return ResponseOrFeed::Subscription { feed },
                 Err(error) => {
                     tracing::warn!(?error, "client recovery failed");
                     SyncResponse::RecoveryFailed
@@ -227,7 +227,7 @@ where
                     stream_feed(write, feed).await;
                     break;
                 }
-                ResponseOrFeed::Subscribtion { feed } => {
+                ResponseOrFeed::Subscription { feed } => {
                     if write.send(SyncResponse::Accepted(feed.next_seq())).await.is_err() {
                         break;
                     }
@@ -301,7 +301,7 @@ pub enum ResponseOrFeed<A: SyncIOAddress, D: DeterministicState> {
         state: RecoverableState<D>,
         feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
     },
-    Subscribtion {
+    Subscription {
         feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
     },
 }
