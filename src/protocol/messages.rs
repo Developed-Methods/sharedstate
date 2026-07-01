@@ -103,6 +103,26 @@ pub enum SyncResponse<A: SyncIOAddress, D: DeterministicState> {
     UnexpectedRequest,
 }
 
+impl<A: SyncIOAddress, D: DeterministicState> SyncResponse<A, D> {
+    pub fn name(&self) -> &'static str {
+        match self {
+            SyncResponse::Pong(_) => "Pong",
+            SyncResponse::Ok => "Ok",
+            SyncResponse::FailedToQueueAction { .. } => "FailedToQueueAction",
+            SyncResponse::Peers(_) => "Peers",
+            SyncResponse::LeaderInfo(_) => "LeaderInfo",
+            SyncResponse::LeaderPath(_) => "LeaderPath",
+            SyncResponse::NoPathToLeader => "NoPathToLeader",
+            SyncResponse::Accepted(_) => "Accepted",
+            SyncResponse::RecoveryFailed => "RecoveryFailed",
+            SyncResponse::FreshState(_) => "FreshState",
+            SyncResponse::AuthorityAction(_, _) => "AuthorityAction",
+            SyncResponse::ActionStreamClosed => "ActionStreamClosed",
+            SyncResponse::UnexpectedRequest => "UnexpectedRequest",
+        }
+    }
+}
+
 impl<A: SyncIOAddress, D: DeterministicState> MessageEncoding for SyncRequest<A, D>
 where
     D::Action: MessageEncoding,
@@ -517,6 +537,32 @@ mod tests {
 
         for (response, tag) in cases {
             assert_eq!(first_tag(&response), tag);
+        }
+    }
+
+    #[test]
+    fn sync_response_name_identifies_variants() {
+        let cases: Vec<(SyncResponse<u64, TestState>, &'static str)> = vec![
+            (SyncResponse::Pong(1), "Pong"),
+            (SyncResponse::Ok, "Ok"),
+            (SyncResponse::FailedToQueueAction { source: 2 }, "FailedToQueueAction"),
+            (SyncResponse::Peers(vec![SharePeerDetails::from(3)]), "Peers"),
+            (SyncResponse::LeaderInfo(leader_info()), "LeaderInfo"),
+            (SyncResponse::LeaderPath(vec![4, 5]), "LeaderPath"),
+            (SyncResponse::NoPathToLeader, "NoPathToLeader"),
+            (SyncResponse::Accepted(6), "Accepted"),
+            (SyncResponse::RecoveryFailed, "RecoveryFailed"),
+            (SyncResponse::FreshState(RecoverableState::new(7, TestState(8))), "FreshState"),
+            (
+                SyncResponse::AuthorityAction(9, RecoverableStateAction::StateAction { action: TestAction(10) }),
+                "AuthorityAction",
+            ),
+            (SyncResponse::ActionStreamClosed, "ActionStreamClosed"),
+            (SyncResponse::UnexpectedRequest, "UnexpectedRequest"),
+        ];
+
+        for (response, name) in cases {
+            assert_eq!(response.name(), name);
         }
     }
 }

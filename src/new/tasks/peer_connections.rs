@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     new::node_state::NodeState,
-    protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{LeaderWithElectionInfo, SharePeerDetails, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::determinstic_state::DeterministicState,
     transport::{
         channels::NetIoSettings,
@@ -135,6 +135,67 @@ where
             connection.kill().await;
         }
     }
+
+    pub async fn send_ping(&self, peer: I::Address, id: u64) -> Result<(), PeerRpcError> {
+        let response = self.send_rpc(peer, SyncRequest::Ping(id)).await?;
+        match response {
+            SyncResponse::Pong(response_id) if response_id == id => Ok(()),
+            response => self.unexpected_response(peer, "Pong with matching id", response).await,
+        }
+    }
+
+    pub async fn send_peers_info(
+        &self,
+        peer: I::Address,
+        peers: Vec<SharePeerDetails<I::Address>>,
+    ) -> Result<Vec<SharePeerDetails<I::Address>>, PeerRpcError> {
+        let response = self.send_rpc(peer, SyncRequest::SharePeers(peers)).await?;
+        match response {
+            SyncResponse::Peers(peers) => Ok(peers),
+            response => self.unexpected_response(peer, "Peers", response).await,
+        }
+    }
+
+    pub async fn send_leader_info(
+        &self,
+        peer: I::Address,
+        source: I::Address,
+        info: LeaderWithElectionInfo<I::Address>,
+    ) -> Result<(), PeerRpcError> {
+        let response = self
+            .send_rpc(peer, SyncRequest::LeaderInformation { source, info })
+            .await?;
+        match response {
+            SyncResponse::Ok => Ok(()),
+            response => self.unexpected_response(peer, "Ok", response).await,
+        }
+    }
+
+    pub async fn request_leader_info(
+        &self,
+        peer: I::Address,
+    ) -> Result<LeaderWithElectionInfo<I::Address>, PeerRpcError> {
+        let response = self.send_rpc(peer, SyncRequest::ShareLeaderInfo).await?;
+        match response {
+            SyncResponse::LeaderInfo(info) if info.observer == peer => Ok(info),
+            response => {
+                self.unexpected_response(peer, "LeaderInfo matching peer", response)
+                    .await
+            }
+        }
+    }
+
+    async fn unexpected_response<T>(
+        &self,
+        peer: I::Address,
+        expected: &'static str,
+        response: SyncResponse<I::Address, D>,
+    ) -> Result<T, PeerRpcError> {
+        let actual = response.name();
+        tracing::debug!(?peer, expected, actual, "peer returned unexpected rpc response");
+        self.kill_connection(peer).await;
+        Err(PeerRpcError::UnexpectedResponse { expected, actual })
+    }
 }
 
 async fn await_rpc_response<A: SyncIOAddress, D: DeterministicState>(
@@ -195,6 +256,10 @@ pub enum PeerRpcError {
     HandshakeRejected,
     ResponseTimedOut,
     ResponseDropped,
+    UnexpectedResponse {
+        expected: &'static str,
+        actual: &'static str,
+    },
 }
 
 struct ConnectionWorker<A: SyncIOAddress, D: DeterministicState> {
@@ -547,6 +612,44 @@ mod tests {
         write.send(SyncResponse::Pong(42)).await.unwrap();
 
         assert!(matches!(task.await.unwrap().unwrap(), SyncResponse::Pong(42)));
+    }
+
+    #[tokio::test]
+    async fn typed_rpc_unexpected_response_kills_connection() {
+        let (connections, remote_io, _state) = peer_connections(1, 2, true).await;
+        let remote_io = remote_io.unwrap();
+
+        let first = tokio::spawn({
+            let connections = connections.clone();
+            async move { connections.send_ping(2, 1).await }
+        });
+        let (write, mut read) = accept_server(&remote_io).await;
+        expect_handshake(&write, &mut read, 1).await;
+        match recv_request(&mut read).await {
+            SyncRequest::Ping(id) => assert_eq!(id, 1),
+            other => panic!("expected first typed ping request, got {other:?}"),
+        }
+        write.send(SyncResponse::Ok).await.unwrap();
+        assert!(matches!(
+            first.await.unwrap(),
+            Err(PeerRpcError::UnexpectedResponse {
+                expected: "Pong with matching id",
+                actual: "Ok",
+            })
+        ));
+
+        let second = tokio::spawn({
+            let connections = connections.clone();
+            async move { connections.send_ping(2, 2).await }
+        });
+        let (write, mut read) = accept_server(&remote_io).await;
+        expect_handshake(&write, &mut read, 1).await;
+        match recv_request(&mut read).await {
+            SyncRequest::Ping(id) => assert_eq!(id, 2),
+            other => panic!("expected second typed ping request, got {other:?}"),
+        }
+        write.send(SyncResponse::Pong(2)).await.unwrap();
+        assert!(second.await.unwrap().is_ok());
     }
 
     #[tokio::test]

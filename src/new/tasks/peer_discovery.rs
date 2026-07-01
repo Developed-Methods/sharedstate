@@ -10,9 +10,9 @@ use crate::{
         subscribable_state::StateHandle,
         tasks::{current_leader::local_leader_observation, peer_connections::PeerConnections},
     },
-    protocol::messages::{SharePeerDetails, SyncRequest, SyncResponse},
+    protocol::messages::SharePeerDetails,
     state::determinstic_state::DeterministicState,
-    transport::traits::{SyncIO, SyncIOAddress},
+    transport::traits::SyncIO,
     utils::now_ms,
 };
 
@@ -166,8 +166,8 @@ async fn observe_peer<I, D>(
 {
     tracing::debug!(local = ?state.my_address, ?peer, "observing peer");
     let started = now_ms();
-    match peer_connections.send_rpc(peer, SyncRequest::Ping(started)).await {
-        Ok(SyncResponse::Pong(id)) if id == started => {
+    match peer_connections.send_ping(peer, started).await {
+        Ok(()) => {
             let latency = NonZeroU64::new(now_ms().saturating_sub(started).max(1));
             tracing::debug!(
                 local = ?state.my_address,
@@ -183,18 +183,6 @@ async fn observe_peer<I, D>(
                 "marked peer observed",
             );
         }
-        Ok(response) => {
-            tracing::debug!(
-                local = ?state.my_address,
-                ?peer,
-                response = response_name(&response),
-                "peer ping returned unexpected response",
-            );
-            peer_connections.kill_connection(peer).await;
-            state.clear_peer_leader_observation(peer).await;
-            tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
-            return;
-        }
         Err(error) => {
             tracing::debug!(
                 local = ?state.my_address,
@@ -208,11 +196,8 @@ async fn observe_peer<I, D>(
         }
     }
 
-    match peer_connections
-        .send_rpc(peer, SyncRequest::SharePeers(share_peers))
-        .await
-    {
-        Ok(SyncResponse::Peers(peers)) => {
+    match peer_connections.send_peers_info(peer, share_peers).await {
+        Ok(peers) => {
             tracing::debug!(
                 local = ?state.my_address,
                 ?peer,
@@ -230,18 +215,6 @@ async fn observe_peer<I, D>(
                 "merged shared peer details",
             );
         }
-        Ok(response) => {
-            tracing::debug!(
-                local = ?state.my_address,
-                ?peer,
-                response = response_name(&response),
-                "share peers returned unexpected response",
-            );
-            peer_connections.kill_connection(peer).await;
-            state.clear_peer_leader_observation(peer).await;
-            tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
-            return;
-        }
         Err(error) => {
             tracing::debug!(
                 local = ?state.my_address,
@@ -256,33 +229,15 @@ async fn observe_peer<I, D>(
     }
 
     match peer_connections
-        .send_rpc(
-            peer,
-            SyncRequest::LeaderInformation {
-                source: state.my_address,
-                info: local_observation,
-            },
-        )
+        .send_leader_info(peer, state.my_address, local_observation)
         .await
     {
-        Ok(SyncResponse::Ok) => {
+        Ok(()) => {
             tracing::debug!(
                 local = ?state.my_address,
                 ?peer,
                 "peer accepted local leader information",
             );
-        }
-        Ok(response) => {
-            tracing::debug!(
-                local = ?state.my_address,
-                ?peer,
-                response = response_name(&response),
-                "leader information push returned unexpected response",
-            );
-            peer_connections.kill_connection(peer).await;
-            state.clear_peer_leader_observation(peer).await;
-            tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
-            return;
         }
         Err(error) => {
             tracing::debug!(
@@ -297,8 +252,8 @@ async fn observe_peer<I, D>(
         }
     }
 
-    match peer_connections.send_rpc(peer, SyncRequest::ShareLeaderInfo).await {
-        Ok(SyncResponse::LeaderInfo(info)) if info.observer == peer => {
+    match peer_connections.request_leader_info(peer).await {
+        Ok(info) => {
             tracing::debug!(
                 local = ?state.my_address,
                 ?peer,
@@ -312,17 +267,6 @@ async fn observe_peer<I, D>(
             );
             state.record_leader_observation(peer, info).await;
         }
-        Ok(response) => {
-            tracing::debug!(
-                local = ?state.my_address,
-                ?peer,
-                response = response_name(&response),
-                "share leader info returned unexpected response",
-            );
-            peer_connections.kill_connection(peer).await;
-            state.clear_peer_leader_observation(peer).await;
-            tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
-        }
         Err(error) => {
             tracing::debug!(
                 local = ?state.my_address,
@@ -333,24 +277,6 @@ async fn observe_peer<I, D>(
             state.clear_peer_leader_observation(peer).await;
             tracing::debug!(local = ?state.my_address, ?peer, "cleared failed peer observation");
         }
-    }
-}
-
-fn response_name<A: SyncIOAddress, D: DeterministicState>(response: &SyncResponse<A, D>) -> &'static str {
-    match response {
-        SyncResponse::Pong(_) => "Pong",
-        SyncResponse::Ok => "Ok",
-        SyncResponse::FailedToQueueAction { .. } => "FailedToQueueAction",
-        SyncResponse::Peers(_) => "Peers",
-        SyncResponse::LeaderInfo(_) => "LeaderInfo",
-        SyncResponse::LeaderPath(_) => "LeaderPath",
-        SyncResponse::NoPathToLeader => "NoPathToLeader",
-        SyncResponse::Accepted(_) => "Accepted",
-        SyncResponse::RecoveryFailed => "RecoveryFailed",
-        SyncResponse::FreshState(_) => "FreshState",
-        SyncResponse::AuthorityAction(_, _) => "AuthorityAction",
-        SyncResponse::ActionStreamClosed => "ActionStreamClosed",
-        SyncResponse::UnexpectedRequest => "UnexpectedRequest",
     }
 }
 
@@ -369,7 +295,7 @@ mod tests {
             subscribable_state::SubscribableState,
             tasks::{current_leader::CurrentLeaderStatus, peer_connections::PeerConnections},
         },
-        protocol::messages::{LeaderWithElectionInfo, PROTOCOL_VERSION},
+        protocol::messages::{LeaderWithElectionInfo, SyncRequest, SyncResponse, PROTOCOL_VERSION},
         state::recoverable_state::{RecoverableState, RecoverableStateDetails},
         transport::{
             channels::NetIoSettings,
