@@ -366,13 +366,9 @@ where
         let peer_state = peers.entry(peer).or_insert_with(|| empty_peer_state(peer));
         peer_state.leader_observation = None;
     }
-    let cleared_via = state.leader_status.clear_if_via(peer).await;
-    let cleared_leader = state.leader_status.clear_if_leader(peer).await;
     tracing::debug!(
         local = ?state.my_address,
         ?peer,
-        cleared_via,
-        cleared_leader,
         "cleared failed peer observation",
     );
 }
@@ -636,7 +632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_failed_observation_clears_path_state_without_changing_connected() {
+    async fn clear_failed_observation_does_not_change_leader_status_or_connected() {
         let mut peers = HashMap::new();
         peers.insert(2, peer(2, Some(true), true));
         let state = node_state(1, false, peers);
@@ -644,7 +640,15 @@ mod tests {
 
         clear_failed_observation(&state, 2).await;
 
-        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::NoLeader { term: 3 });
+        assert_eq!(
+            state.leader_status.snapshot().await.mode,
+            LeaderMode::Following {
+                term: 3,
+                leader: 2,
+                path: vec![2, 1],
+                via: 2,
+            }
+        );
         let peers = state.peers.lock().await;
         assert!(peers.get(&2).is_some_and(|peer| peer.is_connected));
     }
