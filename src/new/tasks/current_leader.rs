@@ -42,7 +42,7 @@ where
     state: Arc<NodeState<A, D>>,
     timing: CurrentLeaderTiming,
     state_handle: Mutex<StateHandle<D>>,
-    last_considered_term: Mutex<u64>,
+    last_considered_term: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -210,11 +210,11 @@ where
             state,
             timing,
             state_handle,
-            last_considered_term: Mutex::new(0),
+            last_considered_term: 0,
         }
     }
 
-    pub async fn run(self) {
+    pub async fn run(mut self) {
         tracing::debug!(
             local = ?self.state.my_address,
             interval_ms = self.timing.election_interval.as_millis(),
@@ -228,11 +228,11 @@ where
         }
     }
 
-    pub async fn tick(&self) {
+    pub async fn tick(&mut self) {
         self.apply_election().await;
     }
 
-    pub async fn apply_election(&self) {
+    pub async fn apply_election(&mut self) {
         for _ in 0..2 {
             let now = now_ms();
             let stale_after_ms = self.timing.observation_stale_after.as_millis() as u64;
@@ -285,13 +285,12 @@ where
             };
 
             let local_observation = local_leader_observation(&self.state, &self.state_handle).await;
-            let last_considered_term = *self.last_considered_term.lock().await;
 
             tracing::debug!(
                 local = ?self.state.my_address,
                 can_lead = self.state.can_lead,
                 cluster_term,
-                last_considered_term,
+                last_considered_term = self.last_considered_term,
                 target_term,
                 current_mode = ?snapshot.mode,
                 local_leader = ?local_observation.leader,
@@ -322,7 +321,7 @@ where
                 "leader election decision",
             );
 
-            *self.last_considered_term.lock().await = target_term;
+            self.last_considered_term = target_term;
 
             let recompute = match decision {
                 ElectionDecision::PromoteSelf { term } => {
@@ -630,7 +629,7 @@ mod tests {
     #[tokio::test]
     async fn can_lead_node_promotes_when_no_reachable_leader() {
         let state = node_state(1, true, HashMap::new());
-        let task = task(state.clone());
+        let mut task = task(state.clone());
 
         task.apply_election().await;
 
@@ -646,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn starts_initial_election_at_term_one() {
         let state = node_state(1, false, HashMap::new());
-        let task = task(state.clone());
+        let mut task = task(state.clone());
 
         task.apply_election().await;
 
@@ -657,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn already_leading_node_does_not_advance_term() {
         let state = node_state(1, true, HashMap::new());
-        let task = task(state.clone());
+        let mut task = task(state.clone());
 
         task.apply_election().await;
         let first_term = state.leader_status.current_term().await;
@@ -669,7 +668,7 @@ mod tests {
     #[tokio::test]
     async fn non_leader_node_does_not_promote() {
         let state = node_state(1, false, HashMap::new());
-        let task = task(state.clone());
+        let mut task = task(state.clone());
 
         task.apply_election().await;
 
@@ -684,7 +683,7 @@ mod tests {
         peers.insert(2, peer_two);
         let state = node_state(1, true, peers);
         state.observe_election_term(3);
-        let task = task(state.clone());
+        let mut task = task(state.clone());
 
         task.apply_election().await;
 
@@ -707,7 +706,7 @@ mod tests {
         peers.insert(2, peer_two);
         let state = node_state(1, false, peers);
         state.observe_election_term(5);
-        let task = task(state.clone());
+        let mut task = task(state.clone());
 
         task.apply_election().await;
 
@@ -727,7 +726,7 @@ mod tests {
     async fn promotes_self_for_discovered_term_when_no_leader_exists() {
         let state = node_state(1, true, HashMap::new());
         state.observe_election_term(5);
-        let task = task(state.clone());
+        let mut task = task(state.clone());
 
         task.apply_election().await;
 
@@ -741,7 +740,7 @@ mod tests {
         let state = node_state(1, false, peers);
         assert!(state.leader_status.follow_remote(2, 3, vec![2, 1], 2).await);
         state.observe_election_term(3);
-        let task = task(state.clone());
+        let mut task = task(state.clone());
 
         task.apply_election().await;
 
@@ -763,7 +762,7 @@ mod tests {
         let state = node_state(1, false, peers);
         assert!(state.leader_status.follow_remote(2, 3, vec![2, 1], 2).await);
         state.observe_election_term(3);
-        let task = task(state.clone());
+        let mut task = task(state.clone());
 
         task.apply_election().await;
 
@@ -778,7 +777,7 @@ mod tests {
         let state = node_state(1, true, peers);
         assert!(state.leader_status.follow_remote(2, 3, vec![2, 1], 2).await);
         state.observe_election_term(3);
-        let task = task(state.clone());
+        let mut task = task(state.clone());
 
         task.apply_election().await;
 
