@@ -289,7 +289,7 @@ where
                     repeat_failures += 1;
 
                     if repeat_failures > CONNECT_RETRY_LIMIT {
-                        self.state.set_peer_connected(self.remote_addr, false).await;
+                        self.state.mark_peer_failed_to_connect(self.remote_addr).await;
                         self.drain_with_error(PeerRpcError::FailedToConnectToPeer).await;
                         tokio::time::sleep(CONNECT_FAIL_HOLD_DELAY).await;
                         return;
@@ -304,12 +304,12 @@ where
         let (_remote, write, mut read) = connection.client_channels::<D>(settings.clone());
 
         if let Err(error) = self.handshake(&write, &mut read, settings.message_timeout).await {
-            self.state.set_peer_connected(self.remote_addr, false).await;
+            self.state.mark_peer_not_connected(self.remote_addr).await;
             self.drain_with_error(error).await;
             return;
         }
 
-        self.state.set_peer_connected(self.remote_addr, true).await;
+        self.state.mark_peer_connected(self.remote_addr).await;
 
         let (response_tx, response_rx) = tokio::sync::mpsc::channel(RPC_QUEUE_CAPACITY);
         tokio::spawn(
@@ -349,7 +349,7 @@ where
             }
         }
 
-        self.state.set_peer_connected(self.remote_addr, false).await;
+        self.state.mark_peer_not_connected(self.remote_addr).await;
         self.cancel.cancel();
     }
 
@@ -444,7 +444,9 @@ mod tests {
     use super::*;
     use crate::{
         new::{
-            node_state::NodeState, subscribable_state::SubscribableState, tasks::current_leader::CurrentLeaderStatus,
+            node_state::{ConnectStatus, NodeState},
+            subscribable_state::SubscribableState,
+            tasks::current_leader::CurrentLeaderStatus,
         },
         protocol::messages::PROTOCOL_VERSION,
         state::recoverable_state::RecoverableState,
@@ -764,7 +766,10 @@ mod tests {
         assert!(matches!(task.await.unwrap().unwrap(), SyncResponse::Pong(42)));
 
         let peers = state.peers.lock().await;
-        assert!(peers.get(&2).is_some_and(|peer| peer.is_connected));
+        assert!(peers.get(&2).is_some_and(|peer| matches!(
+            peer.connect_status,
+            ConnectStatus::Connected { epoch_ms } if epoch_ms > 0
+        )));
     }
 
     #[tokio::test]
@@ -788,7 +793,13 @@ mod tests {
         connections.kill_connection(2).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if state.peers.lock().await.get(&2).is_some_and(|peer| !peer.is_connected) {
+                if state
+                    .peers
+                    .lock()
+                    .await
+                    .get(&2)
+                    .is_some_and(|peer| peer.connect_status == ConnectStatus::NotConnected)
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -809,6 +820,12 @@ mod tests {
         }
         write.send(SyncResponse::Pong(2)).await.unwrap();
         assert!(matches!(second.await.unwrap().unwrap(), SyncResponse::Pong(2)));
+
+        let peers = state.peers.lock().await;
+        assert!(peers.get(&2).is_some_and(|peer| matches!(
+            peer.connect_status,
+            ConnectStatus::Connected { epoch_ms } if epoch_ms > 0
+        )));
     }
 
     #[tokio::test]
@@ -847,11 +864,14 @@ mod tests {
         assert!(matches!(second.await.unwrap().unwrap(), SyncResponse::Pong(2)));
 
         let peers = state.peers.lock().await;
-        assert!(peers.get(&2).is_some_and(|peer| peer.is_connected));
+        assert!(peers.get(&2).is_some_and(|peer| matches!(
+            peer.connect_status,
+            ConnectStatus::Connected { epoch_ms } if epoch_ms > 0
+        )));
     }
 
     #[tokio::test]
-    async fn connect_failure_marks_peer_disconnected() {
+    async fn connect_failure_marks_peer_failed_to_connect() {
         let (connections, _remote_io, state) = peer_connections(1, 2, false).await;
 
         let result = tokio::time::timeout(Duration::from_secs(2), connections.send_rpc(2, SyncRequest::Ping(1)))
@@ -861,6 +881,9 @@ mod tests {
         assert!(matches!(result, Err(PeerRpcError::FailedToConnectToPeer)));
 
         let peers = state.peers.lock().await;
-        assert!(peers.get(&2).is_some_and(|peer| !peer.is_connected));
+        assert!(peers.get(&2).is_some_and(|peer| matches!(
+            peer.connect_status,
+            ConnectStatus::FailedToConnect { epoch_ms } if epoch_ms > 0
+        )));
     }
 }

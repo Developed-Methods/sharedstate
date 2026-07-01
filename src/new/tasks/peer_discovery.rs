@@ -296,7 +296,7 @@ mod tests {
     use super::*;
     use crate::{
         new::{
-            node_state::PeerState,
+            node_state::{ConnectStatus, PeerState},
             subscribable_state::SubscribableState,
             tasks::{current_leader::CurrentLeaderStatus, peer_connections::PeerConnections},
         },
@@ -453,13 +453,17 @@ mod tests {
         }
     }
 
-    fn peer(addr: u64, can_lead: Option<bool>, is_connected: bool) -> PeerState<u64> {
+    fn peer(addr: u64, can_lead: Option<bool>, connected: bool) -> PeerState<u64> {
         PeerState {
             addr,
             latency: None,
             can_lead,
-            is_connected,
-            last_global_connectivity: is_connected.then(|| NonZeroU64::new(now_ms()).unwrap()),
+            connect_status: if connected {
+                ConnectStatus::Connected { epoch_ms: 100 }
+            } else {
+                ConnectStatus::NotConnected
+            },
+            last_global_connectivity: connected.then(|| NonZeroU64::new(now_ms()).unwrap()),
             leader_observation: None,
         }
     }

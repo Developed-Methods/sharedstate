@@ -243,7 +243,9 @@ mod tests {
     use super::*;
     use crate::{
         new::{
-            node_state::PeerState, subscribable_state::SubscribableState, tasks::current_leader::CurrentLeaderStatus,
+            node_state::{ConnectStatus, PeerState},
+            subscribable_state::SubscribableState,
+            tasks::current_leader::CurrentLeaderStatus,
         },
         protocol::messages::{LeaderWithElectionInfo, PROTOCOL_VERSION},
         state::recoverable_state::{RecoverableState, RecoverableStateDetails},
@@ -320,7 +322,7 @@ mod tests {
                 addr: 2,
                 latency: None,
                 can_lead: Some(true),
-                is_connected: true,
+                connect_status: ConnectStatus::Connected { epoch_ms: 100 },
                 last_global_connectivity: None,
                 leader_observation: None,
             },

@@ -427,7 +427,9 @@ where
     let peers = state.peers.lock().await;
     let mut reachable_can_lead = peers
         .iter()
-        .filter_map(|(_, peer)| (peer.is_connected && peer.can_lead == Some(true)).then_some(peer.addr))
+        .filter_map(|(_, peer)| {
+            (peer.connect_status.is_connected() && peer.can_lead == Some(true)).then_some(peer.addr)
+        })
         .collect::<Vec<_>>();
     if state.can_lead {
         reachable_can_lead.push(state.my_address);
@@ -496,7 +498,7 @@ mod tests {
     use super::*;
     use crate::{
         new::{
-            node_state::{NodeState, PeerState},
+            node_state::{ConnectStatus, NodeState, PeerState},
             subscribable_state::SubscribableState,
         },
         state::recoverable_state::{RecoverableState, RecoverableStateDetails},
@@ -544,13 +546,17 @@ mod tests {
         CurrentLeaderTask::new(state, CurrentLeaderTiming::default())
     }
 
-    fn peer(addr: u64, can_lead: Option<bool>, is_connected: bool) -> PeerState<u64> {
+    fn peer(addr: u64, can_lead: Option<bool>, connected: bool) -> PeerState<u64> {
         PeerState {
             addr,
             latency: None,
             can_lead,
-            is_connected,
-            last_global_connectivity: is_connected.then(|| NonZeroU64::new(now_ms()).unwrap()),
+            connect_status: if connected {
+                ConnectStatus::Connected { epoch_ms: 100 }
+            } else {
+                ConnectStatus::NotConnected
+            },
+            last_global_connectivity: connected.then(|| NonZeroU64::new(now_ms()).unwrap()),
             leader_observation: None,
         }
     }
@@ -785,6 +791,17 @@ mod tests {
         let mut peers = HashMap::new();
         peers.insert(2, peer(2, Some(true), true));
         peers.insert(3, peer(3, Some(true), false));
+        peers.insert(
+            4,
+            PeerState {
+                addr: 4,
+                latency: None,
+                can_lead: Some(true),
+                connect_status: ConnectStatus::FailedToConnect { epoch_ms: 100 },
+                last_global_connectivity: None,
+                leader_observation: None,
+            },
+        );
         let state = node_state(1, false, peers);
         let state_handle = Mutex::new(state.state.create_handle());
 

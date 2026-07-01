@@ -24,7 +24,7 @@ use ratatui::{
 use sequenced_broadcast::SequencedBroadcastSettings;
 use sharedstate::{
     new::{
-        node_state::{NodeState, PeerState},
+        node_state::{ConnectStatus, NodeState, PeerState},
         subscribable_state::StateHandle,
         tasks::{
             current_leader::{CurrentLeaderStatus, CurrentLeaderTask, CurrentLeaderTiming, LeaderMode},
@@ -420,7 +420,7 @@ async fn main() -> io::Result<()> {
                     addr: peer,
                     latency: None,
                     can_lead: None,
-                    is_connected: false,
+                    connect_status: ConnectStatus::NotConnected,
                     last_global_connectivity: None,
                     leader_observation: None,
                 },
@@ -791,9 +791,9 @@ async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut 
     } else {
         for peer in peers.values() {
             lines.push(format!(
-                "  {} connected={} can_lead={:?} latency_ms={:?} last_global={:?} observed_leader={:?} observed_term={:?}",
+                "  {} status={} can_lead={:?} latency_ms={:?} last_global={:?} observed_leader={:?} observed_term={:?}",
                 peer.addr,
-                peer.is_connected,
+                connect_status_line(peer.connect_status),
                 peer.can_lead,
                 peer.latency.map(|latency| latency.get()),
                 peer.last_global_connectivity.map(|value| value.get()),
@@ -804,6 +804,14 @@ async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut 
     }
 
     lines
+}
+
+fn connect_status_line(status: ConnectStatus) -> String {
+    match status {
+        ConnectStatus::Connected { epoch_ms } => format!("Connected since={epoch_ms}"),
+        ConnectStatus::FailedToConnect { epoch_ms } => format!("FailedToConnect since={epoch_ms}"),
+        ConnectStatus::NotConnected => "NotConnected".to_owned(),
+    }
 }
 
 fn leader_mode_line(mode: &LeaderMode<u16>) -> String {
@@ -890,9 +898,9 @@ async fn run_command(
             } else {
                 for peer in peers.values() {
                     app.log(format!(
-                        "{} connected={} can_lead={:?} latency_ms={:?} observed_leader={:?}",
+                        "{} status={} can_lead={:?} latency_ms={:?} observed_leader={:?}",
                         peer.addr,
-                        peer.is_connected,
+                        connect_status_line(peer.connect_status),
                         peer.can_lead,
                         peer.latency.map(|latency| latency.get()),
                         peer.leader_observation.as_ref().and_then(|info| info.leader),

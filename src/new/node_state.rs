@@ -30,9 +30,36 @@ pub struct PeerState<A: SyncIOAddress> {
     pub addr: A,
     pub latency: Option<NonZeroU64>,
     pub can_lead: Option<bool>,
-    pub is_connected: bool,
+    pub connect_status: ConnectStatus,
     pub last_global_connectivity: Option<NonZeroU64>,
     pub leader_observation: Option<LeaderWithElectionInfo<A>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectStatus {
+    Connected { epoch_ms: u64 },
+    FailedToConnect { epoch_ms: u64 },
+    NotConnected,
+}
+
+impl ConnectStatus {
+    pub fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected { .. })
+    }
+
+    pub fn connected_at_ms(&self) -> Option<u64> {
+        match self {
+            Self::Connected { epoch_ms } => Some(*epoch_ms),
+            Self::FailedToConnect { .. } | Self::NotConnected => None,
+        }
+    }
+
+    pub fn failed_at_ms(&self) -> Option<u64> {
+        match self {
+            Self::FailedToConnect { epoch_ms } => Some(*epoch_ms),
+            Self::Connected { .. } | Self::NotConnected => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -49,7 +76,7 @@ impl<A: SyncIOAddress> PeerState<A> {
             addr,
             latency: None,
             can_lead: None,
-            is_connected: false,
+            connect_status: ConnectStatus::NotConnected,
             last_global_connectivity: None,
             leader_observation: None,
         }
@@ -167,17 +194,31 @@ where
         true
     }
 
-    pub(crate) async fn set_peer_connected(&self, peer: A, is_connected: bool) {
+    pub(crate) async fn mark_peer_connected(&self, peer: A) {
+        self.set_peer_connect_status(peer, ConnectStatus::Connected { epoch_ms: now_ms() })
+            .await;
+    }
+
+    pub(crate) async fn mark_peer_not_connected(&self, peer: A) {
+        self.set_peer_connect_status(peer, ConnectStatus::NotConnected).await;
+    }
+
+    pub(crate) async fn mark_peer_failed_to_connect(&self, peer: A) {
+        self.set_peer_connect_status(peer, ConnectStatus::FailedToConnect { epoch_ms: now_ms() })
+            .await;
+    }
+
+    async fn set_peer_connect_status(&self, peer: A, connect_status: ConnectStatus) {
         self.peers
             .lock()
             .await
             .entry(peer)
             .and_modify(|peer_state| {
-                peer_state.is_connected = is_connected;
+                peer_state.connect_status = connect_status;
             })
             .or_insert_with(|| {
                 let mut peer_state = PeerState::empty(peer);
-                peer_state.is_connected = is_connected;
+                peer_state.connect_status = connect_status;
                 peer_state
             });
     }
@@ -245,12 +286,12 @@ mod tests {
         })
     }
 
-    fn peer(addr: u64, can_lead: Option<bool>, is_connected: bool) -> PeerState<u64> {
+    fn peer(addr: u64, can_lead: Option<bool>, connect_status: ConnectStatus) -> PeerState<u64> {
         PeerState {
             addr,
             latency: None,
             can_lead,
-            is_connected,
+            connect_status,
             last_global_connectivity: None,
             leader_observation: None,
         }
@@ -352,7 +393,7 @@ mod tests {
     #[tokio::test]
     async fn merge_peer_details_updates_can_lead_only_when_present() {
         let mut peers = HashMap::new();
-        peers.insert(2, peer(2, Some(true), false));
+        peers.insert(2, peer(2, Some(true), ConnectStatus::NotConnected));
         let state = node_state(1, true, peers);
 
         state
@@ -377,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn merge_peer_details_preserves_newest_global_activity() {
         let mut peers = HashMap::new();
-        let mut peer = peer(2, None, false);
+        let mut peer = peer(2, None, ConnectStatus::NotConnected);
         peer.last_global_connectivity = NonZeroU64::new(20);
         peers.insert(2, peer);
         let state = node_state(1, true, peers);
@@ -404,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn local_and_known_peer_details_includes_self() {
         let mut peers = HashMap::new();
-        peers.insert(2, peer(2, Some(false), false));
+        peers.insert(2, peer(2, Some(false), ConnectStatus::NotConnected));
         let state = node_state(1, true, peers);
 
         let details = state.local_and_known_peer_details().await;
@@ -435,9 +476,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_peer_leader_observation_does_not_change_connected() {
+    async fn clear_peer_leader_observation_does_not_change_connect_status() {
         let mut peers = HashMap::new();
-        let mut peer = peer(2, Some(true), true);
+        let mut peer = peer(2, Some(true), ConnectStatus::Connected { epoch_ms: 100 });
         peer.leader_observation = Some(leader_observation(2, 1, 2, vec![2]));
         peers.insert(2, peer);
         let state = node_state(1, false, peers);
@@ -447,7 +488,7 @@ mod tests {
 
         let peers = state.peers.lock().await;
         let peer = peers.get(&2).unwrap();
-        assert!(peer.is_connected);
+        assert_eq!(peer.connect_status, ConnectStatus::Connected { epoch_ms: 100 });
         assert!(peer.leader_observation.is_none());
         drop(peers);
         assert!(state.leader_status.path_to_leader().await.is_some());
@@ -456,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn note_known_peer_activity_updates_existing_peer_only() {
         let mut peers = HashMap::new();
-        peers.insert(2, peer(2, None, false));
+        peers.insert(2, peer(2, None, ConnectStatus::NotConnected));
         let state = node_state(1, true, peers);
 
         assert!(state.note_known_peer_activity(2).await);
@@ -468,15 +509,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_peer_connected_inserts_missing_peer() {
+    async fn mark_peer_connected_inserts_missing_peer() {
         let state = node_state(1, true, HashMap::new());
+        let before = now_ms();
 
-        state.set_peer_connected(2, true).await;
+        state.mark_peer_connected(2).await;
+        let after = now_ms();
 
         let peers = state.peers.lock().await;
         let peer = peers.get(&2).unwrap();
         assert_eq!(peer.addr, 2);
-        assert!(peer.is_connected);
+        let ConnectStatus::Connected { epoch_ms } = peer.connect_status else {
+            panic!("expected connected status, got {:?}", peer.connect_status);
+        };
+        assert!((before..=after).contains(&epoch_ms));
         assert_eq!(peer.can_lead, None);
+    }
+
+    #[tokio::test]
+    async fn mark_peer_not_connected_sets_not_connected() {
+        let mut peers = HashMap::new();
+        peers.insert(2, peer(2, None, ConnectStatus::Connected { epoch_ms: 100 }));
+        let state = node_state(1, true, peers);
+
+        state.mark_peer_not_connected(2).await;
+
+        assert_eq!(state.peers.lock().await.get(&2).unwrap().connect_status, ConnectStatus::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn mark_peer_failed_to_connect_records_transition_time() {
+        let state = node_state(1, true, HashMap::new());
+        let before = now_ms();
+
+        state.mark_peer_failed_to_connect(2).await;
+        let after = now_ms();
+
+        let peers = state.peers.lock().await;
+        let ConnectStatus::FailedToConnect { epoch_ms } = peers.get(&2).unwrap().connect_status else {
+            panic!("expected failed-to-connect status");
+        };
+        assert!((before..=after).contains(&epoch_ms));
+    }
+
+    #[tokio::test]
+    async fn failed_to_connect_timestamp_updates_on_new_failure_transition() {
+        let state = node_state(1, true, HashMap::new());
+
+        state.mark_peer_failed_to_connect(2).await;
+        let first = state
+            .peers
+            .lock()
+            .await
+            .get(&2)
+            .unwrap()
+            .connect_status
+            .failed_at_ms()
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        state.mark_peer_failed_to_connect(2).await;
+        let second = state
+            .peers
+            .lock()
+            .await
+            .get(&2)
+            .unwrap()
+            .connect_status
+            .failed_at_ms()
+            .unwrap();
+
+        assert!(second >= first);
+    }
+
+    #[test]
+    fn connect_status_helpers_identify_connected_and_failed_times() {
+        let connected = ConnectStatus::Connected { epoch_ms: 10 };
+        let failed = ConnectStatus::FailedToConnect { epoch_ms: 20 };
+        let not_connected = ConnectStatus::NotConnected;
+
+        assert!(connected.is_connected());
+        assert_eq!(connected.connected_at_ms(), Some(10));
+        assert_eq!(connected.failed_at_ms(), None);
+        assert!(!failed.is_connected());
+        assert_eq!(failed.connected_at_ms(), None);
+        assert_eq!(failed.failed_at_ms(), Some(20));
+        assert!(!not_connected.is_connected());
+        assert_eq!(not_connected.connected_at_ms(), None);
+        assert_eq!(not_connected.failed_at_ms(), None);
     }
 }
