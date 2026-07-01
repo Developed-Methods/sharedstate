@@ -345,7 +345,7 @@ async fn observe_peer<I, D>(
                 latency_ms = latency.map(NonZeroU64::get),
                 "peer ping succeeded",
             );
-            mark_connected(&state, peer, latency).await;
+            mark_peer_observed(&state, peer, latency).await;
         }
         Ok(response) => {
             tracing::debug!(
@@ -354,7 +354,8 @@ async fn observe_peer<I, D>(
                 response = response_name(&response),
                 "peer ping returned unexpected response",
             );
-            mark_disconnected(&state, peer).await;
+            peer_connections.kill_connection(peer).await;
+            clear_failed_observation(&state, peer).await;
             return;
         }
         Err(error) => {
@@ -364,7 +365,7 @@ async fn observe_peer<I, D>(
                 ?error,
                 "peer ping failed",
             );
-            mark_disconnected(&state, peer).await;
+            clear_failed_observation(&state, peer).await;
             return;
         }
     }
@@ -389,7 +390,8 @@ async fn observe_peer<I, D>(
                 response = response_name(&response),
                 "share peers returned unexpected response",
             );
-            mark_disconnected(&state, peer).await;
+            peer_connections.kill_connection(peer).await;
+            clear_failed_observation(&state, peer).await;
             return;
         }
         Err(error) => {
@@ -399,7 +401,7 @@ async fn observe_peer<I, D>(
                 ?error,
                 "share peers request failed",
             );
-            mark_disconnected(&state, peer).await;
+            clear_failed_observation(&state, peer).await;
             return;
         }
     }
@@ -419,7 +421,6 @@ async fn observe_peer<I, D>(
             );
             let mut peers = state.peers.lock().await;
             let peer_state = peers.entry(peer).or_insert_with(|| empty_peer_state(peer));
-            peer_state.is_connected = true;
             peer_state.can_lead = Some(info.can_lead);
             peer_state.last_global_connectivity = NonZeroU64::new(now_ms());
             peer_state.leader_observation = Some(info);
@@ -431,7 +432,8 @@ async fn observe_peer<I, D>(
                 response = response_name(&response),
                 "share leader info returned unexpected response",
             );
-            mark_disconnected(&state, peer).await;
+            peer_connections.kill_connection(peer).await;
+            clear_failed_observation(&state, peer).await;
         }
         Err(error) => {
             tracing::debug!(
@@ -440,19 +442,18 @@ async fn observe_peer<I, D>(
                 ?error,
                 "share leader info request failed",
             );
-            mark_disconnected(&state, peer).await;
+            clear_failed_observation(&state, peer).await;
         }
     }
 }
 
-async fn mark_connected<A, D>(state: &NodeState<A, D>, peer: A, latency: Option<NonZeroU64>)
+async fn mark_peer_observed<A, D>(state: &NodeState<A, D>, peer: A, latency: Option<NonZeroU64>)
 where
     A: SyncIOAddress,
     D: DeterministicState,
 {
     let mut peers = state.peers.lock().await;
     let peer_state = peers.entry(peer).or_insert_with(|| empty_peer_state(peer));
-    peer_state.is_connected = true;
     peer_state.latency = latency;
     peer_state.last_global_connectivity = NonZeroU64::new(now_ms());
     tracing::debug!(
@@ -463,7 +464,7 @@ where
     );
 }
 
-async fn mark_disconnected<A, D>(state: &NodeState<A, D>, peer: A)
+async fn clear_failed_observation<A, D>(state: &NodeState<A, D>, peer: A)
 where
     A: SyncIOAddress,
     D: DeterministicState,
@@ -471,7 +472,6 @@ where
     {
         let mut peers = state.peers.lock().await;
         let peer_state = peers.entry(peer).or_insert_with(|| empty_peer_state(peer));
-        peer_state.is_connected = false;
         peer_state.leader_observation = None;
     }
     let cleared_via = state.leader_status.clear_if_via(peer).await;
@@ -481,7 +481,7 @@ where
         ?peer,
         cleared_via,
         cleared_leader,
-        "marked peer disconnected",
+        "cleared failed peer observation",
     );
 }
 
@@ -753,9 +753,11 @@ mod tests {
         let state = node_state(1, false, peers);
         assert!(state.leader_status.follow_remote(2, 3, vec![2, 1], 2).await);
 
-        mark_disconnected(&state, 2).await;
+        clear_failed_observation(&state, 2).await;
 
         assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::NoLeader { term: 3 });
+        let peers = state.peers.lock().await;
+        assert!(peers.get(&2).is_some_and(|peer| peer.is_connected));
     }
 
     #[tokio::test]

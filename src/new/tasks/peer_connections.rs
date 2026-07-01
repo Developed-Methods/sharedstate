@@ -33,6 +33,7 @@ pub struct PeerConnections<I: SyncIO, D: DeterministicState> {
 
 struct Connection<A: SyncIOAddress, D: DeterministicState> {
     tx: Sender<RpcMessage<A, D>>,
+    kill_tx: Sender<()>,
 }
 
 struct RpcMessage<A: SyncIOAddress, D: DeterministicState> {
@@ -114,6 +115,14 @@ where
             }
         }
     }
+
+    pub async fn kill_connection(&self, peer: I::Address) {
+        let connection = self.connections.lock().await.remove(&peer);
+        if let Some(connection) = connection {
+            connection.kill();
+        }
+        set_peer_connected(&self.state, peer, false).await;
+    }
 }
 
 async fn await_rpc_response<A: SyncIOAddress, D: DeterministicState>(
@@ -143,10 +152,12 @@ where
         I: SyncIO<Address = A>,
     {
         let (tx, rx) = tokio::sync::mpsc::channel(RPC_QUEUE_CAPACITY);
+        let (kill_tx, kill_rx) = tokio::sync::mpsc::channel(1);
 
         tokio::spawn(
             ConnectionWorker {
                 rx,
+                kill_rx,
                 remote_addr,
                 local_addr,
                 state,
@@ -154,7 +165,11 @@ where
             .run(io, settings),
         );
 
-        Self { tx }
+        Self { tx, kill_tx }
+    }
+
+    fn kill(self) {
+        let _ = self.kill_tx.try_send(());
     }
 }
 
@@ -171,6 +186,7 @@ pub enum PeerRpcError {
 
 struct ConnectionWorker<A: SyncIOAddress, D: DeterministicState> {
     rx: Receiver<RpcMessage<A, D>>,
+    kill_rx: Receiver<()>,
     remote_addr: A,
     local_addr: A,
     state: Arc<NodeState<A, D>>,
@@ -225,19 +241,32 @@ where
             .run(),
         );
 
-        while let Some(msg) = self.rx.recv().await {
-            if write.send(msg.request).await.is_err() {
-                set_peer_connected(&self.state, self.remote_addr, false).await;
-                let _ = msg.response.send(Err(PeerRpcError::FailedToSendRequest));
-                self.drain_with_error(PeerRpcError::FailedToSendRequest).await;
-                return;
-            }
+        loop {
+            tokio::select! {
+                _ = self.kill_rx.recv() => {
+                    set_peer_connected(&self.state, self.remote_addr, false).await;
+                    self.drain_with_error(PeerRpcError::FailedToReceiveResponse).await;
+                    return;
+                }
+                msg = self.rx.recv() => {
+                    let Some(msg) = msg else {
+                        return;
+                    };
 
-            if let Err(error) = response_tx.send(msg.response).await {
-                set_peer_connected(&self.state, self.remote_addr, false).await;
-                let _ = error.0.send(Err(PeerRpcError::FailedToReceiveResponse));
-                self.drain_with_error(PeerRpcError::FailedToReceiveResponse).await;
-                return;
+                    if write.send(msg.request).await.is_err() {
+                        set_peer_connected(&self.state, self.remote_addr, false).await;
+                        let _ = msg.response.send(Err(PeerRpcError::FailedToSendRequest));
+                        self.drain_with_error(PeerRpcError::FailedToSendRequest).await;
+                        return;
+                    }
+
+                    if let Err(error) = response_tx.send(msg.response).await {
+                        set_peer_connected(&self.state, self.remote_addr, false).await;
+                        let _ = error.0.send(Err(PeerRpcError::FailedToReceiveResponse));
+                        self.drain_with_error(PeerRpcError::FailedToReceiveResponse).await;
+                        return;
+                    }
+                }
             }
         }
     }
@@ -632,6 +661,44 @@ mod tests {
 
         let peers = state.peers.lock().await;
         assert!(peers.get(&2).is_some_and(|peer| peer.is_connected));
+    }
+
+    #[tokio::test]
+    async fn kill_connection_marks_disconnected_and_recreates_next_connection() {
+        let (connections, remote_io, state) = peer_connections(1, 2, true).await;
+        let remote_io = remote_io.unwrap();
+
+        let first = tokio::spawn({
+            let connections = connections.clone();
+            async move { connections.send_rpc(2, SyncRequest::Ping(1)).await }
+        });
+        let (write, mut read) = accept_server(&remote_io).await;
+        expect_handshake(&write, &mut read, 1).await;
+        match recv_request(&mut read).await {
+            SyncRequest::Ping(id) => assert_eq!(id, 1),
+            other => panic!("expected first ping request, got {other:?}"),
+        }
+        write.send(SyncResponse::Pong(1)).await.unwrap();
+        assert!(matches!(first.await.unwrap().unwrap(), SyncResponse::Pong(1)));
+
+        connections.kill_connection(2).await;
+        {
+            let peers = state.peers.lock().await;
+            assert!(peers.get(&2).is_some_and(|peer| !peer.is_connected));
+        }
+
+        let second = tokio::spawn({
+            let connections = connections.clone();
+            async move { connections.send_rpc(2, SyncRequest::Ping(2)).await }
+        });
+        let (write, mut read) = accept_server(&remote_io).await;
+        expect_handshake(&write, &mut read, 1).await;
+        match recv_request(&mut read).await {
+            SyncRequest::Ping(id) => assert_eq!(id, 2),
+            other => panic!("expected second ping request, got {other:?}"),
+        }
+        write.send(SyncResponse::Pong(2)).await.unwrap();
+        assert!(matches!(second.await.unwrap().unwrap(), SyncResponse::Pong(2)));
     }
 
     #[tokio::test]
