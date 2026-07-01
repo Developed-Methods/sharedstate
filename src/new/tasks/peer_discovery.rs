@@ -282,7 +282,12 @@ async fn observe_peer<I, D>(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, io::Result, sync::Arc, time::Duration};
+    use std::{
+        collections::HashMap,
+        io::Result,
+        sync::{atomic::AtomicU64, Arc},
+        time::Duration,
+    };
 
     use message_encoding::MessageEncoding;
     use sequenced_broadcast::SequencedBroadcastSettings;
@@ -365,6 +370,7 @@ mod tests {
             )
             .unwrap(),
             leader_status: Arc::new(CurrentLeaderStatus::new(address)),
+            election_term: AtomicU64::new(0),
         })
     }
 
@@ -495,6 +501,7 @@ mod tests {
         task_handle.await.unwrap();
         let peers = state.peers.lock().await;
         assert_eq!(peers.get(&2).unwrap().leader_observation.as_ref().unwrap().observer, 2);
+        assert_eq!(state.election_term(), 1);
     }
 
     #[tokio::test]

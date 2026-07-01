@@ -42,6 +42,7 @@ where
     state: Arc<NodeState<A, D>>,
     timing: CurrentLeaderTiming,
     state_handle: Mutex<StateHandle<D>>,
+    last_considered_term: Mutex<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +104,26 @@ impl<A: SyncIOAddress> CurrentLeaderStatus<A> {
         let term = state.term().max(observed_term) + 1;
         *state = LeaderMode::Electing { term };
         term
+    }
+
+    pub async fn observe_no_leader_term(&self, term: u64) -> bool {
+        let mut state = self.state.lock().await;
+        if term < state.term() {
+            return false;
+        }
+
+        *state = LeaderMode::NoLeader { term };
+        true
+    }
+
+    pub async fn begin_election_for_term(&self, term: u64) -> bool {
+        let mut state = self.state.lock().await;
+        if term < state.term() {
+            return false;
+        }
+
+        *state = LeaderMode::Electing { term };
+        true
     }
 
     pub async fn promote_self(&self, term: u64) {
@@ -189,6 +210,7 @@ where
             state,
             timing,
             state_handle,
+            last_considered_term: Mutex::new(0),
         }
     }
 
@@ -211,137 +233,183 @@ where
     }
 
     pub async fn apply_election(&self) {
-        let now = now_ms();
-        let stale_after_ms = self.timing.observation_stale_after.as_millis() as u64;
+        for _ in 0..2 {
+            let now = now_ms();
+            let stale_after_ms = self.timing.observation_stale_after.as_millis() as u64;
+            let cluster_term = self.state.election_term();
+            let snapshot = self.state.leader_status.snapshot().await;
+            let local_status_term = snapshot.mode.term();
+            let current_leader = snapshot.mode.leader();
+            let mut target_term = cluster_term.max(local_status_term);
 
-        let (known_can_lead, peer_observations, peer_reachability) = {
-            let peers = self.state.peers.lock().await;
-            let mut known_can_lead = peers
-                .values()
-                .filter_map(|peer| (peer.can_lead == Some(true)).then_some(peer.addr))
-                .collect::<BTreeSet<_>>();
-
-            if self.state.can_lead {
-                known_can_lead.insert(self.state.my_address);
+            if target_term == 0 {
+                target_term = self.state.bump_election_term_after(0);
+                self.state.leader_status.observe_no_leader_term(target_term).await;
             }
 
-            let peer_observations = peers
-                .values()
-                .filter_map(|peer| {
-                    peer.leader_observation.clone().map(|observation| TimedPeerObservation {
-                        observer: peer.addr,
-                        last_activity_ms: peer.last_global_connectivity.map(NonZeroU64::get),
-                        observation,
-                    })
-                })
-                .collect::<Vec<_>>();
+            let (known_can_lead, peer_observations, peer_reachability) = {
+                let peers = self.state.peers.lock().await;
+                let mut known_can_lead = peers
+                    .values()
+                    .filter_map(|peer| (peer.can_lead == Some(true)).then_some(peer.addr))
+                    .collect::<BTreeSet<_>>();
 
-            let peer_reachability = peers
-                .values()
-                .map(|peer| {
-                    (
-                        peer.addr,
-                        PeerReachability {
-                            last_activity_ms: peer.last_global_connectivity.map(NonZeroU64::get),
-                        },
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-
-            (known_can_lead, peer_observations, peer_reachability)
-        };
-
-        let local_observation = local_leader_observation(&self.state, &self.state_handle).await;
-        let election_term = self.state.leader_status.current_term().await;
-
-        tracing::debug!(
-            local = ?self.state.my_address,
-            can_lead = self.state.can_lead,
-            election_term,
-            local_leader = ?local_observation.leader,
-            local_leader_path = ?local_observation.leader_path,
-            known_can_lead = ?known_can_lead,
-            peer_observation_count = peer_observations.len(),
-            peer_reachability_count = peer_reachability.len(),
-            stale_after_ms,
-            "applying leader election",
-        );
-
-        let decision = decide_election(ElectionInput {
-            local_address: self.state.my_address,
-            can_lead: self.state.can_lead,
-            known_can_lead,
-            local_observation,
-            peer_observations,
-            peer_reachability,
-            election_term,
-            now_ms: now,
-            stale_after_ms,
-        });
-        tracing::debug!(
-            local = ?self.state.my_address,
-            ?decision,
-            "leader election decision",
-        );
-
-        match decision {
-            ElectionDecision::PromoteSelf { observed_term } => {
-                if self.state.leader_status.leader().await == Some(self.state.my_address) {
-                    tracing::debug!(
-                        local = ?self.state.my_address,
-                        observed_term,
-                        "already leading; skipping self-promotion",
-                    );
-                    return;
+                if self.state.can_lead {
+                    known_can_lead.insert(self.state.my_address);
                 }
 
-                let term = self.state.leader_status.begin_election(observed_term).await;
-                let new_id = new_generation_id(self.state.my_address, term);
-                tracing::debug!(
-                    local = ?self.state.my_address,
-                    observed_term,
+                let peer_observations = peers
+                    .values()
+                    .filter_map(|peer| {
+                        peer.leader_observation.clone().map(|observation| TimedPeerObservation {
+                            observer: peer.addr,
+                            last_activity_ms: peer.last_global_connectivity.map(NonZeroU64::get),
+                            observation,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                let peer_reachability = peers
+                    .values()
+                    .map(|peer| {
+                        (
+                            peer.addr,
+                            PeerReachability {
+                                last_activity_ms: peer.last_global_connectivity.map(NonZeroU64::get),
+                            },
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+
+                (known_can_lead, peer_observations, peer_reachability)
+            };
+
+            let local_observation = local_leader_observation(&self.state, &self.state_handle).await;
+            let last_considered_term = *self.last_considered_term.lock().await;
+
+            tracing::debug!(
+                local = ?self.state.my_address,
+                can_lead = self.state.can_lead,
+                cluster_term,
+                last_considered_term,
+                target_term,
+                current_mode = ?snapshot.mode,
+                local_leader = ?local_observation.leader,
+                local_leader_path = ?local_observation.leader_path,
+                known_can_lead = ?known_can_lead,
+                peer_observation_count = peer_observations.len(),
+                peer_reachability_count = peer_reachability.len(),
+                stale_after_ms,
+                "applying leader election",
+            );
+
+            let decision = decide_election(ElectionInput {
+                local_address: self.state.my_address,
+                can_lead: self.state.can_lead,
+                known_can_lead,
+                local_observation,
+                peer_observations,
+                peer_reachability,
+                current_leader,
+                election_term: target_term,
+                now_ms: now,
+                stale_after_ms,
+            });
+            tracing::debug!(
+                local = ?self.state.my_address,
+                target_term,
+                ?decision,
+                "leader election decision",
+            );
+
+            *self.last_considered_term.lock().await = target_term;
+
+            let recompute = match decision {
+                ElectionDecision::PromoteSelf { term } => {
+                    if matches!(
+                        self.state.leader_status.snapshot().await.mode,
+                        LeaderMode::Leading {
+                            term: current_term,
+                            ..
+                        } if current_term == term
+                    ) {
+                        tracing::debug!(
+                            local = ?self.state.my_address,
+                            term,
+                            "already leading for term; skipping self-promotion",
+                        );
+                        false
+                    } else if !self.state.leader_status.begin_election_for_term(term).await {
+                        tracing::debug!(
+                            local = ?self.state.my_address,
+                            term,
+                            "failed to begin election for stale term",
+                        );
+                        false
+                    } else {
+                        self.state.observe_election_term(term);
+                        let new_id = new_generation_id(self.state.my_address, term);
+                        tracing::debug!(
+                            local = ?self.state.my_address,
+                            term,
+                            new_id,
+                            "promoting self to leader",
+                        );
+                        self.state
+                            .state
+                            .update(iter::once(RecoverableStateAction::BumpGeneration { new_id }))
+                            .await;
+                        self.state.leader_status.promote_self(term).await;
+                        false
+                    }
+                }
+                ElectionDecision::FollowRemote {
+                    leader,
                     term,
-                    new_id,
-                    "promoting self to leader",
-                );
-                self.state
-                    .state
-                    .update(iter::once(RecoverableStateAction::BumpGeneration { new_id }))
-                    .await;
-                self.state.leader_status.promote_self(term).await;
-            }
-            ElectionDecision::FollowRemote {
-                leader,
-                term,
-                path,
-                via,
-            } => {
-                let accepted = self
-                    .state
-                    .leader_status
-                    .follow_remote(leader, term, path.clone(), via)
-                    .await;
-                tracing::debug!(
-                    local = ?self.state.my_address,
-                    ?leader,
-                    term,
-                    ?path,
-                    ?via,
-                    accepted,
-                    "following remote leader",
-                );
-            }
-            ElectionDecision::ClearRemoteLeader { leader } => {
-                let cleared = self.state.leader_status.clear_if_leader(leader).await;
-                tracing::debug!(
-                    local = ?self.state.my_address,
-                    ?leader,
-                    cleared,
-                    "clearing remote leader status",
-                );
-            }
-            ElectionDecision::NoChange => {
-                tracing::debug!(local = ?self.state.my_address, "leader election made no state change");
+                    path,
+                    via,
+                } => {
+                    self.state.observe_election_term(term);
+                    let accepted = self
+                        .state
+                        .leader_status
+                        .follow_remote(leader, term, path.clone(), via)
+                        .await;
+                    tracing::debug!(
+                        local = ?self.state.my_address,
+                        ?leader,
+                        term,
+                        ?path,
+                        ?via,
+                        accepted,
+                        "following remote leader",
+                    );
+                    false
+                }
+                ElectionDecision::BumpTerm {
+                    previous_term,
+                    inaccessible_leader,
+                } => {
+                    let new_term = self.state.bump_election_term_after(previous_term);
+                    let observed = self.state.leader_status.observe_no_leader_term(new_term).await;
+                    tracing::debug!(
+                        local = ?self.state.my_address,
+                        previous_term,
+                        new_term,
+                        ?inaccessible_leader,
+                        observed,
+                        "bumped election term after inaccessible leader",
+                    );
+                    true
+                }
+                ElectionDecision::NoChange => {
+                    tracing::debug!(local = ?self.state.my_address, "leader election made no state change");
+                    false
+                }
+            };
+
+            if !recompute {
+                break;
             }
         }
     }
@@ -468,6 +536,7 @@ mod tests {
             )
             .unwrap(),
             leader_status: Arc::new(CurrentLeaderStatus::new(address)),
+            election_term: AtomicU64::new(0),
         })
     }
 
@@ -560,9 +629,23 @@ mod tests {
         task.apply_election().await;
 
         match state.leader_status.snapshot().await.mode {
-            LeaderMode::Leading { path, .. } => assert_eq!(path, vec![1]),
+            LeaderMode::Leading { term, path } => {
+                assert_eq!(term, 1);
+                assert_eq!(path, vec![1]);
+            }
             mode => panic!("expected leading mode, got {mode:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn starts_initial_election_at_term_one() {
+        let state = node_state(1, false, HashMap::new());
+        let task = task(state.clone());
+
+        task.apply_election().await;
+
+        assert_eq!(state.election_term(), 1);
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::NoLeader { term: 1 });
     }
 
     #[tokio::test]
@@ -584,16 +667,17 @@ mod tests {
 
         task.apply_election().await;
 
-        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::NoLeader { term: 0 });
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::NoLeader { term: 1 });
     }
 
     #[tokio::test]
-    async fn follows_reachable_remote_leader() {
+    async fn follows_leader_already_published_for_discovered_term() {
         let mut peers = HashMap::new();
         let mut peer_two = peer(2, Some(true), true);
         peer_two.leader_observation = Some(leader_observation(2, 3, 2, vec![2]));
         peers.insert(2, peer_two);
         let state = node_state(1, true, peers);
+        state.observe_election_term(3);
         let task = task(state.clone());
 
         task.apply_election().await;
@@ -610,15 +694,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clears_inaccessible_current_leader() {
+    async fn uses_higher_peer_discovered_term() {
+        let mut peers = HashMap::new();
+        let mut peer_two = peer(2, Some(true), true);
+        peer_two.leader_observation = Some(leader_observation(2, 5, 2, vec![2]));
+        peers.insert(2, peer_two);
+        let state = node_state(1, false, peers);
+        state.observe_election_term(5);
+        let task = task(state.clone());
+
+        task.apply_election().await;
+
+        assert_eq!(state.election_term(), 5);
+        assert_eq!(
+            state.leader_status.snapshot().await.mode,
+            LeaderMode::Following {
+                term: 5,
+                leader: 2,
+                path: vec![2, 1],
+                via: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn promotes_self_for_discovered_term_when_no_leader_exists() {
+        let state = node_state(1, true, HashMap::new());
+        state.observe_election_term(5);
+        let task = task(state.clone());
+
+        task.apply_election().await;
+
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Leading { term: 5, path: vec![1] });
+    }
+
+    #[tokio::test]
+    async fn following_node_does_not_flap_to_no_leader_from_local_restatement() {
         let mut peers = HashMap::new();
         peers.insert(2, peer(2, Some(true), true));
         let state = node_state(1, false, peers);
         assert!(state.leader_status.follow_remote(2, 3, vec![2, 1], 2).await);
+        state.observe_election_term(3);
+        let task = task(state.clone());
 
-        state.leader_status.clear_if_via(2).await;
+        task.apply_election().await;
 
-        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::NoLeader { term: 3 });
+        assert_eq!(
+            state.leader_status.snapshot().await.mode,
+            LeaderMode::Following {
+                term: 3,
+                leader: 2,
+                path: vec![2, 1],
+                via: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn inaccessible_current_leader_bumps_term() {
+        let mut peers = HashMap::new();
+        peers.insert(2, peer(2, Some(true), false));
+        let state = node_state(1, false, peers);
+        assert!(state.leader_status.follow_remote(2, 3, vec![2, 1], 2).await);
+        state.observe_election_term(3);
+        let task = task(state.clone());
+
+        task.apply_election().await;
+
+        assert_eq!(state.election_term(), 4);
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::NoLeader { term: 4 });
+    }
+
+    #[tokio::test]
+    async fn after_bumping_term_can_promote_available_local_candidate() {
+        let mut peers = HashMap::new();
+        peers.insert(2, peer(2, Some(true), false));
+        let state = node_state(1, true, peers);
+        assert!(state.leader_status.follow_remote(2, 3, vec![2, 1], 2).await);
+        state.observe_election_term(3);
+        let task = task(state.clone());
+
+        task.apply_election().await;
+
+        assert_eq!(state.election_term(), 4);
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Leading { term: 4, path: vec![1] });
     }
 
     #[tokio::test]

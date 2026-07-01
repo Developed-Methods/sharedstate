@@ -226,7 +226,12 @@ pub enum ResponseOrFeed<A: SyncIOAddress, D: DeterministicState> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, io::Result, sync::Arc, time::Duration};
+    use std::{
+        collections::HashMap,
+        io::Result,
+        sync::{atomic::AtomicU64, Arc},
+        time::Duration,
+    };
 
     use message_encoding::MessageEncoding;
     use sequenced_broadcast::SequencedBroadcastSettings;
@@ -240,8 +245,8 @@ mod tests {
         new::{
             node_state::PeerState, subscribable_state::SubscribableState, tasks::current_leader::CurrentLeaderStatus,
         },
-        protocol::messages::PROTOCOL_VERSION,
-        state::recoverable_state::RecoverableState,
+        protocol::messages::{LeaderWithElectionInfo, PROTOCOL_VERSION},
+        state::recoverable_state::{RecoverableState, RecoverableStateDetails},
         transport::traits::SyncConnection,
     };
 
@@ -331,6 +336,7 @@ mod tests {
             )
             .unwrap(),
             leader_status: Arc::new(CurrentLeaderStatus::new(address)),
+            election_term: AtomicU64::new(0),
         })
     }
 
@@ -351,6 +357,18 @@ mod tests {
                 write: server_write,
             },
         )
+    }
+
+    fn leader_observation(observer: u64, term: u64, leader: u64, path: Vec<u64>) -> LeaderWithElectionInfo<u64> {
+        LeaderWithElectionInfo {
+            observer,
+            term,
+            leader: Some(leader),
+            leader_path: Some(path),
+            can_lead: true,
+            reachable_can_lead: vec![observer],
+            recover_details: RecoverableStateDetails::new(observer, 1),
+        }
     }
 
     async fn recv_response(read: &mut Receiver<SyncResponse<u64, TestState>>) -> SyncResponse<u64, TestState> {
@@ -383,5 +401,25 @@ mod tests {
 
         drop(write);
         server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn records_remote_term_from_pushed_leader_information() {
+        let (actions_tx, _actions_rx) = mpsc::channel(16);
+        let state = node_state(1);
+        let server = RpcServer::new(state.clone(), actions_tx);
+
+        let response = server
+            .handle(
+                2,
+                SyncRequest::LeaderInformation {
+                    source: 2,
+                    info: leader_observation(2, 7, 2, vec![2]),
+                },
+            )
+            .await;
+
+        assert!(matches!(response, ResponseOrFeed::Response(SyncResponse::Ok)));
+        assert_eq!(state.election_term(), 7);
     }
 }

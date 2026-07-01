@@ -432,7 +432,12 @@ fn require_ok<A: SyncIOAddress, D: DeterministicState>(response: SyncResponse<A,
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, io::Result, sync::Arc, time::Duration};
+    use std::{
+        collections::HashMap,
+        io::Result,
+        sync::{atomic::AtomicU64, Arc},
+        time::Duration,
+    };
 
     use sequenced_broadcast::SequencedBroadcastSettings;
 
@@ -510,6 +515,7 @@ mod tests {
             )
             .unwrap(),
             leader_status: Arc::new(CurrentLeaderStatus::new(address)),
+            election_term: AtomicU64::new(0),
         })
     }
 

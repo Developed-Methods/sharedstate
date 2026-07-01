@@ -3,7 +3,7 @@ use std::{
     env,
     io::{self, Error, ErrorKind, Stdout, Write},
     iter,
-    sync::Arc,
+    sync::{atomic::AtomicU64, Arc},
     time::{Duration, Instant},
 };
 
@@ -438,6 +438,7 @@ async fn main() -> io::Result<()> {
         )
         .map_err(|error| Error::other(format!("failed to create state broadcast: {error:?}")))?,
         leader_status: Arc::new(CurrentLeaderStatus::new(local_address)),
+        election_term: AtomicU64::new(0),
     });
 
     let peer_connections = Arc::new(PeerConnections::new(io.clone(), settings.clone(), state.clone()));

@@ -1,4 +1,11 @@
-use std::{collections::HashMap, num::NonZeroU64, sync::Arc};
+use std::{
+    collections::HashMap,
+    num::NonZeroU64,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use tokio::sync::Mutex;
 
@@ -16,6 +23,7 @@ pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
     pub peers: Mutex<HashMap<A, PeerState<A>>>,
     pub state: SubscribableState<D>,
     pub leader_status: Arc<CurrentLeaderStatus<A>>,
+    pub election_term: AtomicU64,
 }
 
 pub struct PeerState<A: SyncIOAddress> {
@@ -61,6 +69,23 @@ where
     A: SyncIOAddress,
     D: DeterministicState,
 {
+    pub(crate) fn election_term(&self) -> u64 {
+        self.election_term.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn observe_election_term(&self, term: u64) -> u64 {
+        self.election_term
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| (term > current).then_some(term))
+            .map_or_else(|current| current, |_| term)
+    }
+
+    pub(crate) fn bump_election_term_after(&self, previous_term: u64) -> u64 {
+        let next_term = previous_term.saturating_add(1);
+        self.election_term
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| (next_term > current).then_some(next_term))
+            .map_or_else(|current| current, |_| next_term)
+    }
+
     pub(crate) async fn merge_peer_details(&self, shared_peers: Vec<SharePeerDetails<A>>) -> PeerMergeResult {
         let shared_count = shared_peers.len();
         let mut result = PeerMergeResult {
@@ -109,6 +134,7 @@ where
     }
 
     pub(crate) async fn record_leader_observation(&self, source: A, info: LeaderWithElectionInfo<A>) {
+        self.observe_election_term(info.term);
         let mut peers = self.peers.lock().await;
         let peer_state = peers.entry(source).or_insert_with(|| PeerState::empty(source));
         peer_state.addr = source;
@@ -215,6 +241,7 @@ mod tests {
             )
             .unwrap(),
             leader_status: Arc::new(CurrentLeaderStatus::new(address)),
+            election_term: AtomicU64::new(0),
         })
     }
 
@@ -239,6 +266,44 @@ mod tests {
             reachable_can_lead: vec![observer],
             recover_details: RecoverableStateDetails::new(observer, 1),
         }
+    }
+
+    #[tokio::test]
+    async fn observe_election_term_keeps_highest_seen_term() {
+        let state = node_state(1, true, HashMap::new());
+
+        assert_eq!(state.observe_election_term(2), 2);
+        assert_eq!(state.observe_election_term(1), 2);
+        assert_eq!(state.election_term(), 2);
+    }
+
+    #[tokio::test]
+    async fn record_leader_observation_advances_election_term() {
+        let state = node_state(1, true, HashMap::new());
+
+        state
+            .record_leader_observation(2, leader_observation(2, 4, 2, vec![2]))
+            .await;
+
+        assert_eq!(state.election_term(), 4);
+    }
+
+    #[tokio::test]
+    async fn bump_election_term_after_advances_past_previous() {
+        let state = node_state(1, true, HashMap::new());
+
+        assert_eq!(state.bump_election_term_after(3), 4);
+        assert_eq!(state.election_term(), 4);
+    }
+
+    #[tokio::test]
+    async fn bump_election_term_after_preserves_higher_observed_term() {
+        let state = node_state(1, true, HashMap::new());
+
+        state.observe_election_term(7);
+
+        assert_eq!(state.bump_election_term_after(3), 7);
+        assert_eq!(state.election_term(), 7);
     }
 
     #[tokio::test]
