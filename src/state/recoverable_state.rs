@@ -187,11 +187,7 @@ impl<D: DeterministicState> DeterministicState for RecoverableState<D> {
 }
 
 impl MessageEncoding for RecovGenerationEnd {
-    const STATIC_SIZE: Option<usize> = m_opt_sum(&[
-        u64::STATIC_SIZE,
-        u64::STATIC_SIZE,
-        u64::STATIC_SIZE,
-    ]);
+    const STATIC_SIZE: Option<usize> = m_opt_sum(&[u64::STATIC_SIZE, u64::STATIC_SIZE, u64::STATIC_SIZE]);
 
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
