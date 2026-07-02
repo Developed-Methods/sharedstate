@@ -16,7 +16,7 @@ use crate::{
     new::{
         election::{
             can_lead_majority, choose_vote, conflicting_published_leaders, find_published_leader,
-            leader_offline_vote_count, peer_is_fresh, tally_votes, ElectionInput, PeerReachability,
+            leader_offline_vote_count, peer_is_fresh, tally_votes, ElectionInput, PeerReachability, PublishedLeader,
             TimedPeerObservation,
         },
         node_state::NodeState,
@@ -240,26 +240,47 @@ where
         let snapshot = self.state.leader_status.snapshot().await;
         let input = self.build_election_input(term).await;
 
+        if term_changed {
+            if conflicting_published_leaders(&input).len() > 1 {
+                tracing::debug!(
+                    local = ?self.state.my_address,
+                    term,
+                    "caught up to election term with multiple published leaders; waiting before starting new election",
+                );
+                return;
+            }
+
+            if let Some(published) = find_published_leader(&input) {
+                self.apply_published_leader(term, published).await;
+                return;
+            }
+
+            tracing::debug!(
+                local = ?self.state.my_address,
+                term,
+                "caught up to election term without starting election",
+            );
+            return;
+        }
+
         if self.trigger_new_election_on_conflicting_leaders(term, &input).await {
             return;
         }
 
-        if !term_changed {
-            match snapshot.mode {
-                LeaderMode::Following { leader, .. } => {
-                    self.verify_following_leader(term, leader, input).await;
-                    return;
-                }
-                LeaderMode::Leading { .. } => {
-                    tracing::debug!(
-                        local = ?self.state.my_address,
-                        term,
-                        "already leading for current election term",
-                    );
-                    return;
-                }
-                LeaderMode::NoLeader | LeaderMode::Electing { .. } => {}
+        match snapshot.mode {
+            LeaderMode::Following { leader, .. } => {
+                self.verify_following_leader(term, leader, input).await;
+                return;
             }
+            LeaderMode::Leading { .. } => {
+                tracing::debug!(
+                    local = ?self.state.my_address,
+                    term,
+                    "already leading for current election term",
+                );
+                return;
+            }
+            LeaderMode::NoLeader | LeaderMode::Electing { .. } => {}
         }
 
         self.evaluate_term(term, input).await;
@@ -291,33 +312,7 @@ where
 
     async fn evaluate_term(&mut self, term: u64, input: ElectionInput<A>) {
         if let Some(published) = find_published_leader(&input) {
-            tracing::debug!(
-                local = ?self.state.my_address,
-                term,
-                leader = ?published.leader,
-                path = ?published.path,
-                via = ?published.via,
-                "found published leader for election term",
-            );
-
-            if published.leader == self.state.my_address {
-                if self.state.can_lead {
-                    self.promote_for_term(term).await;
-                }
-            } else if let Some(via) = published.via {
-                let followed = self
-                    .state
-                    .leader_status
-                    .follow_remote(published.leader, published.path, via)
-                    .await;
-                tracing::debug!(
-                    local = ?self.state.my_address,
-                    term,
-                    leader = ?published.leader,
-                    followed,
-                    "applied published remote leader",
-                );
-            }
+            self.apply_published_leader(term, published).await;
             return;
         }
 
@@ -347,6 +342,36 @@ where
             }
         } else {
             self.state.leader_status.set_vote(Some(tally.candidate)).await;
+        }
+    }
+
+    async fn apply_published_leader(&self, term: u64, published: PublishedLeader<A>) {
+        tracing::debug!(
+            local = ?self.state.my_address,
+            term,
+            leader = ?published.leader,
+            path = ?published.path,
+            via = ?published.via,
+            "found published leader for election term",
+        );
+
+        if published.leader == self.state.my_address {
+            if self.state.can_lead {
+                self.promote_for_term(term).await;
+            }
+        } else if let Some(via) = published.via {
+            let followed = self
+                .state
+                .leader_status
+                .follow_remote(published.leader, published.path, via)
+                .await;
+            tracing::debug!(
+                local = ?self.state.my_address,
+                term,
+                leader = ?published.leader,
+                followed,
+                "applied published remote leader",
+            );
         }
     }
 
@@ -688,7 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_term_without_published_leader_enters_election_with_vote() {
+    async fn new_term_without_published_leader_catches_up_before_electing() {
         let mut peers = HashMap::new();
         peers.insert(2, peer(2, Some(true), ConnectStatus::NotConnected, None));
         peers.insert(3, peer(3, Some(true), ConnectStatus::NotConnected, None));
@@ -698,6 +723,10 @@ mod tests {
         task.tick().await;
 
         assert_eq!(state.election_term(), 1);
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::NoLeader);
+
+        task.tick().await;
+
         assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Electing { vote: Some(1) });
     }
 
@@ -708,6 +737,7 @@ mod tests {
         let state = node_state(1, false, peers, 0);
         let mut task = CurrentLeaderTask::new(state.clone(), timing());
 
+        task.tick().await;
         task.tick().await;
 
         assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Electing { vote: None });
@@ -757,6 +787,7 @@ mod tests {
         peers.insert(3, observed_peer(3, true, now, observation(3, 1, None, None, Some(1), true, vec![1, 3])));
         let state = node_state(1, true, peers, 1);
         let mut task = CurrentLeaderTask::new(state.clone(), timing());
+        task.last_considered_term = 1;
 
         task.tick().await;
 
@@ -771,6 +802,7 @@ mod tests {
         peers.insert(3, observed_peer(3, true, now, observation(3, 1, None, None, Some(2), true, vec![2, 3])));
         let state = node_state(1, true, peers, 1);
         let mut task = CurrentLeaderTask::new(state.clone(), timing());
+        task.last_considered_term = 1;
 
         task.tick().await;
 
@@ -813,6 +845,49 @@ mod tests {
         task.tick().await;
 
         assert_eq!(state.election_term(), 2);
+        assert!(matches!(state.leader_status.snapshot().await.mode, LeaderMode::Electing { .. }));
+    }
+
+    #[tokio::test]
+    async fn newly_observed_term_with_published_leader_follows_without_election() {
+        let now = now_ms();
+        let mut peers = HashMap::new();
+        peers.insert(2, observed_peer(2, true, now, observation(2, 2, Some(2), Some(vec![2]), Some(2), true, vec![2])));
+        let state = node_state(1, true, peers, 2);
+        let mut task = CurrentLeaderTask::new(state.clone(), timing());
+        task.last_considered_term = 1;
+
+        task.tick().await;
+
+        assert_eq!(state.election_term(), 2);
+        assert_eq!(
+            state.leader_status.snapshot().await.mode,
+            LeaderMode::Following {
+                leader: 2,
+                path: vec![2, 1],
+                via: 2,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn newly_observed_term_with_conflicting_leaders_waits_until_caught_up_to_bump() {
+        let now = now_ms();
+        let mut peers = HashMap::new();
+        peers.insert(2, observed_peer(2, true, now, observation(2, 2, Some(2), Some(vec![2]), Some(2), true, vec![2])));
+        peers.insert(3, observed_peer(3, true, now, observation(3, 2, Some(3), Some(vec![3]), Some(3), true, vec![3])));
+        let state = node_state(1, true, peers, 2);
+        let mut task = CurrentLeaderTask::new(state.clone(), timing());
+        task.last_considered_term = 1;
+
+        task.tick().await;
+
+        assert_eq!(state.election_term(), 2);
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::NoLeader);
+
+        task.tick().await;
+
+        assert_eq!(state.election_term(), 3);
         assert!(matches!(state.leader_status.snapshot().await.mode, LeaderMode::Electing { .. }));
     }
 
