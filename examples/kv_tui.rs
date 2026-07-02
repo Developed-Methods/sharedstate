@@ -800,8 +800,8 @@ async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut 
                 peer.can_lead,
                 peer.latency.map(|latency| latency.get()),
                 peer.last_global_connectivity.map(|value| value.get()),
-                peer.leader_observation.as_ref().and_then(|info| info.leader),
-                peer.leader_observation.as_ref().and_then(|info| info.vote),
+                peer.leader_observation.as_ref().and_then(|info| info.leader.published_leader(peer.addr)),
+                peer.leader_observation.as_ref().and_then(|info| info.leader.vote(peer.addr)),
                 peer.leader_observation.as_ref().map(|info| info.term),
             ));
         }
@@ -822,10 +822,8 @@ fn leader_mode_line(mode: &LeaderMode<u16>) -> String {
     match mode {
         LeaderMode::NoLeader => "NoLeader".to_owned(),
         LeaderMode::Electing { vote } => format!("Electing vote={vote:?}"),
-        LeaderMode::Leading { path } => format!("Leading path={path:?}"),
-        LeaderMode::Following { leader, path, via } => {
-            format!("Following leader={leader} via={via} path={path:?}")
-        }
+        LeaderMode::Leading => "Leading".to_owned(),
+        LeaderMode::Following { leader } => format!("Following leader={leader}"),
     }
 }
 
@@ -902,7 +900,9 @@ async fn run_command(
                         connect_status_line(peer.connect_status),
                         peer.can_lead,
                         peer.latency.map(|latency| latency.get()),
-                        peer.leader_observation.as_ref().and_then(|info| info.leader),
+                        peer.leader_observation
+                            .as_ref()
+                            .and_then(|info| info.leader.published_leader(peer.addr)),
                     ));
                 }
             }

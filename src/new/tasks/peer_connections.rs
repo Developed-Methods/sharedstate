@@ -178,11 +178,8 @@ where
     ) -> Result<LeaderWithElectionInfo<I::Address>, PeerRpcError> {
         let response = self.send_rpc(peer, SyncRequest::ShareLeaderInfo).await?;
         match response {
-            SyncResponse::LeaderInfo(info) if info.observer == peer => Ok(info),
-            response => {
-                self.unexpected_response(peer, "LeaderInfo matching peer", response)
-                    .await
-            }
+            SyncResponse::LeaderInfo(info) => Ok(info),
+            response => self.unexpected_response(peer, "LeaderInfo", response).await,
         }
     }
 

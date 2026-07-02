@@ -309,10 +309,8 @@ async fn observe_peer<I, D>(
             tracing::debug!(
                 local = ?state.my_address,
                 ?peer,
-                observer = ?info.observer,
                 leader = ?info.leader,
-                leader_path = ?info.leader_path,
-                vote = ?info.vote,
+                vote = ?info.leader.vote(peer),
                 term = info.term,
                 can_lead = info.can_lead,
                 reachable_can_lead = ?info.reachable_can_lead,
@@ -352,7 +350,7 @@ mod tests {
             subscribable_state::SubscribableState,
             tasks::{current_leader::CurrentLeaderStatus, peer_connections::PeerConnections},
         },
-        protocol::messages::{LeaderWithElectionInfo, SyncRequest, SyncResponse, PROTOCOL_VERSION},
+        protocol::messages::{LeaderMode, LeaderWithElectionInfo, SyncRequest, SyncResponse, PROTOCOL_VERSION},
         state::recoverable_state::{RecoverableState, RecoverableStateDetails},
         transport::{
             channels::NetIoSettings,
@@ -498,7 +496,7 @@ mod tests {
         match recv_request(read).await {
             SyncRequest::LeaderInformation { source, info } => {
                 assert_eq!(source, 1);
-                assert_eq!(info.observer, 1);
+                assert_eq!(info.leader, LeaderMode::NoLeader);
                 write.send(SyncResponse::Ok).await.unwrap();
             }
             other => panic!("expected leader-information request, got {other:?}"),
@@ -534,13 +532,14 @@ mod tests {
         }
     }
 
-    fn leader_observation(observer: u64, term: u64, leader: u64, path: Vec<u64>) -> LeaderWithElectionInfo<u64> {
+    fn leader_observation(observer: u64, term: u64, leader: u64, _path: Vec<u64>) -> LeaderWithElectionInfo<u64> {
         LeaderWithElectionInfo {
-            observer,
             term,
-            leader: Some(leader),
-            leader_path: Some(path),
-            vote: Some(leader),
+            leader: if leader == observer {
+                LeaderMode::Leading
+            } else {
+                LeaderMode::Following { leader }
+            },
             can_lead: true,
             reachable_can_lead: vec![observer],
             recover_details: RecoverableStateDetails::new(observer, 1),
@@ -683,7 +682,7 @@ mod tests {
 
         task_handle.await.unwrap();
         let peers = state.peers.lock().await;
-        assert_eq!(peers.get(&2).unwrap().leader_observation.as_ref().unwrap().observer, 2);
+        assert_eq!(peers.get(&2).unwrap().leader_observation.as_ref().unwrap().leader, LeaderMode::Leading);
         assert_eq!(state.election_term(), 1);
     }
 

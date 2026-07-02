@@ -217,12 +217,9 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderInfoMessage<A> {
 impl<A: SyncIOAddress> MessageEncoding for LeaderWithElectionInfo<A> {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
-        sum += 3u16.write_to(out)?;
-        sum += self.observer.write_to(out)?;
+        sum += 4u16.write_to(out)?;
         sum += self.term.write_to(out)?;
         sum += self.leader.write_to(out)?;
-        sum += write_opt_vec(&self.leader_path, out)?;
-        sum += self.vote.write_to(out)?;
         sum += self.can_lead.write_to(out)?;
         sum += write_vec(&self.reachable_can_lead, out)?;
         sum += self.recover_details.write_to(out)?;
@@ -231,20 +228,55 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderWithElectionInfo<A> {
 
     fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
         let version = u16::read_from(read)?;
-        if version != 3 {
+        if version != 4 {
             return Err(unknown_version_err(version, "ElectionObservation"));
         }
 
         Ok(Self {
-            observer: MessageEncoding::read_from(read)?,
             term: MessageEncoding::read_from(read)?,
             leader: MessageEncoding::read_from(read)?,
-            leader_path: read_opt_vec(read)?,
-            vote: MessageEncoding::read_from(read)?,
             can_lead: MessageEncoding::read_from(read)?,
             reachable_can_lead: read_vec(read)?,
             recover_details: MessageEncoding::read_from(read)?,
         })
+    }
+}
+
+impl<A: SyncIOAddress> MessageEncoding for LeaderMode<A> {
+    fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
+        let mut sum = 0;
+        match self {
+            LeaderMode::NoLeader => {
+                sum += 0u16.write_to(out)?;
+            }
+            LeaderMode::Electing { vote } => {
+                sum += 1u16.write_to(out)?;
+                sum += vote.write_to(out)?;
+            }
+            LeaderMode::Leading => {
+                sum += 2u16.write_to(out)?;
+            }
+            LeaderMode::Following { leader } => {
+                sum += 3u16.write_to(out)?;
+                sum += leader.write_to(out)?;
+            }
+        }
+        Ok(sum)
+    }
+
+    fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
+        let tag = u16::read_from(read)?;
+        match tag {
+            0 => Ok(LeaderMode::NoLeader),
+            1 => Ok(LeaderMode::Electing {
+                vote: MessageEncoding::read_from(read)?,
+            }),
+            2 => Ok(LeaderMode::Leading),
+            3 => Ok(LeaderMode::Following {
+                leader: MessageEncoding::read_from(read)?,
+            }),
+            _ => Err(unknown_id_err(tag, "LeaderMode")),
+        }
     }
 }
 
@@ -432,11 +464,8 @@ mod tests {
 
     fn leader_info() -> LeaderWithElectionInfo<u64> {
         LeaderWithElectionInfo {
-            observer: 1,
             term: 2,
-            leader: Some(3),
-            leader_path: Some(vec![3, 1]),
-            vote: Some(3),
+            leader: LeaderMode::Following { leader: 3 },
             can_lead: true,
             reachable_can_lead: vec![1, 3],
             recover_details: RecoverableStateDetails::new(1, 1),
@@ -450,20 +479,17 @@ mod tests {
     }
 
     #[test]
-    fn leader_info_encoding_version_three_roundtrips_vote() {
+    fn leader_info_encoding_version_four_roundtrips_mode() {
         let info = leader_info();
         let mut bytes = Vec::new();
 
         info.write_to(&mut bytes).unwrap();
 
-        assert_eq!(u16::read_from(&mut &bytes[..]).unwrap(), 3);
+        assert_eq!(u16::read_from(&mut &bytes[..]).unwrap(), 4);
 
         let decoded: LeaderWithElectionInfo<u64> = LeaderWithElectionInfo::read_from(&mut &bytes[..]).unwrap();
-        assert_eq!(decoded.observer, info.observer);
         assert_eq!(decoded.term, info.term);
         assert_eq!(decoded.leader, info.leader);
-        assert_eq!(decoded.leader_path, info.leader_path);
-        assert_eq!(decoded.vote, info.vote);
         assert_eq!(decoded.can_lead, info.can_lead);
         assert_eq!(decoded.reachable_can_lead, info.reachable_can_lead);
         assert_eq!(decoded.recover_details.next_seq(), info.recover_details.next_seq());

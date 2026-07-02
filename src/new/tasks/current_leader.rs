@@ -31,6 +31,8 @@ use crate::{
     utils::now_ms,
 };
 
+pub use crate::protocol::messages::LeaderMode;
+
 static GENERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub struct CurrentLeaderTask<A, D>
@@ -60,26 +62,19 @@ impl Default for CurrentLeaderTiming {
 }
 
 impl<A: SyncIOAddress> LeaderMode<A> {
-    pub fn leader(&self) -> Option<A> {
+    pub fn published_leader(&self, observer: A) -> Option<A> {
         match self {
             Self::NoLeader | Self::Electing { .. } => None,
-            Self::Leading => None,
+            Self::Leading => Some(observer),
             Self::Following { leader, .. } => Some(*leader),
         }
     }
 
-    pub fn path(&self) -> Option<&Vec<A>> {
-        match self {
-            Self::NoLeader | Self::Electing { .. } => None,
-            Self::Leading { path } | Self::Following { path, .. } => Some(path),
-        }
-    }
-
-    pub fn vote(&self, local: A) -> Option<A> {
+    pub fn vote(&self, observer: A) -> Option<A> {
         match self {
             Self::NoLeader => None,
             Self::Electing { vote } => *vote,
-            Self::Leading { .. } => Some(local),
+            Self::Leading => Some(observer),
             Self::Following { leader, .. } => Some(*leader),
         }
     }
@@ -110,11 +105,15 @@ impl<A: SyncIOAddress> CurrentLeaderStatus<A> {
     }
 
     pub async fn leader(&self) -> Option<A> {
-        self.state.lock().await.leader()
+        self.state.lock().await.published_leader(self.local)
     }
 
     pub async fn path_to_leader(&self) -> Option<Vec<A>> {
-        self.state.lock().await.path().cloned()
+        match &*self.state.lock().await {
+            LeaderMode::NoLeader | LeaderMode::Electing { .. } => None,
+            LeaderMode::Leading => Some(vec![self.local]),
+            LeaderMode::Following { leader } => Some(vec![*leader, self.local]),
+        }
     }
 
     pub async fn vote(&self) -> Option<A> {
@@ -142,7 +141,7 @@ impl<A: SyncIOAddress> CurrentLeaderStatus<A> {
     }
 
     pub async fn promote_self(&self) {
-        *self.state.lock().await = LeaderMode::Leading { path: vec![self.local] };
+        *self.state.lock().await = LeaderMode::Leading;
     }
 
     pub async fn follow_remote(&self, leader: A, path: Vec<A>, via: A) -> bool {
@@ -153,7 +152,7 @@ impl<A: SyncIOAddress> CurrentLeaderStatus<A> {
             return false;
         }
 
-        *self.state.lock().await = LeaderMode::Following { leader, path, via };
+        *self.state.lock().await = LeaderMode::Following { leader };
         true
     }
 
@@ -166,11 +165,8 @@ impl<A: SyncIOAddress> CurrentLeaderStatus<A> {
     ) -> LeaderWithElectionInfo<A> {
         let state = self.state.lock().await;
         LeaderWithElectionInfo {
-            observer: self.local,
             term,
-            leader: state.leader(),
-            leader_path: state.path().cloned(),
-            vote: state.vote(self.local),
+            leader: state.clone(),
             can_lead,
             reachable_can_lead,
             recover_details,
@@ -213,34 +209,20 @@ where
 
     pub async fn apply_current_leader_tick(&mut self) {
         let mut term = self.state.election_term();
+        if term == 0 {
+            term = self.state.bump_election_term_after(0);
+        }
 
-        if term != self.last_considered_term {
-            let current_leader = {
-                let peers = self.state.peers.lock().await;
-                let leaders = peers
-                    .iter()
-                    .filter_map(|(_, peer)| peer.can_lead.unwrap_or(false).then_some(peer))
-                    .filter_map(|peer| peer.leader_observation.as_ref().and_then(|v| v.leader));
-
-                let mut votes = HashMap::<A, u64>::new();
-                for leader in leaders {
-                    votes.entry(leader).and_modify(|v| *v += 1).or_insert(1);
-                }
-
-                votes.into_iter().max_by_key(|v| v.1).map(|v| v.0)
-            };
-
-            let mut state_lock = self.state.leader_status.state.lock().await;
-            match current_leader {
-                None => {
-                    *state_lock = LeaderMode::Electing { vote: None };
-                }
-                Some(leader) => {
-                    *state_lock = LeaderMode::Following { leader };
-                }
-            }
-
+        let term_changed = self.last_considered_term != term;
+        if term_changed {
+            tracing::debug!(
+                local = ?self.state.my_address,
+                previous_term = self.last_considered_term,
+                term,
+                "current leader task considering new election term",
+            );
             self.last_considered_term = term;
+            self.state.leader_status.no_leader().await;
         }
 
         let snapshot = self.state.leader_status.snapshot().await;
@@ -278,7 +260,7 @@ where
                 self.verify_following_leader(term, leader, input).await;
                 return;
             }
-            LeaderMode::Leading { .. } => {
+            LeaderMode::Leading => {
                 tracing::debug!(
                     local = ?self.state.my_address,
                     term,
@@ -435,7 +417,7 @@ where
 
     async fn promote_for_term(&self, term: u64) {
         let snapshot = self.state.leader_status.snapshot().await;
-        if matches!(snapshot.mode, LeaderMode::Leading { path } if path.as_slice() == [self.state.my_address]) {
+        if matches!(snapshot.mode, LeaderMode::Leading) {
             return;
         }
 
@@ -650,17 +632,23 @@ mod tests {
         observer: u64,
         term: u64,
         leader: Option<u64>,
-        leader_path: Option<Vec<u64>>,
+        _leader_path: Option<Vec<u64>>,
         vote: Option<u64>,
         can_lead: bool,
         reachable_can_lead: Vec<u64>,
     ) -> LeaderWithElectionInfo<u64> {
+        let mode = match leader {
+            Some(leader) if leader == observer => LeaderMode::Leading,
+            Some(leader) => LeaderMode::Following { leader },
+            None => match vote {
+                Some(vote) => LeaderMode::Electing { vote: Some(vote) },
+                None => LeaderMode::NoLeader,
+            },
+        };
+
         LeaderWithElectionInfo {
-            observer,
             term,
-            leader,
-            leader_path,
-            vote,
+            leader: mode,
             can_lead,
             reachable_can_lead,
             recover_details: RecoverableStateDetails::new(observer, 1),
@@ -682,7 +670,7 @@ mod tests {
 
         status.promote_self().await;
 
-        assert_eq!(status.snapshot().await.mode, LeaderMode::Leading { path: vec![1] });
+        assert_eq!(status.snapshot().await.mode, LeaderMode::Leading);
         assert_eq!(status.leader().await, Some(1));
         assert_eq!(status.vote().await, Some(1));
     }
@@ -693,15 +681,9 @@ mod tests {
 
         assert!(status.follow_remote(2, vec![2, 1], 2).await);
 
-        assert_eq!(
-            status.snapshot().await.mode,
-            LeaderMode::Following {
-                leader: 2,
-                path: vec![2, 1],
-                via: 2,
-            }
-        );
+        assert_eq!(status.snapshot().await.mode, LeaderMode::Following { leader: 2 });
         assert_eq!(status.vote().await, Some(2));
+        assert_eq!(status.path_to_leader().await, Some(vec![2, 1]));
     }
 
     #[tokio::test]
@@ -712,10 +694,8 @@ mod tests {
 
         let observation = local_leader_observation(&state, &handle).await;
 
-        assert_eq!(observation.observer, 1);
         assert_eq!(observation.term, 5);
-        assert_eq!(observation.leader, None);
-        assert_eq!(observation.vote, Some(2));
+        assert_eq!(observation.leader, LeaderMode::Electing { vote: Some(2) });
     }
 
     #[tokio::test]
@@ -759,14 +739,7 @@ mod tests {
 
         task.tick().await;
 
-        assert_eq!(
-            state.leader_status.snapshot().await.mode,
-            LeaderMode::Following {
-                leader: 2,
-                path: vec![2, 1],
-                via: 2,
-            }
-        );
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Following { leader: 2 });
     }
 
     #[tokio::test]
@@ -782,7 +755,7 @@ mod tests {
 
         task.tick().await;
 
-        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Leading { path: vec![1] });
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Leading);
     }
 
     #[tokio::test]
@@ -797,7 +770,7 @@ mod tests {
 
         task.tick().await;
 
-        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Leading { path: vec![1] });
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Leading);
     }
 
     #[tokio::test]
@@ -827,14 +800,7 @@ mod tests {
 
         task.tick().await;
 
-        assert_eq!(
-            state.leader_status.snapshot().await.mode,
-            LeaderMode::Following {
-                leader: 2,
-                path: vec![2, 1],
-                via: 2,
-            }
-        );
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Following { leader: 2 });
     }
 
     #[tokio::test]
@@ -866,14 +832,7 @@ mod tests {
         task.tick().await;
 
         assert_eq!(state.election_term(), 2);
-        assert_eq!(
-            state.leader_status.snapshot().await.mode,
-            LeaderMode::Following {
-                leader: 2,
-                path: vec![2, 1],
-                via: 2,
-            }
-        );
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Following { leader: 2 });
     }
 
     #[tokio::test]
@@ -946,7 +905,7 @@ mod tests {
 
         assert_eq!(state.election_term(), 1);
         assert_eq!(handle.recover_details(), before);
-        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Leading { path: vec![1] });
+        assert_eq!(state.leader_status.snapshot().await.mode, LeaderMode::Leading);
     }
 
     #[tokio::test]
@@ -968,16 +927,8 @@ mod tests {
     fn leader_mode_vote_uses_role_state() {
         assert_eq!(LeaderMode::<u64>::NoLeader.vote(1), None);
         assert_eq!(LeaderMode::Electing { vote: Some(2) }.vote(1), Some(2));
-        assert_eq!(LeaderMode::Leading { path: vec![1] }.vote(1), Some(1));
-        assert_eq!(
-            LeaderMode::Following {
-                leader: 2,
-                path: vec![2, 1],
-                via: 2,
-            }
-            .vote(1),
-            Some(2)
-        );
+        assert_eq!(LeaderMode::Leading.vote(1), Some(1));
+        assert_eq!(LeaderMode::Following { leader: 2 }.vote(1), Some(2));
     }
 
     #[tokio::test]

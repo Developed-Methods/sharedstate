@@ -247,7 +247,7 @@ mod tests {
             subscribable_state::SubscribableState,
             tasks::current_leader::CurrentLeaderStatus,
         },
-        protocol::messages::{LeaderWithElectionInfo, PROTOCOL_VERSION},
+        protocol::messages::{LeaderMode, LeaderWithElectionInfo, PROTOCOL_VERSION},
         state::recoverable_state::{RecoverableState, RecoverableStateDetails},
         transport::traits::SyncConnection,
     };
@@ -361,13 +361,14 @@ mod tests {
         )
     }
 
-    fn leader_observation(observer: u64, term: u64, leader: u64, path: Vec<u64>) -> LeaderWithElectionInfo<u64> {
+    fn leader_observation(observer: u64, term: u64, leader: u64, _path: Vec<u64>) -> LeaderWithElectionInfo<u64> {
         LeaderWithElectionInfo {
-            observer,
             term,
-            leader: Some(leader),
-            leader_path: Some(path),
-            vote: Some(leader),
+            leader: if leader == observer {
+                LeaderMode::Leading
+            } else {
+                LeaderMode::Following { leader }
+            },
             can_lead: true,
             reachable_can_lead: vec![observer],
             recover_details: RecoverableStateDetails::new(observer, 1),

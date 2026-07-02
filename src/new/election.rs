@@ -1,6 +1,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::{protocol::messages::LeaderWithElectionInfo, transport::traits::SyncIOAddress};
+use crate::{
+    protocol::messages::{LeaderMode, LeaderWithElectionInfo},
+    transport::traits::SyncIOAddress,
+};
 
 #[derive(Clone, Debug)]
 pub struct ElectionInput<A: SyncIOAddress> {
@@ -51,10 +54,19 @@ struct PublishedLeaderEvidence<A: SyncIOAddress> {
 }
 
 pub fn fresh_same_term_observations<A: SyncIOAddress>(input: &ElectionInput<A>) -> Vec<LeaderWithElectionInfo<A>> {
+    fresh_same_term_observations_with_observer(input)
+        .into_iter()
+        .map(|(_, observation)| observation)
+        .collect()
+}
+
+fn fresh_same_term_observations_with_observer<A: SyncIOAddress>(
+    input: &ElectionInput<A>,
+) -> Vec<(A, LeaderWithElectionInfo<A>)> {
     let mut observations = Vec::with_capacity(input.peer_observations.len() + 1);
 
     if input.local_observation.term == input.election_term {
-        observations.push(input.local_observation.clone());
+        observations.push((input.local_address, input.local_observation.clone()));
     }
 
     observations.extend(
@@ -63,7 +75,7 @@ pub fn fresh_same_term_observations<A: SyncIOAddress>(input: &ElectionInput<A>) 
             .iter()
             .cloned()
             .filter_map(|timed| fresh_observation(input.now_ms, input.stale_after_ms, timed))
-            .filter(|observation| observation.term == input.election_term),
+            .filter(|(_, observation)| observation.term == input.election_term),
     );
 
     observations
@@ -72,26 +84,9 @@ pub fn fresh_same_term_observations<A: SyncIOAddress>(input: &ElectionInput<A>) 
 pub fn find_published_leader<A: SyncIOAddress>(input: &ElectionInput<A>) -> Option<PublishedLeader<A>> {
     let mut evidence: HashMap<A, PublishedLeaderEvidence<A>> = HashMap::new();
 
-    for observation in fresh_same_term_observations(input) {
-        let Some(leader) = observation.leader else {
+    for (observer, observation) in fresh_same_term_observations_with_observer(input) {
+        let Some((leader, route)) = published_leader_route(observer, &observation.leader, input.local_address) else {
             continue;
-        };
-        let Some(path) = observation.leader_path.clone() else {
-            continue;
-        };
-
-        let route = if observation.observer == input.local_address {
-            if !valid_local_leader_path(Some(leader), &path, input.local_address) {
-                continue;
-            }
-
-            (leader == input.local_address).then_some((path, None))
-        } else {
-            if !valid_remote_leader_path(Some(leader), &path, observation.observer, input.local_address) {
-                continue;
-            }
-
-            Some((append_path(path, input.local_address), Some(observation.observer)))
         };
 
         let recover_next_seq = observation.recover_details.next_seq();
@@ -153,21 +148,8 @@ pub fn find_published_leader<A: SyncIOAddress>(input: &ElectionInput<A>) -> Opti
 pub fn conflicting_published_leaders<A: SyncIOAddress>(input: &ElectionInput<A>) -> Vec<A> {
     let mut leaders = BTreeSet::new();
 
-    for observation in fresh_same_term_observations(input) {
-        let Some(leader) = observation.leader else {
-            continue;
-        };
-        let Some(path) = observation.leader_path else {
-            continue;
-        };
-
-        let valid = if observation.observer == input.local_address {
-            valid_local_leader_path(Some(leader), &path, input.local_address)
-        } else {
-            valid_remote_leader_path(Some(leader), &path, observation.observer, input.local_address)
-        };
-
-        if valid {
+    for (observer, observation) in fresh_same_term_observations_with_observer(input) {
+        if let Some(leader) = published_leader(observer, &observation.leader) {
             leaders.insert(leader);
         }
     }
@@ -187,11 +169,11 @@ pub fn tally_votes<A: SyncIOAddress>(input: &ElectionInput<A>) -> Option<VoteTal
     let majority = can_lead_majority(&input.known_can_lead);
     let mut votes: HashMap<A, usize> = HashMap::new();
 
-    for observation in fresh_same_term_observations(input)
+    for (observer, observation) in fresh_same_term_observations_with_observer(input)
         .into_iter()
-        .filter(|observation| observation.can_lead)
+        .filter(|(_, observation)| observation.can_lead)
     {
-        let Some(candidate) = observation.vote else {
+        let Some(candidate) = observation.leader.vote(observer) else {
             continue;
         };
         if !input.known_can_lead.contains(&candidate) {
@@ -294,6 +276,40 @@ fn connectivity_score<A: SyncIOAddress>(input: &ElectionInput<A>, candidate: A) 
         .count()
 }
 
+fn published_leader_route<A: SyncIOAddress>(
+    observer: A,
+    mode: &LeaderMode<A>,
+    local: A,
+) -> Option<(A, Option<(Vec<A>, Option<A>)>)> {
+    match mode {
+        LeaderMode::NoLeader | LeaderMode::Electing { .. } => None,
+        LeaderMode::Leading => {
+            if observer == local {
+                Some((observer, Some((vec![local], None))))
+            } else {
+                Some((observer, Some((vec![observer, local], Some(observer)))))
+            }
+        }
+        LeaderMode::Following { leader } => {
+            if *leader == local {
+                Some((*leader, Some((vec![local], None))))
+            } else if observer == local {
+                Some((*leader, None))
+            } else {
+                Some((*leader, Some((vec![*leader, observer, local], Some(observer)))))
+            }
+        }
+    }
+}
+
+fn published_leader<A: SyncIOAddress>(observer: A, mode: &LeaderMode<A>) -> Option<A> {
+    match mode {
+        LeaderMode::NoLeader | LeaderMode::Electing { .. } => None,
+        LeaderMode::Leading => Some(observer),
+        LeaderMode::Following { leader } => Some(*leader),
+    }
+}
+
 fn should_replace_published_route<A: SyncIOAddress>(
     best_path: Option<&Vec<A>>,
     best_via: Option<A>,
@@ -326,15 +342,12 @@ fn fresh_observation<A: SyncIOAddress>(
     now_ms: u64,
     stale_after_ms: u64,
     timed: TimedPeerObservation<A>,
-) -> Option<LeaderWithElectionInfo<A>> {
-    if timed.observer != timed.observation.observer {
-        return None;
-    }
+) -> Option<(A, LeaderWithElectionInfo<A>)> {
     let last_activity = timed.last_activity_ms?;
     if stale_after_ms < now_ms.saturating_sub(last_activity) {
         return None;
     }
-    Some(timed.observation)
+    Some((timed.observer, timed.observation))
 }
 
 #[cfg(test)]
@@ -355,26 +368,35 @@ mod tests {
         observer: u64,
         term: u64,
         leader: Option<u64>,
-        path: Option<Vec<u64>>,
+        _path: Option<Vec<u64>>,
         vote: Option<u64>,
         can_lead: bool,
         reachable_can_lead: Vec<u64>,
         recover_next_seq: u64,
-    ) -> LeaderWithElectionInfo<u64> {
-        LeaderWithElectionInfo {
+    ) -> (u64, LeaderWithElectionInfo<u64>) {
+        let mode = match leader {
+            Some(leader) if leader == observer => LeaderMode::Leading,
+            Some(leader) => LeaderMode::Following { leader },
+            None => match vote {
+                Some(vote) => LeaderMode::Electing { vote: Some(vote) },
+                None => LeaderMode::NoLeader,
+            },
+        };
+
+        (
             observer,
-            term,
-            leader,
-            leader_path: path,
-            vote,
-            can_lead,
-            reachable_can_lead,
-            recover_details: details(recover_next_seq),
-        }
+            LeaderWithElectionInfo {
+                term,
+                leader: mode,
+                can_lead,
+                reachable_can_lead,
+                recover_details: details(recover_next_seq),
+            },
+        )
     }
 
-    fn input(local: u64, can_lead: bool, observations: Vec<LeaderWithElectionInfo<u64>>) -> ElectionInput<u64> {
-        let local_observation = observation(local, 1, None, None, None, can_lead, vec![local], 1);
+    fn input(local: u64, can_lead: bool, observations: Vec<(u64, LeaderWithElectionInfo<u64>)>) -> ElectionInput<u64> {
+        let local_observation = observation(local, 1, None, None, None, can_lead, vec![local], 1).1;
         ElectionInput {
             local_address: local,
             can_lead,
@@ -382,8 +404,8 @@ mod tests {
             local_observation,
             peer_observations: observations
                 .into_iter()
-                .map(|observation| TimedPeerObservation {
-                    observer: observation.observer,
+                .map(|(observer, observation)| TimedPeerObservation {
+                    observer,
                     last_activity_ms: Some(100),
                     observation,
                 })
@@ -437,7 +459,7 @@ mod tests {
         let observations = fresh_same_term_observations(&input);
 
         assert_eq!(observations.len(), 1);
-        assert_eq!(observations[0].observer, 1);
+        assert_eq!(observations[0].leader, LeaderMode::NoLeader);
     }
 
     #[test]
@@ -491,10 +513,10 @@ mod tests {
                 observation(1, 1, Some(1), Some(vec![1]), Some(1), true, vec![1], 1),
                 observation(2, 1, Some(2), Some(vec![2]), Some(2), true, vec![2], 1),
                 observation(4, 2, Some(4), Some(vec![4]), Some(4), true, vec![4], 1),
-                observation(5, 1, Some(5), Some(vec![6, 5]), Some(5), true, vec![5], 1),
+                observation(5, 1, None, None, Some(5), true, vec![5], 1),
             ],
         );
-        input.local_observation = observation(3, 1, Some(1), Some(vec![1, 3]), Some(1), true, vec![1, 3], 1);
+        input.local_observation = observation(3, 1, Some(1), Some(vec![1, 3]), Some(1), true, vec![1, 3], 1).1;
 
         assert_eq!(conflicting_published_leaders(&input), vec![1, 2]);
     }
@@ -558,7 +580,7 @@ mod tests {
                 observation(3, 1, None, None, Some(2), true, vec![2], 1),
             ],
         );
-        input.local_observation.vote = Some(1);
+        input.local_observation.leader = LeaderMode::Electing { vote: Some(1) };
 
         let tally = tally_votes(&input).unwrap();
 

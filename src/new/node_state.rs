@@ -242,6 +242,7 @@ mod tests {
     use super::*;
     use crate::{
         new::{subscribable_state::SubscribableState, tasks::current_leader::CurrentLeaderStatus},
+        protocol::messages::LeaderMode,
         state::{
             determinstic_state::DeterministicState,
             recoverable_state::{RecoverableState, RecoverableStateDetails},
@@ -297,13 +298,14 @@ mod tests {
         }
     }
 
-    fn leader_observation(observer: u64, term: u64, leader: u64, path: Vec<u64>) -> LeaderWithElectionInfo<u64> {
+    fn leader_observation(observer: u64, term: u64, leader: u64, _path: Vec<u64>) -> LeaderWithElectionInfo<u64> {
         LeaderWithElectionInfo {
-            observer,
             term,
-            leader: Some(leader),
-            leader_path: Some(path),
-            vote: Some(leader),
+            leader: if leader == observer {
+                LeaderMode::Leading
+            } else {
+                LeaderMode::Following { leader }
+            },
             can_lead: true,
             reachable_can_lead: vec![observer],
             recover_details: RecoverableStateDetails::new(observer, 1),
@@ -473,7 +475,7 @@ mod tests {
         assert_eq!(peer.addr, 2);
         assert_eq!(peer.can_lead, Some(true));
         assert!(peer.last_global_connectivity.is_some());
-        assert_eq!(peer.leader_observation.as_ref().unwrap().leader, Some(2));
+        assert_eq!(peer.leader_observation.as_ref().unwrap().leader, LeaderMode::Leading);
     }
 
     #[tokio::test]
