@@ -59,19 +59,11 @@ impl Default for CurrentLeaderTiming {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LeaderMode<A: SyncIOAddress> {
-    NoLeader,
-    Electing { vote: Option<A> },
-    Leading { path: Vec<A> },
-    Following { leader: A, path: Vec<A>, via: A },
-}
-
 impl<A: SyncIOAddress> LeaderMode<A> {
     pub fn leader(&self) -> Option<A> {
         match self {
             Self::NoLeader | Self::Electing { .. } => None,
-            Self::Leading { path } => path.first().copied(),
+            Self::Leading => None,
             Self::Following { leader, .. } => Some(*leader),
         }
     }
@@ -221,20 +213,34 @@ where
 
     pub async fn apply_current_leader_tick(&mut self) {
         let mut term = self.state.election_term();
-        if term == 0 {
-            term = self.state.bump_election_term_after(0);
-        }
 
-        let term_changed = self.last_considered_term != term;
-        if term_changed {
-            tracing::debug!(
-                local = ?self.state.my_address,
-                previous_term = self.last_considered_term,
-                term,
-                "current leader task considering new election term",
-            );
+        if term != self.last_considered_term {
+            let current_leader = {
+                let peers = self.state.peers.lock().await;
+                let leaders = peers
+                    .iter()
+                    .filter_map(|(_, peer)| peer.can_lead.unwrap_or(false).then_some(peer))
+                    .filter_map(|peer| peer.leader_observation.as_ref().and_then(|v| v.leader));
+
+                let mut votes = HashMap::<A, u64>::new();
+                for leader in leaders {
+                    votes.entry(leader).and_modify(|v| *v += 1).or_insert(1);
+                }
+
+                votes.into_iter().max_by_key(|v| v.1).map(|v| v.0)
+            };
+
+            let mut state_lock = self.state.leader_status.state.lock().await;
+            match current_leader {
+                None => {
+                    *state_lock = LeaderMode::Electing { vote: None };
+                }
+                Some(leader) => {
+                    *state_lock = LeaderMode::Following { leader };
+                }
+            }
+
             self.last_considered_term = term;
-            self.state.leader_status.no_leader().await;
         }
 
         let snapshot = self.state.leader_status.snapshot().await;

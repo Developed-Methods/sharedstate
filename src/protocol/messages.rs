@@ -26,11 +26,12 @@ pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
     LeaderInformation { source: A, info: LeaderWithElectionInfo<A> },
 }
 
-#[derive(Clone, Debug)]
-pub enum LeaderStatus<A: SyncIOAddress> {
-    Promoted { term: u64, leader: A },
-    Offline { term: u64, leader: A },
-    Observation(LeaderWithElectionInfo<A>),
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaderMode<A: SyncIOAddress> {
+    NoLeader,
+    Electing { vote: Option<A> },
+    Leading,
+    Following { leader: A },
 }
 
 #[derive(Clone, Debug)]
@@ -42,11 +43,8 @@ pub struct LeaderInfoMessage<A: SyncIOAddress> {
 
 #[derive(Clone, Debug)]
 pub struct LeaderWithElectionInfo<A: SyncIOAddress> {
-    pub observer: A,
     pub term: u64,
-    pub leader: Option<A>,
-    pub leader_path: Option<Vec<A>>,
-    pub vote: Option<A>,
+    pub leader: LeaderMode<A>,
     pub can_lead: bool,
     pub reachable_can_lead: Vec<A>,
     pub recover_details: RecoverableStateDetails,
@@ -188,44 +186,6 @@ where
                 info: MessageEncoding::read_from(read)?,
             },
             other => return Err(unknown_id_err(other, "SyncRequest")),
-        })
-    }
-}
-
-impl<A: SyncIOAddress> MessageEncoding for LeaderStatus<A> {
-    fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
-        let mut sum = 0;
-        sum += match self {
-            LeaderStatus::Offline { term, leader } => {
-                sum += 0u16.write_to(out)?;
-                sum += term.write_to(out)?;
-                leader.write_to(out)?
-            }
-            LeaderStatus::Promoted { term, leader } => {
-                sum += 1u16.write_to(out)?;
-                sum += term.write_to(out)?;
-                leader.write_to(out)?
-            }
-            LeaderStatus::Observation(observation) => {
-                sum += 2u16.write_to(out)?;
-                observation.write_to(out)?
-            }
-        };
-        Ok(sum)
-    }
-
-    fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
-        Ok(match u16::read_from(read)? {
-            0 => Self::Offline {
-                term: MessageEncoding::read_from(read)?,
-                leader: MessageEncoding::read_from(read)?,
-            },
-            1 => Self::Promoted {
-                term: MessageEncoding::read_from(read)?,
-                leader: MessageEncoding::read_from(read)?,
-            },
-            2 => Self::Observation(MessageEncoding::read_from(read)?),
-            id => return Err(unknown_id_err(id, "LeaderStatus")),
         })
     }
 }
