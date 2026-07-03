@@ -62,6 +62,7 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
             SyncRequest::LeaderInformation(info) => {
                 let mut lock = self.state.peers.lock().await;
                 let peer = lock.entry(peer_addr).or_insert_with(|| PeerState::empty(peer_addr));
+                peer.can_lead = Some(info.can_lead);
                 peer.leader_info = Some(info);
 
                 SyncResponse::Ok

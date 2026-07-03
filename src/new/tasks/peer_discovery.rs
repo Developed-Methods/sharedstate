@@ -134,11 +134,13 @@ where
                 let leader_info = leader_info.clone();
 
                 async move {
-                    if !peer.can_lead.unwrap_or(false) {
+                    /* voters broadcast to everyone so observers learn the
+                     * leader; observers only report their state to voters */
+                    if !self.state.can_lead && !peer.can_lead.unwrap_or(false) {
                         return;
                     }
 
-                    conn.send_leader_info(peer.addr, leader_info).await;
+                    let _ = conn.send_leader_info(peer.addr, leader_info).await;
                 }
             },
         )
