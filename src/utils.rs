@@ -1,4 +1,16 @@
-use std::time::UNIX_EPOCH;
+use std::{
+    hash::{Hash, Hasher},
+    time::UNIX_EPOCH,
+};
+
+/// Generates an id for a state lineage that is unlikely to collide across
+/// nodes, so recovery checks don't accept a follower from a different lineage.
+pub fn unique_state_id<A: Hash>(addr: &A) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    addr.hash(&mut hasher);
+    now_ms().hash(&mut hasher);
+    hasher.finish()
+}
 
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()

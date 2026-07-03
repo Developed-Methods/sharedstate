@@ -65,6 +65,10 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
                 let (state, feed) = self.state.state.subscribe_fresh().await;
                 return ResponseOrFeed::FreshState { state, feed };
             }
+            SyncRequest::LeaderQuery => {
+                let leader_state = self.state.leader_state.lock().await.clone();
+                SyncResponse::LeaderState(leader_state)
+            }
             SyncRequest::SharePeers(shared_peers) => {
                 self.state.merge_peer_details(shared_peers).await;
                 let share_peer_details = self.state.known_peer_details().await;

@@ -46,6 +46,42 @@ impl<D: DeterministicState> SubscribableState<D> {
         details
     }
 
+    /// Recovery details once every queued update has been applied, so the
+    /// reported next_seq matches the broadcast position. Blocks concurrent
+    /// updates while it settles.
+    pub async fn settled_recovery_details(&self) -> RecoverableStateDetails {
+        let sender = self.broadcast_sender.lock().await;
+        let target_seq = sender.seq();
+
+        self.settle().await;
+
+        let mut handle = self.state_handle.lock().await;
+        loop {
+            let details = handle.current().0.details().clone();
+            if details.next_seq() == target_seq {
+                handle.quiescent();
+                return details;
+            }
+            handle.quiescent();
+            self.state.maintain();
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Drives hot-read maintenance until the published copy has every queued
+    /// update. Publication can be deferred when a reader is mid-read, and
+    /// nothing else retries it, so updates must settle before they can be
+    /// relied on to be visible.
+    async fn settle(&self) {
+        loop {
+            if self.state.copy_applied_seq(self.state.active_index()) == self.state.latest_seq() {
+                return;
+            }
+            self.state.maintain();
+            tokio::task::yield_now().await;
+        }
+    }
+
     pub async fn reset(&self, new_state: RecoverableState<D>) {
         let mut broadcast_locked = self.broadcast.lock().await;
         let mut sender_locked = self.broadcast_sender.lock().await;
@@ -53,21 +89,7 @@ impl<D: DeterministicState> SubscribableState<D> {
         let new_recover_details = new_state.details().clone();
 
         self.state.queue_update(HotStateAction::Reset(new_state));
-
-        {
-            let mut handle = self.state_handle.lock().await;
-
-            /* busy spin waiting for state to apply reset action */
-            loop {
-                let current_state = handle.current();
-                if new_recover_details.eq(current_state.0.details()) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-
-            handle.quiescent();
-        }
+        self.settle().await;
 
         let (broadcast, broadcast_sender) =
             SequencedBroadcast::new(new_recover_details.next_seq(), self.broadcast_settings.clone()).unwrap();
@@ -107,7 +129,7 @@ impl<D: DeterministicState> SubscribableState<D> {
             let state = {
                 let mut lock = self.state_handle.lock().await;
                 let state_clone = lock.current().0.clone();
-                lock.generation();
+                lock.quiescent();
                 state_clone
             };
 
@@ -137,6 +159,8 @@ impl<D: DeterministicState> SubscribableState<D> {
         for action in batch {
             let _ = sender.send(action).await;
         }
+
+        self.settle().await;
     }
 }
 
@@ -153,7 +177,7 @@ impl<D: DeterministicState> StateHandle<D> {
         self.read_with(|v| v.details().clone())
     }
 
-    pub fn read_with<R, F: Fn(&RecoverableState<D>) -> R>(&mut self, handle: F) -> R {
+    pub fn read_with<R, F: FnOnce(&RecoverableState<D>) -> R>(&mut self, handle: F) -> R {
         let state = self.current();
         let result = handle(state);
         self.quiescent();

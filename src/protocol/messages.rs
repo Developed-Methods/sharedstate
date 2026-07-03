@@ -22,6 +22,7 @@ pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
     SubscribeFresh,
     SubscribeRecovery(RecoverableStateDetails),
     Action { source: A, action: D::Action },
+    LeaderQuery,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +72,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Debug for SyncRequest<A, D> {
             Self::SubscribeFresh => write!(f, "SubscribeFresh"),
             Self::SubscribeRecovery(details) => write!(f, "SubscribeRecovery({details:?})"),
             Self::Action { source, .. } => write!(f, "Action(source: {source:?})"),
+            Self::LeaderQuery => write!(f, "LeaderQuery"),
         }
     }
 }
@@ -85,6 +87,7 @@ pub enum SyncResponse<A: SyncIOAddress, D: DeterministicState> {
     AuthorityAction(u64, RecoverableStateAction<D::AuthorityAction>),
     ActionStreamClosed,
     UnexpectedRequest,
+    LeaderState(LeaderState<A>),
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> SyncResponse<A, D> {
@@ -99,6 +102,7 @@ impl<A: SyncIOAddress, D: DeterministicState> SyncResponse<A, D> {
             SyncResponse::AuthorityAction(_, _) => "AuthorityAction",
             SyncResponse::ActionStreamClosed => "ActionStreamClosed",
             SyncResponse::UnexpectedRequest => "UnexpectedRequest",
+            SyncResponse::LeaderState(_) => "LeaderState",
         }
     }
 }
@@ -136,6 +140,7 @@ where
                 sum += source.write_to(out)?;
                 action.write_to(out)?
             }
+            Self::LeaderQuery => 7u16.write_to(out)?,
         };
 
         Ok(sum)
@@ -153,6 +158,7 @@ where
                 source: MessageEncoding::read_from(read)?,
                 action: MessageEncoding::read_from(read)?,
             },
+            7 => Self::LeaderQuery,
             other => return Err(unknown_id_err(other, "SyncRequest")),
         })
     }
@@ -300,6 +306,10 @@ where
             }
             Self::ActionStreamClosed => 7u16.write_to(out)?,
             Self::UnexpectedRequest => 8u16.write_to(out)?,
+            Self::LeaderState(state) => {
+                sum += 9u16.write_to(out)?;
+                state.write_to(out)?
+            }
         };
 
         Ok(sum)
@@ -318,6 +328,7 @@ where
             6 => Self::AuthorityAction(MessageEncoding::read_from(read)?, MessageEncoding::read_from(read)?),
             7 => Self::ActionStreamClosed,
             8 => Self::UnexpectedRequest,
+            9 => Self::LeaderState(MessageEncoding::read_from(read)?),
             other => return Err(unknown_id_err(other, "SyncResponse")),
         })
     }
@@ -435,6 +446,7 @@ mod tests {
                 },
                 6,
             ),
+            (SyncRequest::LeaderQuery, 7),
         ];
 
         for (request, tag) in cases {
@@ -454,6 +466,13 @@ mod tests {
             (SyncResponse::AuthorityAction(9, RecoverableStateAction::StateAction { action: TestAction(10) }), 6),
             (SyncResponse::ActionStreamClosed, 7),
             (SyncResponse::UnexpectedRequest, 8),
+            (
+                SyncResponse::LeaderState(LeaderState {
+                    term: 3,
+                    mode: LeaderMode::Leading,
+                }),
+                9,
+            ),
         ];
 
         for (response, tag) in cases {

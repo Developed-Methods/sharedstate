@@ -6,6 +6,7 @@ pub mod node_state;
 pub mod peer_connections;
 pub mod peer_discovery;
 pub mod rpc_server;
+pub mod state_sync;
 
 #[cfg(test)]
 mod tests {

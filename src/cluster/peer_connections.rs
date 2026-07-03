@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     cluster::node_state::NodeState,
-    protocol::messages::{LeaderInfo, SharePeerDetails, SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{LeaderInfo, LeaderState, SharePeerDetails, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::deterministic_state::DeterministicState,
     transport::{
         channels::NetIoSettings,
@@ -156,6 +156,14 @@ where
         match response {
             SyncResponse::Ok => Ok(()),
             response => self.unexpected_response(peer, "Ok", response).await,
+        }
+    }
+
+    pub async fn query_leader(&self, peer: I::Address) -> Result<LeaderState<I::Address>, PeerRpcError> {
+        let response = self.send_rpc(peer, SyncRequest::LeaderQuery).await?;
+        match response {
+            SyncResponse::LeaderState(state) => Ok(state),
+            response => self.unexpected_response(peer, "LeaderState", response).await,
         }
     }
 

@@ -1,8 +1,7 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     env,
     io::{self, Error, ErrorKind, Stdout, Write},
-    iter,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -21,45 +20,32 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Terminal,
 };
-use sequenced_broadcast::SequencedBroadcastSettings;
 use sharedstate::{
     cluster::{
-        leader::{LeaderMode, LeaderTask, LeaderTiming},
-        node_state::{ConnectStatus, NodeState, PeerState},
-        peer_connections::PeerConnections,
-        peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
-        rpc_server::RpcServer,
+        leader::LeaderMode,
+        node_state::{ConnectStatus, NodeState},
     },
-    protocol::messages::{LeaderState, SyncRequest, SyncResponse, PROTOCOL_VERSION},
-    state::{
-        deterministic_state::DeterministicState,
-        recoverable_state::{RecoverableState, RecoverableStateAction},
-        subscribable_state::StateHandle,
-    },
-    transport::{
-        channels::NetIoSettings,
-        traits::{SyncConnection, SyncIO, SyncIOListener},
-    },
+    state::{deterministic_state::DeterministicState, subscribable_state::StateHandle},
+    transport::traits::{SyncConnection, SyncIO, SyncIOListener},
+    SharedState, SharedStateConfig, SharedStateSettings,
 };
 use tokio::{
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{
-        mpsc::{self, UnboundedReceiver, UnboundedSender},
-        Mutex,
-    },
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
 use tracing_subscriber::fmt::MakeWriter;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+type KvShared = SharedState<LocalhostTcpIo, KvStore>;
 
 const COMMAND_HELP: &str =
     "commands: help, status, peers, get <key>, set <key> <value>, delete|del|rm <key>, list|print, quit|exit";
 const PROMPT: &str = "kv> ";
 const LOG_LIMIT: usize = 250;
 const RENDER_INTERVAL: Duration = Duration::from_millis(100);
-const SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
 struct Args {
@@ -404,52 +390,16 @@ async fn main() -> io::Result<()> {
     let args = parse_args()?;
     let io = Arc::new(LocalhostTcpIo::bind_ephemeral().await?);
     let local_address = io.address;
-    let settings = NetIoSettings::default();
 
-    let initial_peers = args
-        .peers
-        .iter()
-        .copied()
-        .filter(|peer| *peer != local_address)
-        .map(|peer| {
-            (
-                peer,
-                PeerState {
-                    addr: peer,
-                    can_lead: None,
-                    connect_status: ConnectStatus::NotConnected,
-                    last_global_connectivity: None,
-                    leader_info: None,
-                },
-            )
-        })
-        .collect::<HashMap<_, _>>();
-
-    let state = Arc::new(NodeState {
+    let shared = SharedState::start(SharedStateConfig {
+        io,
         my_address: local_address,
         can_lead: args.can_lead,
-        peers: Mutex::new(initial_peers),
-        state: sharedstate::state::subscribable_state::SubscribableState::new(
-            RecoverableState::new(local_address as u64, KvStore::new()),
-            SequencedBroadcastSettings::default(),
-        )
-        .map_err(|error| Error::other(format!("failed to create state broadcast: {error:?}")))?,
-        leader_state: Mutex::new(LeaderState {
-            term: 0,
-            mode: LeaderMode::NoLeader,
-        }),
-    });
-
-    let peer_connections = Arc::new(PeerConnections::new(io.clone(), settings.clone(), state.clone()));
-    let (actions_tx, actions_rx) = mpsc::channel(512);
-    let rpc_server = Arc::new(RpcServer::new(state.clone(), actions_tx.clone()));
-    let _server_task = rpc_server.start_listener(io.clone(), settings.clone());
-
-    tokio::spawn(PeerDiscoveryTask::new(state.clone(), peer_connections.clone(), PeerDiscoveryTiming::default()).run());
-    tokio::spawn(LeaderTask::new(state.clone(), LeaderTiming::default()).run());
-
-    start_action_router(state.clone(), peer_connections.clone(), actions_rx, log_tx.clone());
-    start_follower_subscription(state.clone(), io.clone(), settings.clone(), log_tx.clone());
+        initial_peers: args.peers.clone(),
+        initial_state: KvStore::new(),
+        settings: SharedStateSettings::default(),
+    })
+    .map_err(|error| Error::other(format!("failed to start shared state: {error:?}")))?;
 
     let _ = log_tx.send(format!(
         "listening on 127.0.0.1:{local_address} can_lead={} initial_peers={:?}",
@@ -457,8 +407,8 @@ async fn main() -> io::Result<()> {
     ));
     let _ = log_tx.send(COMMAND_HELP.to_owned());
 
-    let mut state_handle = state.state.create_handle();
-    run_tui(state, actions_tx, log_rx, &mut state_handle).await
+    let mut state_handle = shared.state_handle();
+    run_tui(&shared, log_rx, &mut state_handle).await
 }
 
 fn parse_args() -> io::Result<Args> {
@@ -496,153 +446,8 @@ fn usage_error() -> io::Error {
     Error::new(ErrorKind::InvalidInput, "usage: cargo run --example kv_tui -- <can_lead:true|false> [peer_ports_csv]")
 }
 
-fn start_action_router(
-    state: Arc<NodeState<u16, KvStore>>,
-    peer_connections: Arc<PeerConnections<LocalhostTcpIo, KvStore>>,
-    mut actions_rx: mpsc::Receiver<(u16, KvAction)>,
-    log_tx: UnboundedSender<String>,
-) {
-    tokio::spawn(async move {
-        while let Some((source, action)) = actions_rx.recv().await {
-            match current_leader_address(&state).await {
-                Some(leader) if leader == state.my_address => {
-                    state
-                        .state
-                        .update(iter::once(RecoverableStateAction::StateAction { action }))
-                        .await;
-                    let _ = log_tx.send(format!("applied action locally from {source}"));
-                }
-                Some(leader) => {
-                    let result = peer_connections
-                        .send_rpc(leader, SyncRequest::Action { source, action })
-                        .await;
-                    match result {
-                        Ok(SyncResponse::Ok) => {
-                            let _ = log_tx.send(format!("forwarded action from {source} to leader {leader}"));
-                        }
-                        Ok(response) => {
-                            let _ = log_tx.send(format!(
-                                "leader {leader} returned unexpected action response {}",
-                                response.name()
-                            ));
-                        }
-                        Err(error) => {
-                            let _ = log_tx.send(format!("failed to forward action to leader {leader}: {error:?}"));
-                        }
-                    }
-                }
-                None => {
-                    let _ = log_tx.send("no leader available; action dropped".to_owned());
-                }
-            }
-        }
-    });
-}
-
-fn start_follower_subscription(
-    state: Arc<NodeState<u16, KvStore>>,
-    io: Arc<LocalhostTcpIo>,
-    settings: NetIoSettings,
-    log_tx: UnboundedSender<String>,
-) {
-    tokio::spawn(async move {
-        loop {
-            let Some(leader) = current_leader_address(&state).await else {
-                tokio::time::sleep(SUBSCRIBE_RETRY_DELAY).await;
-                continue;
-            };
-            if leader == state.my_address {
-                tokio::time::sleep(SUBSCRIBE_RETRY_DELAY).await;
-                continue;
-            }
-
-            let _ = log_tx.send(format!("subscribing fresh from leader {leader}"));
-            match subscribe_to_leader(&state, &io, settings.clone(), leader, &log_tx).await {
-                Ok(()) => {
-                    let _ = log_tx.send(format!("subscription to leader {leader} closed"));
-                }
-                Err(error) => {
-                    let _ = log_tx.send(format!("subscription to leader {leader} failed: {error}"));
-                }
-            }
-
-            tokio::time::sleep(SUBSCRIBE_RETRY_DELAY).await;
-        }
-    });
-}
-
-async fn subscribe_to_leader(
-    state: &Arc<NodeState<u16, KvStore>>,
-    io: &Arc<LocalhostTcpIo>,
-    settings: NetIoSettings,
-    leader: u16,
-    log_tx: &UnboundedSender<String>,
-) -> io::Result<()> {
-    let connection = io.connect(&leader).await?;
-    let (_remote, write, mut read) = connection.client_channels::<KvStore>(settings.clone());
-
-    write
-        .send(SyncRequest::ProtocolVersion(PROTOCOL_VERSION))
-        .await
-        .map_err(|_| Error::new(ErrorKind::BrokenPipe, "failed to send protocol version"))?;
-    require_ok(read.recv().await, "protocol version")?;
-
-    write
-        .send(SyncRequest::MyAddress(state.my_address))
-        .await
-        .map_err(|_| Error::new(ErrorKind::BrokenPipe, "failed to send local address"))?;
-    require_ok(read.recv().await, "my address")?;
-
-    write
-        .send(SyncRequest::SubscribeFresh)
-        .await
-        .map_err(|_| Error::new(ErrorKind::BrokenPipe, "failed to send fresh subscription request"))?;
-
-    match read.recv().await {
-        Some(SyncResponse::FreshState(fresh)) => {
-            let next_seq = fresh.details().next_seq();
-            state.state.reset(fresh).await;
-            let _ = log_tx.send(format!("loaded fresh state from leader {leader} next_seq={next_seq}"));
-        }
-        Some(response) => {
-            return Err(Error::new(ErrorKind::InvalidData, format!("expected FreshState, got {}", response.name())));
-        }
-        None => return Err(Error::new(ErrorKind::UnexpectedEof, "subscription closed before fresh state")),
-    }
-
-    while current_leader_address(state).await == Some(leader) {
-        match read.recv().await {
-            Some(SyncResponse::AuthorityAction(seq, action)) => {
-                state.state.update(iter::once(action)).await;
-                let _ = log_tx.send(format!("applied streamed authority action seq={seq} from leader {leader}"));
-            }
-            Some(SyncResponse::ActionStreamClosed) => break,
-            Some(response) => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("unexpected stream response {}", response.name()),
-                ));
-            }
-            None => return Err(Error::new(ErrorKind::UnexpectedEof, "subscription stream closed")),
-        }
-    }
-
-    Ok(())
-}
-
-fn require_ok(response: Option<SyncResponse<u16, KvStore>>, step: &'static str) -> io::Result<()> {
-    match response {
-        Some(SyncResponse::Ok) => Ok(()),
-        Some(response) => {
-            Err(Error::new(ErrorKind::InvalidData, format!("expected Ok during {step}, got {}", response.name())))
-        }
-        None => Err(Error::new(ErrorKind::UnexpectedEof, format!("connection closed during {step}"))),
-    }
-}
-
 async fn run_tui(
-    state: Arc<NodeState<u16, KvStore>>,
-    actions_tx: mpsc::Sender<(u16, KvAction)>,
+    shared: &KvShared,
     mut log_rx: UnboundedReceiver<String>,
     state_handle: &mut StateHandle<KvStore>,
 ) -> io::Result<()> {
@@ -656,14 +461,14 @@ async fn run_tui(
         }
 
         if last_render.elapsed() >= RENDER_INTERVAL {
-            let summary = build_summary(&state, state_handle).await;
+            let summary = build_summary(shared.node(), state_handle).await;
             terminal.terminal.draw(|frame| render(frame, &app, summary.clone()))?;
             last_render = Instant::now();
         }
 
         if event::poll(Duration::from_millis(20))? {
             if let Event::Key(key) = event::read()? {
-                handle_key(key, &mut app, &state, &actions_tx, state_handle).await;
+                handle_key(key, &mut app, shared, state_handle).await;
             }
         }
 
@@ -761,7 +566,7 @@ fn input_view(input: &str, cursor: usize, max_width: u16) -> (String, u16) {
     (input[start..end].to_owned(), cursor_col)
 }
 
-async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut StateHandle<KvStore>) -> Vec<String> {
+async fn build_summary(state: &NodeState<u16, KvStore>, state_handle: &mut StateHandle<KvStore>) -> Vec<String> {
     let leader_state = state.leader_state.lock().await.clone();
     let (seq, item_count, values_preview) = state_handle.read_with(|recoverable| {
         let store = recoverable.state();
@@ -805,15 +610,6 @@ async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut 
     lines
 }
 
-async fn current_leader_address(state: &NodeState<u16, KvStore>) -> Option<u16> {
-    let leader_state = state.leader_state.lock().await.clone();
-    match leader_state.mode {
-        LeaderMode::Leading => Some(state.my_address),
-        LeaderMode::Following { leader } => Some(leader),
-        LeaderMode::NoLeader | LeaderMode::Electing { .. } => None,
-    }
-}
-
 fn published_leader(observer: u16, mode: &LeaderMode<u16>) -> Option<u16> {
     match mode {
         LeaderMode::NoLeader | LeaderMode::Electing { .. } => None,
@@ -846,13 +642,7 @@ fn leader_mode_line(mode: &LeaderMode<u16>) -> String {
     }
 }
 
-async fn handle_key(
-    key: KeyEvent,
-    app: &mut App,
-    state: &Arc<NodeState<u16, KvStore>>,
-    actions_tx: &mpsc::Sender<(u16, KvAction)>,
-    state_handle: &mut StateHandle<KvStore>,
-) {
+async fn handle_key(key: KeyEvent, app: &mut App, shared: &KvShared, state_handle: &mut StateHandle<KvStore>) {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
@@ -871,7 +661,7 @@ async fn handle_key(
             let command = app.take_input();
             if !command.is_empty() {
                 app.log(format!("kv> {command}"));
-                run_command(command, app, state, actions_tx, state_handle).await;
+                run_command(command, app, shared, state_handle).await;
             }
         }
         KeyCode::Char(ch) => {
@@ -883,13 +673,7 @@ async fn handle_key(
     }
 }
 
-async fn run_command(
-    command: String,
-    app: &mut App,
-    state: &Arc<NodeState<u16, KvStore>>,
-    actions_tx: &mpsc::Sender<(u16, KvAction)>,
-    state_handle: &mut StateHandle<KvStore>,
-) {
+async fn run_command(command: String, app: &mut App, shared: &KvShared, state_handle: &mut StateHandle<KvStore>) {
     let mut parts = command.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or_default();
     let rest = parts.next().unwrap_or_default().trim();
@@ -898,17 +682,17 @@ async fn run_command(
         "help" => app.log(COMMAND_HELP),
         "quit" | "exit" => app.should_quit = true,
         "status" => {
-            let leader_state = state.leader_state.lock().await.clone();
-            let peer_count = state.peers.lock().await.len();
+            let leader_state = shared.leader_state().await;
+            let peer_count = shared.node().peers.lock().await.len();
             app.log(format!(
                 "address={} can_lead={} leader={} peers={peer_count}",
-                state.my_address,
-                state.can_lead,
+                shared.my_address(),
+                shared.can_lead(),
                 leader_mode_line(&leader_state.mode)
             ));
         }
         "peers" => {
-            let peers = state.peers.lock().await;
+            let peers = shared.node().peers.lock().await;
             if peers.is_empty() {
                 app.log("(no peers)");
             } else {
@@ -926,8 +710,8 @@ async fn run_command(
             }
         }
         "get" => handle_get(rest, app, state_handle),
-        "set" => handle_set(rest, app, state.my_address, actions_tx).await,
-        "delete" | "del" | "rm" => handle_delete(rest, app, state.my_address, actions_tx).await,
+        "set" => handle_set(rest, app, shared).await,
+        "delete" | "del" | "rm" => handle_delete(rest, app, shared).await,
         "list" | "print" => handle_list(app, state_handle),
         _ => app.log(format!("unknown command: {name}")),
     }
@@ -947,7 +731,7 @@ fn handle_get(rest: &str, app: &mut App, state_handle: &mut StateHandle<KvStore>
     }
 }
 
-async fn handle_set(rest: &str, app: &mut App, source: u16, actions_tx: &mpsc::Sender<(u16, KvAction)>) {
+async fn handle_set(rest: &str, app: &mut App, shared: &KvShared) {
     let mut parts = rest.splitn(2, char::is_whitespace);
     let Some(key) = parts.next().filter(|value| !value.is_empty()) else {
         app.log("usage: set <key> <value>");
@@ -958,14 +742,11 @@ async fn handle_set(rest: &str, app: &mut App, source: u16, actions_tx: &mpsc::S
         return;
     };
 
-    match actions_tx
-        .send((
-            source,
-            KvAction::Set {
-                key: key.to_owned(),
-                value: value.to_owned(),
-            },
-        ))
+    match shared
+        .submit_action(KvAction::Set {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        })
         .await
     {
         Ok(()) => app.log(format!("queued set {key}")),
@@ -973,17 +754,14 @@ async fn handle_set(rest: &str, app: &mut App, source: u16, actions_tx: &mpsc::S
     }
 }
 
-async fn handle_delete(rest: &str, app: &mut App, source: u16, actions_tx: &mpsc::Sender<(u16, KvAction)>) {
+async fn handle_delete(rest: &str, app: &mut App, shared: &KvShared) {
     let key = rest.trim();
     if key.is_empty() || key.split_whitespace().nth(1).is_some() {
         app.log("usage: delete <key>");
         return;
     }
 
-    match actions_tx
-        .send((source, KvAction::Delete { key: key.to_owned() }))
-        .await
-    {
+    match shared.submit_action(KvAction::Delete { key: key.to_owned() }).await {
         Ok(()) => app.log(format!("queued delete {key}")),
         Err(error) => app.log(format!("failed to queue delete: {error}")),
     }

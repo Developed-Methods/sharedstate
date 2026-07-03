@@ -5,7 +5,10 @@
 
 pub mod cluster;
 pub mod protocol;
+pub mod service;
 pub mod state;
 pub mod transport;
 
 mod utils;
+
+pub use service::{SharedState, SharedStateConfig, SharedStateSettings};
