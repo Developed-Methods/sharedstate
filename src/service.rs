@@ -280,6 +280,64 @@ mod tests {
         .await;
     }
 
+    async fn wait_for_state(node: &SharedState<SimulatedIo, KvState>, expected: &BTreeMap<u64, u64>) {
+        let mut handle = node.state_handle();
+        wait_for(&format!("node {} to settle on {expected:?}", node.my_address()), || {
+            handle.read_with(|state| {
+                let state = state.state();
+                state.seq == expected.len() as u64 && state.values == *expected
+            })
+        })
+        .await;
+    }
+
+    async fn wait_for_cluster_state(nodes: &[&SharedState<SimulatedIo, KvState>], expected: &BTreeMap<u64, u64>) {
+        for node in nodes {
+            wait_for_state(node, expected).await;
+        }
+    }
+
+    async fn wait_for_common_leader(nodes: &[&SharedState<SimulatedIo, KvState>]) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut observed_leader = None;
+            let mut leader_is_leading = false;
+            let mut unsettled = Vec::new();
+
+            for node in nodes {
+                let state = node.leader_state().await;
+                let leader = match state.mode {
+                    LeaderMode::Leading => {
+                        leader_is_leading = true;
+                        node.my_address()
+                    }
+                    LeaderMode::Following { leader } => leader,
+                    _ => {
+                        unsettled.push((node.my_address(), state));
+                        continue;
+                    }
+                };
+
+                if observed_leader.is_some_and(|observed| observed != leader) {
+                    unsettled.push((node.my_address(), state));
+                }
+                observed_leader.get_or_insert(leader);
+            }
+
+            if let Some(leader) = observed_leader {
+                if unsettled.is_empty() && leader_is_leading {
+                    return leader;
+                }
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "nodes never settled on a common leader, unsettled states {unsettled:?}",
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     async fn wait_for_leader(nodes: &[&SharedState<SimulatedIo, KvState>], leader: u64) {
         for node in nodes {
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -483,5 +541,45 @@ mod tests {
         node3.submit_action((2, 2)).await.unwrap();
         wait_for_value(&node2, 2, 2).await;
         wait_for_value(&node3, 2, 2).await;
+    }
+
+    #[tokio::test]
+    async fn five_node_cluster_replicates_from_all_nodes_after_leader_failure() {
+        let net = SimulatedNet::new();
+        let node1 = start_node(&net, 1, true, &[2, 3, 4, 5]).await;
+        let node2 = start_node(&net, 2, true, &[1, 3, 4, 5]).await;
+        let node3 = start_node(&net, 3, true, &[1, 2, 4, 5]).await;
+        let node4 = start_node(&net, 4, false, &[1, 2, 3, 5]).await;
+        let node5 = start_node(&net, 5, false, &[1, 2, 3, 4]).await;
+
+        let all_nodes = [&node1, &node2, &node3, &node4, &node5];
+        let first_leader = wait_for_common_leader(&all_nodes).await;
+        assert_eq!(first_leader, 1);
+
+        let mut expected = BTreeMap::new();
+        for node in all_nodes {
+            let key = 100 + node.my_address();
+            let value = key * 10;
+            node.submit_action((key, value)).await.unwrap();
+            expected.insert(key, value);
+        }
+        wait_for_cluster_state(&[&node1, &node2, &node3, &node4, &node5], &expected).await;
+
+        net.set_node_blocked(first_leader, true).await;
+        net.stop_node(first_leader).await;
+        drop(node1);
+
+        let remaining_nodes = [&node2, &node3, &node4, &node5];
+        let second_leader = wait_for_common_leader(&remaining_nodes).await;
+        assert_ne!(second_leader, first_leader);
+        assert_eq!(second_leader, 2);
+
+        for node in remaining_nodes {
+            let key = 200 + node.my_address();
+            let value = key * 10;
+            node.submit_action((key, value)).await.unwrap();
+            expected.insert(key, value);
+        }
+        wait_for_cluster_state(&[&node2, &node3, &node4, &node5], &expected).await;
     }
 }
