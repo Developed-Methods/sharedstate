@@ -24,6 +24,7 @@ pub struct PeerState<A: SyncIOAddress> {
     pub connect_status: ConnectStatus,
     pub last_global_connectivity: Option<NonZeroU64>,
     pub leader_info: Option<LeaderInfo<A>>,
+    pub reachable_voters: Vec<A>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +48,7 @@ impl<A: SyncIOAddress> PeerState<A> {
             connect_status: ConnectStatus::NotConnected,
             last_global_connectivity: None,
             leader_info: None,
+            reachable_voters: Vec::new(),
         }
     }
 

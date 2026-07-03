@@ -2,9 +2,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
     cluster::node_state::{ConnectStatus, NodeState, PeerState},
-    protocol::messages::LeaderState,
-    state::deterministic_state::DeterministicState,
-    transport::traits::SyncIOAddress,
+    protocol::messages::{ElectionTerm, LeaderState},
+    state::{deterministic_state::DeterministicState, recoverable_state::RecoverableStateDetails},
+    transport::traits::SyncIOAddress, utils::now_ms,
 };
 
 pub use crate::protocol::messages::LeaderMode;
@@ -50,7 +50,25 @@ where
     pub async fn tick(&mut self) {
         let peer_views = {
             let peers = self.state.peers.lock().await;
-            peers.values().map(PeerView::new).collect::<Vec<_>>()
+            let online_peers_with_leader_info = peers.values()
+                .filter(|p| p.connect_status.is_connected()).filter_map(|v| v.leader_info.clone());
+            
+            let (peer_count, connection_table) = online_peers_with_leader_info.fold((0u32, HashMap::<A, u32>::new()), |(count, mut table), peer| {
+                for addr in &peer.reachable_voters {
+                    table.entry(*addr).and_modify(|v| *v += 1).or_insert(1);
+                }
+                (count + 1, table)
+            });
+
+            let offline_threshold = peer_count / 3;
+
+            peers.values()
+                .filter(|peer| {
+                    let connection_count = connection_table.get(&peer.addr).cloned().unwrap_or(0);
+                    offline_threshold < connection_count
+                })
+                .map(PeerView::new)
+                .collect::<Vec<_>>()
         };
 
         let mut leader_state = self.state.leader_state.lock().await;
@@ -75,6 +93,7 @@ struct PeerView<A: SyncIOAddress> {
     connected: bool,
     unreachable: bool,
     leader_state: Option<LeaderState<A>>,
+    recovery_details: Option<RecoverableStateDetails>,
 }
 
 impl<A: SyncIOAddress> PeerView<A> {
@@ -93,10 +112,11 @@ impl<A: SyncIOAddress> PeerView<A> {
             connected: peer.connect_status.is_connected(),
             unreachable,
             leader_state: peer.leader_info.as_ref().map(|info| info.leader_state.clone()),
+            recovery_details: peer.leader_info.as_ref().map(|info| info.recovery_details.clone()),
         }
     }
 
-    fn mode_at_term(&self, term: u64) -> Option<&LeaderMode<A>> {
+    fn mode_at_term(&self, term: ElectionTerm) -> Option<&LeaderMode<A>> {
         self.leader_state
             .as_ref()
             .filter(|state| state.term == term)
@@ -118,9 +138,9 @@ fn next_voter_state<A: SyncIOAddress>(me: A, current: &LeaderState<A>, peers: &[
 
     let term = voters()
         .filter_map(|peer| peer.leader_state.as_ref().map(|state| state.term))
-        .max()
-        .unwrap_or(0)
-        .max(current.term);
+        .chain(std::iter::once(current.term))
+        .max_by_key(ElectionTerm::id)
+        .unwrap();
 
     let mode = if term == current.term {
         current.mode.clone()
@@ -136,28 +156,28 @@ fn next_voter_state<A: SyncIOAddress>(me: A, current: &LeaderState<A>, peers: &[
     let peer_claim = voters()
         .filter(|peer| peer.connected)
         .filter(|peer| matches!(peer.mode_at_term(term), Some(LeaderMode::Leading)))
-        .map(|peer| peer.addr)
-        .min();
+        .map(|peer| (peer.recovery_details.as_ref().unwrap().next_seq(), peer.addr))
+        .max();
 
     match mode {
         LeaderMode::Leading => {
             let reachable_count = voters().filter(|peer| !peer.unreachable).count() + 1;
             if !has_majority(reachable_count) {
                 tracing::warn!(
-                    term,
+                    %term,
                     voter_count,
                     reachable_count,
                     "lost contact with voter majority, stepping down"
                 );
                 return LeaderState {
-                    term: term + 1,
+                    term: term.bump(),
                     mode: LeaderMode::Electing { vote: None },
                 };
             }
 
             match peer_claim {
                 Some(leader) if leader < me => {
-                    tracing::warn!(?leader, term, "conceding to lower address leading the same term");
+                    tracing::warn!(?leader, %term, "conceding to lower address leading the same term");
                     LeaderState {
                         term,
                         mode: LeaderMode::Following { leader },
@@ -180,9 +200,9 @@ fn next_voter_state<A: SyncIOAddress>(me: A, current: &LeaderState<A>, peers: &[
             let leader_view = peers.iter().find(|peer| peer.addr == leader);
 
             if leader_view.map(|peer| peer.unreachable).unwrap_or(true) {
-                tracing::warn!(?leader, term, "leader is unreachable, starting a new election");
+                tracing::warn!(?leader, %term, "leader is unreachable, starting a new election");
                 return LeaderState {
-                    term: term + 1,
+                    term: term.bump(),
                     mode: LeaderMode::Electing { vote: None },
                 };
             }

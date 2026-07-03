@@ -1,4 +1,4 @@
-use std::{fmt::Debug, num::NonZeroU64};
+use std::{fmt::{Debug, Display}, num::NonZeroU64};
 
 use message_encoding::MessageEncoding;
 
@@ -8,7 +8,7 @@ use crate::{
         recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
     },
     transport::traits::SyncIOAddress,
-    utils::{unknown_id_err, unknown_version_err},
+    utils::{now_ms, unknown_id_err, unknown_version_err},
 };
 
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -27,8 +27,43 @@ pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeaderState<A: SyncIOAddress> {
-    pub term: u64,
+    pub term: ElectionTerm,
     pub mode: LeaderMode<A>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy, PartialOrd, Ord)]
+pub struct ElectionTerm(u64);
+
+impl Display for ElectionTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.term(), self.0)
+    }
+}
+
+impl ElectionTerm {
+    pub fn bump(self) -> Self {
+        let term = self.term();
+        let epoch = now_ms();
+        ElectionTerm((term.saturating_add(1) << 32) | (epoch as u32 ^ (epoch >> 32) as u32) as u64)
+    }
+
+    pub fn id(&self) -> u64 {
+        self.0
+    }
+
+    pub fn term(self) -> u64 {
+        self.0 >> 32
+    }
+}
+
+impl MessageEncoding for ElectionTerm {
+    fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
+        self.0.write_to(out)
+    }
+
+    fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
+        u64::read_from(read).map(Self)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -43,6 +78,8 @@ pub enum LeaderMode<A: SyncIOAddress> {
 pub struct LeaderInfo<A: SyncIOAddress> {
     pub leader_state: LeaderState<A>,
     pub can_lead: bool,
+    pub reachable_voters: Vec<A>,
+    pub recovery_details: RecoverableStateDetails,
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +207,8 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderInfo<A> {
         sum += 5u16.write_to(out)?;
         sum += self.leader_state.write_to(out)?;
         sum += self.can_lead.write_to(out)?;
+        sum += write_vec(&self.reachable_voters, out)?;
+        sum += self.recovery_details.write_to(out)?;
         Ok(sum)
     }
 
@@ -182,6 +221,8 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderInfo<A> {
         Ok(Self {
             leader_state: MessageEncoding::read_from(read)?,
             can_lead: MessageEncoding::read_from(read)?,
+            reachable_voters: read_vec(read)?,
+            recovery_details: MessageEncoding::read_from(read)?,
         })
     }
 }
@@ -353,7 +394,7 @@ fn read_vec<T: MessageEncoding, R: std::io::Read>(read: &mut R) -> std::io::Resu
 
 #[cfg(test)]
 mod tests {
-    use std::io::Result;
+    use std::{collections::VecDeque, io::Result};
 
     use super::*;
 
@@ -403,10 +444,12 @@ mod tests {
     fn leader_info() -> LeaderInfo<u64> {
         LeaderInfo {
             leader_state: LeaderState {
-                term: 2,
+                term: ElectionTerm(2),
                 mode: LeaderMode::Following { leader: 3 },
             },
             can_lead: true,
+            reachable_voters: vec![],
+            recovery_details: RecoverableStateDetails::new(1, 2),
         }
     }
 
@@ -468,7 +511,7 @@ mod tests {
             (SyncResponse::UnexpectedRequest, 8),
             (
                 SyncResponse::LeaderState(LeaderState {
-                    term: 3,
+                    term: ElectionTerm(3),
                     mode: LeaderMode::Leading,
                 }),
                 9,
