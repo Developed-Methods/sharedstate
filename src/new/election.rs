@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::{
-    protocol::messages::{LeaderMode, LeaderWithElectionInfo},
+    protocol::messages::{LeaderInfo, LeaderMode},
     transport::traits::SyncIOAddress,
 };
 
@@ -10,7 +10,7 @@ pub struct ElectionInput<A: SyncIOAddress> {
     pub local_address: A,
     pub can_lead: bool,
     pub known_can_lead: BTreeSet<A>,
-    pub local_observation: LeaderWithElectionInfo<A>,
+    pub local_observation: LeaderInfo<A>,
     pub peer_observations: Vec<TimedPeerObservation<A>>,
     pub peer_reachability: HashMap<A, PeerReachability>,
     pub election_term: u64,
@@ -22,7 +22,7 @@ pub struct ElectionInput<A: SyncIOAddress> {
 pub struct TimedPeerObservation<A: SyncIOAddress> {
     pub observer: A,
     pub last_activity_ms: Option<u64>,
-    pub observation: LeaderWithElectionInfo<A>,
+    pub observation: LeaderInfo<A>,
 }
 
 #[derive(Clone, Debug)]
@@ -53,16 +53,14 @@ struct PublishedLeaderEvidence<A: SyncIOAddress> {
     best_via: Option<A>,
 }
 
-pub fn fresh_same_term_observations<A: SyncIOAddress>(input: &ElectionInput<A>) -> Vec<LeaderWithElectionInfo<A>> {
+pub fn fresh_same_term_observations<A: SyncIOAddress>(input: &ElectionInput<A>) -> Vec<LeaderInfo<A>> {
     fresh_same_term_observations_with_observer(input)
         .into_iter()
         .map(|(_, observation)| observation)
         .collect()
 }
 
-fn fresh_same_term_observations_with_observer<A: SyncIOAddress>(
-    input: &ElectionInput<A>,
-) -> Vec<(A, LeaderWithElectionInfo<A>)> {
+fn fresh_same_term_observations_with_observer<A: SyncIOAddress>(input: &ElectionInput<A>) -> Vec<(A, LeaderInfo<A>)> {
     let mut observations = Vec::with_capacity(input.peer_observations.len() + 1);
 
     if input.local_observation.term == input.election_term {
@@ -198,7 +196,7 @@ pub fn leader_offline_vote_count<A: SyncIOAddress>(input: &ElectionInput<A>, lea
     fresh_same_term_observations(input)
         .into_iter()
         .filter(|observation| observation.can_lead)
-        .filter(|observation| !observation.reachable_can_lead.contains(&leader))
+        .filter(|observation| !observation.leader_connectivity.contains(&leader))
         .count()
 }
 
@@ -272,7 +270,7 @@ fn connectivity_score<A: SyncIOAddress>(input: &ElectionInput<A>, candidate: A) 
     fresh_same_term_observations(input)
         .into_iter()
         .filter(|observation| observation.can_lead)
-        .filter(|observation| observation.reachable_can_lead.contains(&candidate))
+        .filter(|observation| observation.leader_connectivity.contains(&candidate))
         .count()
 }
 
@@ -342,7 +340,7 @@ fn fresh_observation<A: SyncIOAddress>(
     now_ms: u64,
     stale_after_ms: u64,
     timed: TimedPeerObservation<A>,
-) -> Option<(A, LeaderWithElectionInfo<A>)> {
+) -> Option<(A, LeaderInfo<A>)> {
     let last_activity = timed.last_activity_ms?;
     if stale_after_ms < now_ms.saturating_sub(last_activity) {
         return None;
@@ -373,7 +371,7 @@ mod tests {
         can_lead: bool,
         reachable_can_lead: Vec<u64>,
         recover_next_seq: u64,
-    ) -> (u64, LeaderWithElectionInfo<u64>) {
+    ) -> (u64, LeaderInfo<u64>) {
         let mode = match leader {
             Some(leader) if leader == observer => LeaderMode::Leading,
             Some(leader) => LeaderMode::Following { leader },
@@ -385,17 +383,17 @@ mod tests {
 
         (
             observer,
-            LeaderWithElectionInfo {
+            LeaderInfo {
                 term,
                 leader: mode,
                 can_lead,
-                reachable_can_lead,
+                leader_connectivity: reachable_can_lead,
                 recover_details: details(recover_next_seq),
             },
         )
     }
 
-    fn input(local: u64, can_lead: bool, observations: Vec<(u64, LeaderWithElectionInfo<u64>)>) -> ElectionInput<u64> {
+    fn input(local: u64, can_lead: bool, observations: Vec<(u64, LeaderInfo<u64>)>) -> ElectionInput<u64> {
         let local_observation = observation(local, 1, None, None, None, can_lead, vec![local], 1).1;
         ElectionInput {
             local_address: local,

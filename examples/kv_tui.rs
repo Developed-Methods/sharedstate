@@ -30,7 +30,7 @@ use sharedstate::{
         node_state::{ConnectStatus, NodeState, PeerState},
         subscribable_state::StateHandle,
         tasks::{
-            current_leader::{CurrentLeaderStatus, CurrentLeaderTask, CurrentLeaderTiming, LeaderMode},
+            leader_logic::{CurrentLeaderStatus, CurrentLeaderTask, CurrentLeaderTiming, LeaderMode},
             peer_connections::PeerConnections,
             peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
             rpc_server::RpcServer,
@@ -425,7 +425,7 @@ async fn main() -> io::Result<()> {
                     can_lead: None,
                     connect_status: ConnectStatus::NotConnected,
                     last_global_connectivity: None,
-                    leader_observation: None,
+                    leader_info: None,
                 },
             )
         })
@@ -800,9 +800,9 @@ async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut 
                 peer.can_lead,
                 peer.latency.map(|latency| latency.get()),
                 peer.last_global_connectivity.map(|value| value.get()),
-                peer.leader_observation.as_ref().and_then(|info| info.leader.published_leader(peer.addr)),
-                peer.leader_observation.as_ref().and_then(|info| info.leader.vote(peer.addr)),
-                peer.leader_observation.as_ref().map(|info| info.term),
+                peer.leader_info.as_ref().and_then(|info| info.leader_state.published_leader(peer.addr)),
+                peer.leader_info.as_ref().and_then(|info| info.leader_state.vote(peer.addr)),
+                peer.leader_info.as_ref().map(|info| info.term),
             ));
         }
     }
@@ -900,9 +900,9 @@ async fn run_command(
                         connect_status_line(peer.connect_status),
                         peer.can_lead,
                         peer.latency.map(|latency| latency.get()),
-                        peer.leader_observation
+                        peer.leader_info
                             .as_ref()
-                            .and_then(|info| info.leader.published_leader(peer.addr)),
+                            .and_then(|info| info.leader_state.published_leader(peer.addr)),
                     ));
                 }
             }

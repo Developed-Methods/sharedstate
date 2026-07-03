@@ -39,6 +39,13 @@ impl<D: DeterministicState> SubscribableState<D> {
         }
     }
 
+    pub async fn recovery_details(&self) -> RecoverableStateDetails {
+        let mut lock = self.state_handle.lock().await;
+        let details = lock.current().0.details().clone();
+        lock.quiescent();
+        details
+    }
+
     pub async fn reset(&self, new_state: RecoverableState<D>) {
         let mut broadcast_locked = self.broadcast.lock().await;
         let mut sender_locked = self.broadcast_sender.lock().await;

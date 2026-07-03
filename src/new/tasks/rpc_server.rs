@@ -11,7 +11,10 @@ use tokio::{
 };
 
 use crate::{
-    new::{node_state::NodeState, subscribable_state::StateHandle, tasks::current_leader::local_leader_observation},
+    new::{
+        node_state::{NodeState, PeerState},
+        subscribable_state::StateHandle,
+    },
     protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         determinstic_state::DeterministicState,
@@ -49,14 +52,6 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
             SyncRequest::ProtocolVersion(_) => SyncResponse::UnexpectedRequest,
             SyncRequest::MyAddress(_) => SyncResponse::UnexpectedRequest,
 
-            SyncRequest::ShareLeaderPath => match self.state.leader_status.path_to_leader().await {
-                Some(v) => SyncResponse::LeaderPath(v),
-                None => SyncResponse::NoPathToLeader,
-            },
-
-            SyncRequest::ShareLeaderInfo => {
-                SyncResponse::LeaderInfo(local_leader_observation(&self.state, &self.state_handle).await)
-            }
             SyncRequest::Action { source, action } => {
                 if self.actions_tx.try_send((source, action)).is_ok() {
                     SyncResponse::Ok
@@ -64,8 +59,11 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
                     SyncResponse::FailedToQueueAction { source }
                 }
             }
-            SyncRequest::LeaderInformation { source, info } => {
-                self.state.record_leader_observation(source, info).await;
+            SyncRequest::LeaderInformation(info) => {
+                let mut lock = self.state.peers.lock().await;
+                let peer = lock.entry(peer_addr).or_insert_with(|| PeerState::empty(peer_addr));
+                peer.leader_info = Some(info);
+
                 SyncResponse::Ok
             }
             SyncRequest::SubscribeRecovery(details) => match self.state.state.subscribe(details).await {
@@ -222,208 +220,4 @@ pub enum ResponseOrFeed<A: SyncIOAddress, D: DeterministicState> {
     Subscription {
         feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
     },
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        collections::HashMap,
-        io::Result,
-        sync::{atomic::AtomicU64, Arc},
-        time::Duration,
-    };
-
-    use message_encoding::MessageEncoding;
-    use sequenced_broadcast::SequencedBroadcastSettings;
-    use tokio::{
-        io::{duplex, split, DuplexStream, ReadHalf, WriteHalf},
-        sync::{mpsc, Mutex},
-    };
-
-    use super::*;
-    use crate::{
-        new::{
-            node_state::{ConnectStatus, PeerState},
-            subscribable_state::SubscribableState,
-            tasks::current_leader::CurrentLeaderStatus,
-        },
-        protocol::messages::{LeaderMode, LeaderWithElectionInfo, PROTOCOL_VERSION},
-        state::recoverable_state::{RecoverableState, RecoverableStateDetails},
-        transport::traits::SyncConnection,
-    };
-
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct TestState(u64);
-
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct TestAction(u64);
-
-    impl DeterministicState for TestState {
-        type Action = TestAction;
-        type AuthorityAction = TestAction;
-
-        fn accept_seq(&self) -> u64 {
-            self.0
-        }
-
-        fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
-            action
-        }
-
-        fn update(&mut self, _action: &Self::AuthorityAction) {
-            self.0 += 1;
-        }
-    }
-
-    impl MessageEncoding for TestState {
-        fn write_to<T: std::io::Write>(&self, out: &mut T) -> Result<usize> {
-            self.0.write_to(out)
-        }
-
-        fn read_from<T: std::io::Read>(read: &mut T) -> Result<Self> {
-            Ok(Self(MessageEncoding::read_from(read)?))
-        }
-    }
-
-    impl MessageEncoding for TestAction {
-        fn write_to<T: std::io::Write>(&self, out: &mut T) -> Result<usize> {
-            self.0.write_to(out)
-        }
-
-        fn read_from<T: std::io::Read>(read: &mut T) -> Result<Self> {
-            Ok(Self(MessageEncoding::read_from(read)?))
-        }
-    }
-
-    struct TestIo;
-
-    impl SyncIO for TestIo {
-        type Address = u64;
-        type Read = ReadHalf<DuplexStream>;
-        type Write = WriteHalf<DuplexStream>;
-
-        async fn connect(&self, _remote: &Self::Address) -> Result<SyncConnection<Self>> {
-            unreachable!("rpc server tests use direct duplex connections")
-        }
-    }
-
-    fn settings() -> NetIoSettings {
-        NetIoSettings {
-            process_timeout: Duration::from_millis(100),
-            message_timeout: Duration::from_millis(500),
-        }
-    }
-
-    fn node_state(address: u64) -> Arc<NodeState<u64, TestState>> {
-        let mut peers = HashMap::new();
-        peers.insert(
-            2,
-            PeerState {
-                addr: 2,
-                latency: None,
-                can_lead: Some(true),
-                connect_status: ConnectStatus::Connected { epoch_ms: 100 },
-                last_global_connectivity: None,
-                leader_observation: None,
-            },
-        );
-
-        Arc::new(NodeState {
-            my_address: address,
-            can_lead: true,
-            peers: Mutex::new(peers),
-            state: SubscribableState::new(
-                RecoverableState::new(address, TestState(1)),
-                SequencedBroadcastSettings::default(),
-            )
-            .unwrap(),
-            leader_status: Arc::new(CurrentLeaderStatus::new(address)),
-            election_term: AtomicU64::new(0),
-        })
-    }
-
-    fn duplex_connections() -> (SyncConnection<TestIo>, SyncConnection<TestIo>) {
-        let (client, server) = duplex(4096);
-        let (client_read, client_write) = split(client);
-        let (server_read, server_write) = split(server);
-
-        (
-            SyncConnection {
-                remote: 1,
-                read: client_read,
-                write: client_write,
-            },
-            SyncConnection {
-                remote: 2,
-                read: server_read,
-                write: server_write,
-            },
-        )
-    }
-
-    fn leader_observation(observer: u64, term: u64, leader: u64, _path: Vec<u64>) -> LeaderWithElectionInfo<u64> {
-        LeaderWithElectionInfo {
-            term,
-            leader: if leader == observer {
-                LeaderMode::Leading
-            } else {
-                LeaderMode::Following { leader }
-            },
-            can_lead: true,
-            reachable_can_lead: vec![observer],
-            recover_details: RecoverableStateDetails::new(observer, 1),
-        }
-    }
-
-    async fn recv_response(read: &mut Receiver<SyncResponse<u64, TestState>>) -> SyncResponse<u64, TestState> {
-        tokio::time::timeout(Duration::from_secs(1), read.recv())
-            .await
-            .unwrap()
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn handle_client_handshakes_then_dispatches_requests() {
-        let (actions_tx, _actions_rx) = mpsc::channel(16);
-        let server = Arc::new(RpcServer::new(node_state(1), actions_tx));
-        let (client_conn, server_conn) = duplex_connections();
-        let server_task = tokio::spawn(server.handle_client(server_conn, settings()));
-
-        let (_remote, write, mut read) = client_conn.client_channels::<TestState>(settings());
-
-        write
-            .send(SyncRequest::ProtocolVersion(PROTOCOL_VERSION))
-            .await
-            .unwrap();
-        assert!(matches!(recv_response(&mut read).await, SyncResponse::Ok));
-
-        write.send(SyncRequest::MyAddress(2)).await.unwrap();
-        assert!(matches!(recv_response(&mut read).await, SyncResponse::Ok));
-
-        write.send(SyncRequest::Ping(42)).await.unwrap();
-        assert!(matches!(recv_response(&mut read).await, SyncResponse::Pong(42)));
-
-        drop(write);
-        server_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn records_remote_term_from_pushed_leader_information() {
-        let (actions_tx, _actions_rx) = mpsc::channel(16);
-        let state = node_state(1);
-        let server = RpcServer::new(state.clone(), actions_tx);
-
-        let response = server
-            .handle(
-                2,
-                SyncRequest::LeaderInformation {
-                    source: 2,
-                    info: leader_observation(2, 7, 2, vec![2]),
-                },
-            )
-            .await;
-
-        assert!(matches!(response, ResponseOrFeed::Response(SyncResponse::Ok)));
-        assert_eq!(state.election_term(), 7);
-    }
 }

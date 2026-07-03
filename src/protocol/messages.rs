@@ -3,6 +3,7 @@ use std::{fmt::Debug, num::NonZeroU64};
 use message_encoding::MessageEncoding;
 
 use crate::{
+    new::node_state::LeaderState,
     state::{
         determinstic_state::DeterministicState,
         recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
@@ -18,15 +19,31 @@ pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
     MyAddress(A),
     Ping(u64),
     SharePeers(Vec<SharePeerDetails<A>>),
-    ShareLeaderPath,
-    ShareLeaderInfo,
+    LeaderInformation(LeaderInfo<A>),
+
     SubscribeFresh,
     SubscribeRecovery(RecoverableStateDetails),
     Action { source: A, action: D::Action },
-    LeaderInformation { source: A, info: LeaderWithElectionInfo<A> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaderState<A: SyncIOAddress> {
+    pub term: u64,
+    pub mode: LeaderMode<A>,
+}
+
+impl<A: SyncIOAddress> LeaderState<A> {
+    pub fn start_election(&mut self, can_lead: bool) {
+        self.term += 1;
+        if can_lead {
+            self.mode = LeaderMode::Electing { vote: None };
+        } else {
+            self.mode = LeaderMode::NoLeader;
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LeaderMode<A: SyncIOAddress> {
     NoLeader,
     Electing { vote: Option<A> },
@@ -42,11 +59,10 @@ pub struct LeaderInfoMessage<A: SyncIOAddress> {
 }
 
 #[derive(Clone, Debug)]
-pub struct LeaderWithElectionInfo<A: SyncIOAddress> {
-    pub term: u64,
-    pub leader: LeaderMode<A>,
+pub struct LeaderInfo<A: SyncIOAddress> {
+    pub leader_state: LeaderState<A>,
     pub can_lead: bool,
-    pub reachable_can_lead: Vec<A>,
+    pub leader_connectivity: Vec<(A, ConnectStatus)>,
     pub recover_details: RecoverableStateDetails,
 }
 
@@ -55,6 +71,33 @@ pub struct SharePeerDetails<A: SyncIOAddress> {
     pub address: A,
     pub can_be_leader: Option<bool>,
     pub last_global_activity: Option<NonZeroU64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectStatus {
+    Connected { epoch_ms: u64 },
+    FailedToConnect { epoch_ms: u64 },
+    NotConnected,
+}
+
+impl ConnectStatus {
+    pub fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected { .. })
+    }
+
+    pub fn connected_at_ms(&self) -> Option<u64> {
+        match self {
+            Self::Connected { epoch_ms } => Some(*epoch_ms),
+            Self::FailedToConnect { .. } | Self::NotConnected => None,
+        }
+    }
+
+    pub fn failed_at_ms(&self) -> Option<u64> {
+        match self {
+            Self::FailedToConnect { epoch_ms } => Some(*epoch_ms),
+            Self::Connected { .. } | Self::NotConnected => None,
+        }
+    }
 }
 
 impl<A: SyncIOAddress> From<A> for SharePeerDetails<A> {
@@ -91,7 +134,7 @@ pub enum SyncResponse<A: SyncIOAddress, D: DeterministicState> {
     Ok,
     FailedToQueueAction { source: A },
     Peers(Vec<SharePeerDetails<A>>),
-    LeaderInfo(LeaderWithElectionInfo<A>),
+    LeaderInfo(LeaderInfo<A>),
     LeaderPath(Vec<A>),
     NoPathToLeader,
     Accepted(u64),
@@ -214,14 +257,14 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderInfoMessage<A> {
     }
 }
 
-impl<A: SyncIOAddress> MessageEncoding for LeaderWithElectionInfo<A> {
+impl<A: SyncIOAddress> MessageEncoding for LeaderInfo<A> {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
         sum += 4u16.write_to(out)?;
         sum += self.term.write_to(out)?;
-        sum += self.leader.write_to(out)?;
+        sum += self.leader_state.write_to(out)?;
         sum += self.can_lead.write_to(out)?;
-        sum += write_vec(&self.reachable_can_lead, out)?;
+        sum += write_vec(&self.leader_connectivity, out)?;
         sum += self.recover_details.write_to(out)?;
         Ok(sum)
     }
@@ -234,9 +277,9 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderWithElectionInfo<A> {
 
         Ok(Self {
             term: MessageEncoding::read_from(read)?,
-            leader: MessageEncoding::read_from(read)?,
+            leader_state: MessageEncoding::read_from(read)?,
             can_lead: MessageEncoding::read_from(read)?,
-            reachable_can_lead: read_vec(read)?,
+            leader_connectivity: read_vec(read)?,
             recover_details: MessageEncoding::read_from(read)?,
         })
     }
@@ -462,12 +505,12 @@ mod tests {
         }
     }
 
-    fn leader_info() -> LeaderWithElectionInfo<u64> {
-        LeaderWithElectionInfo {
+    fn leader_info() -> LeaderInfo<u64> {
+        LeaderInfo {
             term: 2,
-            leader: LeaderMode::Following { leader: 3 },
+            leader_state: LeaderMode::Following { leader: 3 },
             can_lead: true,
-            reachable_can_lead: vec![1, 3],
+            leader_connectivity: vec![1, 3],
             recover_details: RecoverableStateDetails::new(1, 1),
         }
     }
@@ -487,11 +530,11 @@ mod tests {
 
         assert_eq!(u16::read_from(&mut &bytes[..]).unwrap(), 4);
 
-        let decoded: LeaderWithElectionInfo<u64> = LeaderWithElectionInfo::read_from(&mut &bytes[..]).unwrap();
+        let decoded: LeaderInfo<u64> = LeaderInfo::read_from(&mut &bytes[..]).unwrap();
         assert_eq!(decoded.term, info.term);
-        assert_eq!(decoded.leader, info.leader);
+        assert_eq!(decoded.leader_state, info.leader_state);
         assert_eq!(decoded.can_lead, info.can_lead);
-        assert_eq!(decoded.reachable_can_lead, info.reachable_can_lead);
+        assert_eq!(decoded.leader_connectivity, info.leader_connectivity);
         assert_eq!(decoded.recover_details.next_seq(), info.recover_details.next_seq());
     }
 
