@@ -353,6 +353,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn old_leader_rejoins_as_follower_and_its_actions_apply() {
+        let net = SimulatedNet::new();
+        let node1 = start_node(&net, 1, true, &[2, 3]).await;
+        let node2 = start_node(&net, 2, true, &[1, 3]).await;
+        let node3 = start_node(&net, 3, true, &[1, 2]).await;
+
+        wait_for_leader(&[&node1, &node2, &node3], 1).await;
+        node1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&node3, 1, 1).await;
+
+        /* partition the leader away; the others elect node 2 */
+        net.set_node_blocked(1, true).await;
+        wait_for_leader(&[&node2, &node3], 2).await;
+
+        node2.submit_action((2, 2)).await.unwrap();
+        wait_for_value(&node3, 2, 2).await;
+
+        /* heal the partition; node 1 must concede and follow node 2 */
+        net.set_node_blocked(1, false).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = node1.leader_state().await;
+            if matches!(state.mode, LeaderMode::Following { leader: 2 }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "node 1 never conceded to node 2, last state {state:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        wait_for_value(&node1, 2, 2).await;
+
+        /* the moved follower's actions must reach the new leader */
+        node1.submit_action((3, 3)).await.unwrap();
+        wait_for_value(&node1, 3, 3).await;
+        wait_for_value(&node2, 3, 3).await;
+        wait_for_value(&node3, 3, 3).await;
+    }
+
+    #[tokio::test]
+    async fn observer_actions_apply_after_leader_change() {
+        let net = SimulatedNet::new();
+        let node1 = start_node(&net, 1, true, &[2, 3, 4]).await;
+        let node2 = start_node(&net, 2, true, &[1, 3, 4]).await;
+        let node3 = start_node(&net, 3, true, &[1, 2, 4]).await;
+        let node4 = start_node(&net, 4, false, &[1, 2, 3]).await;
+
+        wait_for_leader(&[&node1, &node2, &node3, &node4], 1).await;
+
+        node4.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&node1, 1, 1).await;
+        wait_for_value(&node4, 1, 1).await;
+
+        /* leader dies; observer must move to the new leader and its actions
+         * must keep applying */
+        net.set_node_blocked(1, true).await;
+        net.stop_node(1).await;
+        drop(node1);
+
+        wait_for_leader(&[&node2, &node3, &node4], 2).await;
+
+        node4.submit_action((2, 2)).await.unwrap();
+        wait_for_value(&node2, 2, 2).await;
+        wait_for_value(&node3, 2, 2).await;
+        wait_for_value(&node4, 2, 2).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn action_flood_during_failover_does_not_wedge_sync() {
+        let net = SimulatedNet::new();
+        let node1 = Arc::new(start_node(&net, 1, true, &[2, 3]).await);
+        let node2 = Arc::new(start_node(&net, 2, true, &[1, 3]).await);
+        let node3 = Arc::new(start_node(&net, 3, true, &[1, 2]).await);
+
+        wait_for_leader(&[&node1, &node2, &node3], 1).await;
+
+        /* keep a continuous stream of actions flowing from both survivors
+         * while the leader dies; the sync tasks must still notice the leader
+         * change instead of forwarding in circles forever */
+        let flood = {
+            let node2 = node2.clone();
+            let node3 = node3.clone();
+            tokio::spawn(async move {
+                let mut i = 0u64;
+                loop {
+                    let _ = node2.submit_action((1000 + i, i)).await;
+                    let _ = node3.submit_action((2000 + i, i)).await;
+                    i += 1;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+
+        net.set_node_blocked(1, true).await;
+        net.stop_node(1).await;
+        drop(node1);
+
+        wait_for_leader(&[&node2, &node3], 2).await;
+
+        /* even with the flood running, a fresh action from the moved
+         * follower must apply everywhere */
+        node3.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&node2, 1, 1).await;
+        wait_for_value(&node3, 1, 1).await;
+
+        flood.abort();
+    }
+
+    #[tokio::test]
     async fn cluster_recovers_after_leader_failure() {
         let net = SimulatedNet::new();
         let node1 = start_node(&net, 1, true, &[2, 3]).await;

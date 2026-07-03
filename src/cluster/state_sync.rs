@@ -239,14 +239,17 @@ where
     ) -> std::io::Result<u64> {
         let timeout = self.settings.message_timeout;
 
+        tracing::info!(?target, "sync trace: handshake start");
         send(write, SyncRequest::ProtocolVersion(PROTOCOL_VERSION)).await?;
         expect_ok(recv(read, timeout).await?, "protocol version")?;
 
         send(write, SyncRequest::MyAddress(self.state.my_address)).await?;
         expect_ok(recv(read, timeout).await?, "my address")?;
 
+        tracing::info!(?target, "sync trace: handshake done, settling recovery details");
         let details = self.state.state.settled_recovery_details().await;
         let local_next_seq = details.next_seq();
+        tracing::info!(?target, local_next_seq, "sync trace: requesting recovery");
         send(write, SyncRequest::SubscribeRecovery(details)).await?;
 
         match recv(read, timeout).await? {
