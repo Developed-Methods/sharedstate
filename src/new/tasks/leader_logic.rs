@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{atomic::AtomicU64, Arc},
+    time::Duration,
 };
 
 use crate::{
@@ -12,12 +13,26 @@ pub use crate::protocol::messages::LeaderMode;
 
 static GENERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone, Debug)]
+pub struct CurrentLeaderTiming {
+    pub tick_interval: Duration,
+}
+
+impl Default for CurrentLeaderTiming {
+    fn default() -> Self {
+        Self {
+            tick_interval: Duration::from_millis(250),
+        }
+    }
+}
+
 pub struct CurrentLeaderTask<A, D>
 where
     A: SyncIOAddress,
     D: DeterministicState,
 {
     state: Arc<NodeState<A, D>>,
+    timing: CurrentLeaderTiming,
 }
 
 impl<A, D> CurrentLeaderTask<A, D>
@@ -25,6 +40,17 @@ where
     A: SyncIOAddress,
     D: DeterministicState,
 {
+    pub fn new(state: Arc<NodeState<A, D>>, timing: CurrentLeaderTiming) -> Self {
+        Self { state, timing }
+    }
+
+    pub async fn run(mut self) {
+        loop {
+            self.tick().await;
+            tokio::time::sleep(self.timing.tick_interval).await;
+        }
+    }
+
     pub async fn tick(&mut self) {
         if self.state.can_lead {
             self.tick_as_lead().await;

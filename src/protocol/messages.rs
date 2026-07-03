@@ -3,7 +3,6 @@ use std::{fmt::Debug, num::NonZeroU64};
 use message_encoding::MessageEncoding;
 
 use crate::{
-    new::node_state::LeaderState,
     state::{
         determinstic_state::DeterministicState,
         recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
@@ -100,6 +99,37 @@ impl ConnectStatus {
     }
 }
 
+impl MessageEncoding for ConnectStatus {
+    fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
+        let mut sum = 0;
+        sum += match self {
+            ConnectStatus::Connected { epoch_ms } => {
+                sum += 0u16.write_to(out)?;
+                epoch_ms.write_to(out)?
+            }
+            ConnectStatus::FailedToConnect { epoch_ms } => {
+                sum += 1u16.write_to(out)?;
+                epoch_ms.write_to(out)?
+            }
+            ConnectStatus::NotConnected => 2u16.write_to(out)?,
+        };
+        Ok(sum)
+    }
+
+    fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
+        Ok(match u16::read_from(read)? {
+            0 => ConnectStatus::Connected {
+                epoch_ms: MessageEncoding::read_from(read)?,
+            },
+            1 => ConnectStatus::FailedToConnect {
+                epoch_ms: MessageEncoding::read_from(read)?,
+            },
+            2 => ConnectStatus::NotConnected,
+            other => return Err(unknown_id_err(other, "ConnectStatus")),
+        })
+    }
+}
+
 impl<A: SyncIOAddress> From<A> for SharePeerDetails<A> {
     fn from(value: A) -> Self {
         SharePeerDetails {
@@ -117,14 +147,10 @@ impl<A: SyncIOAddress, D: DeterministicState> Debug for SyncRequest<A, D> {
             Self::MyAddress(address) => write!(f, "MyAddress({address:?})"),
             Self::Ping(num) => write!(f, "Ping({num})"),
             Self::SharePeers(peers) => write!(f, "SharePeers({peers:?})"),
-            Self::ShareLeaderPath => write!(f, "ShareLeaderPath"),
-            Self::ShareLeaderInfo => write!(f, "ShareLeaderInfo"),
             Self::SubscribeFresh => write!(f, "SubscribeFresh"),
             Self::SubscribeRecovery(details) => write!(f, "SubscribeRecovery({details:?})"),
             Self::Action { source, .. } => write!(f, "Action(source: {source:?})"),
-            Self::LeaderInformation { source, info } => {
-                write!(f, "LeaderInformation(source: {source:?}, info: {info:?})")
-            }
+            Self::LeaderInformation(info) => write!(f, "LeaderInformation({info:?})"),
         }
     }
 }
@@ -188,21 +214,18 @@ where
                 sum += 3u16.write_to(out)?;
                 write_vec(peers, out)?
             }
-            Self::ShareLeaderPath => 4u16.write_to(out)?,
-            Self::ShareLeaderInfo => 5u16.write_to(out)?,
-            Self::SubscribeFresh => 6u16.write_to(out)?,
+            Self::SubscribeFresh => 4u16.write_to(out)?,
             Self::SubscribeRecovery(details) => {
-                sum += 7u16.write_to(out)?;
+                sum += 5u16.write_to(out)?;
                 details.write_to(out)?
             }
             Self::Action { source, action } => {
-                sum += 8u16.write_to(out)?;
+                sum += 6u16.write_to(out)?;
                 sum += source.write_to(out)?;
                 action.write_to(out)?
             }
-            Self::LeaderInformation { source, info } => {
-                sum += 9u16.write_to(out)?;
-                sum += source.write_to(out)?;
+            Self::LeaderInformation(info) => {
+                sum += 7u16.write_to(out)?;
                 info.write_to(out)?
             }
         };
@@ -216,18 +239,13 @@ where
             1 => Self::MyAddress(MessageEncoding::read_from(read)?),
             2 => Self::Ping(MessageEncoding::read_from(read)?),
             3 => Self::SharePeers(read_vec(read)?),
-            4 => Self::ShareLeaderPath,
-            5 => Self::ShareLeaderInfo,
-            6 => Self::SubscribeFresh,
-            7 => Self::SubscribeRecovery(MessageEncoding::read_from(read)?),
-            8 => Self::Action {
+            4 => Self::SubscribeFresh,
+            5 => Self::SubscribeRecovery(MessageEncoding::read_from(read)?),
+            6 => Self::Action {
                 source: MessageEncoding::read_from(read)?,
                 action: MessageEncoding::read_from(read)?,
             },
-            9 => Self::LeaderInformation {
-                source: MessageEncoding::read_from(read)?,
-                info: MessageEncoding::read_from(read)?,
-            },
+            7 => Self::LeaderInformation(MessageEncoding::read_from(read)?),
             other => return Err(unknown_id_err(other, "SyncRequest")),
         })
     }
@@ -261,7 +279,6 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderInfo<A> {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
         sum += 4u16.write_to(out)?;
-        sum += self.term.write_to(out)?;
         sum += self.leader_state.write_to(out)?;
         sum += self.can_lead.write_to(out)?;
         sum += write_vec(&self.leader_connectivity, out)?;
@@ -272,15 +289,36 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderInfo<A> {
     fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
         let version = u16::read_from(read)?;
         if version != 4 {
-            return Err(unknown_version_err(version, "ElectionObservation"));
+            return Err(unknown_version_err(version, "LeaderInfo"));
         }
 
         Ok(Self {
-            term: MessageEncoding::read_from(read)?,
             leader_state: MessageEncoding::read_from(read)?,
             can_lead: MessageEncoding::read_from(read)?,
             leader_connectivity: read_vec(read)?,
             recover_details: MessageEncoding::read_from(read)?,
+        })
+    }
+}
+
+impl<A: SyncIOAddress> MessageEncoding for LeaderState<A> {
+    fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
+        let mut sum = 0;
+        sum += 1u16.write_to(out)?;
+        sum += self.term.write_to(out)?;
+        sum += self.mode.write_to(out)?;
+        Ok(sum)
+    }
+
+    fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
+        let version = u16::read_from(read)?;
+        if version != 1 {
+            return Err(unknown_version_err(version, "LeaderState"));
+        }
+
+        Ok(Self {
+            term: MessageEncoding::read_from(read)?,
+            mode: MessageEncoding::read_from(read)?,
         })
     }
 }
@@ -507,10 +545,12 @@ mod tests {
 
     fn leader_info() -> LeaderInfo<u64> {
         LeaderInfo {
-            term: 2,
-            leader_state: LeaderMode::Following { leader: 3 },
+            leader_state: LeaderState {
+                term: 2,
+                mode: LeaderMode::Following { leader: 3 },
+            },
             can_lead: true,
-            leader_connectivity: vec![1, 3],
+            leader_connectivity: vec![(1, ConnectStatus::NotConnected), (3, ConnectStatus::Connected { epoch_ms: 5 })],
             recover_details: RecoverableStateDetails::new(1, 1),
         }
     }
@@ -531,7 +571,6 @@ mod tests {
         assert_eq!(u16::read_from(&mut &bytes[..]).unwrap(), 4);
 
         let decoded: LeaderInfo<u64> = LeaderInfo::read_from(&mut &bytes[..]).unwrap();
-        assert_eq!(decoded.term, info.term);
         assert_eq!(decoded.leader_state, info.leader_state);
         assert_eq!(decoded.can_lead, info.can_lead);
         assert_eq!(decoded.leader_connectivity, info.leader_connectivity);
@@ -545,24 +584,16 @@ mod tests {
             (SyncRequest::MyAddress(1), 1),
             (SyncRequest::Ping(2), 2),
             (SyncRequest::SharePeers(vec![SharePeerDetails::from(3)]), 3),
-            (SyncRequest::ShareLeaderPath, 4),
-            (SyncRequest::ShareLeaderInfo, 5),
-            (SyncRequest::SubscribeFresh, 6),
-            (SyncRequest::SubscribeRecovery(RecoverableStateDetails::new(4, 5)), 7),
+            (SyncRequest::SubscribeFresh, 4),
+            (SyncRequest::SubscribeRecovery(RecoverableStateDetails::new(4, 5)), 5),
             (
                 SyncRequest::Action {
                     source: 6,
                     action: TestAction(7),
                 },
-                8,
+                6,
             ),
-            (
-                SyncRequest::LeaderInformation {
-                    source: 8,
-                    info: leader_info(),
-                },
-                9,
-            ),
+            (SyncRequest::LeaderInformation(leader_info()), 7),
         ];
 
         for (request, tag) in cases {

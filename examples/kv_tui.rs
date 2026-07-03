@@ -3,10 +3,7 @@ use std::{
     env,
     io::{self, Error, ErrorKind, Stdout, Write},
     iter,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -27,16 +24,16 @@ use ratatui::{
 use sequenced_broadcast::SequencedBroadcastSettings;
 use sharedstate::{
     new::{
-        node_state::{ConnectStatus, NodeState, PeerState},
+        node_state::{NodeState, PeerState},
         subscribable_state::StateHandle,
         tasks::{
-            leader_logic::{CurrentLeaderStatus, CurrentLeaderTask, CurrentLeaderTiming, LeaderMode},
+            leader_logic::{CurrentLeaderTask, CurrentLeaderTiming, LeaderMode},
             peer_connections::PeerConnections,
             peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
             rpc_server::RpcServer,
         },
     },
-    protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{ConnectStatus, LeaderState, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         determinstic_state::DeterministicState,
         recoverable_state::{RecoverableState, RecoverableStateAction},
@@ -440,8 +437,10 @@ async fn main() -> io::Result<()> {
             SequencedBroadcastSettings::default(),
         )
         .map_err(|error| Error::other(format!("failed to create state broadcast: {error:?}")))?,
-        leader_status: Arc::new(CurrentLeaderStatus::new(local_address)),
-        election_term: AtomicU64::new(0),
+        leader_state: Mutex::new(LeaderState {
+            term: 0,
+            mode: LeaderMode::NoLeader,
+        }),
     });
 
     let peer_connections = Arc::new(PeerConnections::new(io.clone(), settings.clone(), state.clone()));
@@ -508,7 +507,7 @@ fn start_action_router(
 ) {
     tokio::spawn(async move {
         while let Some((source, action)) = actions_rx.recv().await {
-            match state.leader_status.leader().await {
+            match current_leader_address(&state).await {
                 Some(leader) if leader == state.my_address => {
                     state
                         .state
@@ -551,7 +550,7 @@ fn start_follower_subscription(
 ) {
     tokio::spawn(async move {
         loop {
-            let Some(leader) = state.leader_status.leader().await else {
+            let Some(leader) = current_leader_address(&state).await else {
                 tokio::time::sleep(SUBSCRIBE_RETRY_DELAY).await;
                 continue;
             };
@@ -614,7 +613,7 @@ async fn subscribe_to_leader(
         None => return Err(Error::new(ErrorKind::UnexpectedEof, "subscription closed before fresh state")),
     }
 
-    while state.leader_status.leader().await == Some(leader) {
+    while current_leader_address(state).await == Some(leader) {
         match read.recv().await {
             Some(SyncResponse::AuthorityAction(seq, action)) => {
                 state.state.update(iter::once(action)).await;
@@ -766,7 +765,7 @@ fn input_view(input: &str, cursor: usize, max_width: u16) -> (String, u16) {
 }
 
 async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut StateHandle<KvStore>) -> Vec<String> {
-    let snapshot = state.leader_status.snapshot().await;
+    let leader_state = state.leader_state.lock().await.clone();
     let (seq, item_count, values_preview) = state_handle.read_with(|recoverable| {
         let store = recoverable.state();
         let preview = store
@@ -781,7 +780,7 @@ async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut 
 
     let mut lines = vec![
         format!("address: 127.0.0.1:{}  can_lead: {}", state.my_address, state.can_lead),
-        format!("leader: term={} {}", state.election_term.load(Ordering::Acquire), leader_mode_line(&snapshot.mode)),
+        format!("leader: term={} {}", leader_state.term, leader_mode_line(&leader_state.mode)),
         format!("kv: seq={seq} items={item_count}"),
     ];
     if !values_preview.is_empty() {
@@ -800,14 +799,38 @@ async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut 
                 peer.can_lead,
                 peer.latency.map(|latency| latency.get()),
                 peer.last_global_connectivity.map(|value| value.get()),
-                peer.leader_info.as_ref().and_then(|info| info.leader_state.published_leader(peer.addr)),
-                peer.leader_info.as_ref().and_then(|info| info.leader_state.vote(peer.addr)),
-                peer.leader_info.as_ref().map(|info| info.term),
+                peer.leader_info.as_ref().and_then(|info| published_leader(peer.addr, &info.leader_state.mode)),
+                peer.leader_info.as_ref().and_then(|info| observed_vote(&info.leader_state.mode)),
+                peer.leader_info.as_ref().map(|info| info.leader_state.term),
             ));
         }
     }
 
     lines
+}
+
+async fn current_leader_address(state: &NodeState<u16, KvStore>) -> Option<u16> {
+    let leader_state = state.leader_state.lock().await.clone();
+    match leader_state.mode {
+        LeaderMode::Leading => Some(state.my_address),
+        LeaderMode::Following { leader } => Some(leader),
+        LeaderMode::NoLeader | LeaderMode::Electing { .. } => None,
+    }
+}
+
+fn published_leader(observer: u16, mode: &LeaderMode<u16>) -> Option<u16> {
+    match mode {
+        LeaderMode::NoLeader | LeaderMode::Electing { .. } => None,
+        LeaderMode::Leading => Some(observer),
+        LeaderMode::Following { leader } => Some(*leader),
+    }
+}
+
+fn observed_vote(mode: &LeaderMode<u16>) -> Option<u16> {
+    match mode {
+        LeaderMode::Electing { vote } => *vote,
+        _ => None,
+    }
 }
 
 fn connect_status_line(status: ConnectStatus) -> String {
@@ -879,13 +902,13 @@ async fn run_command(
         "help" => app.log(COMMAND_HELP),
         "quit" | "exit" => app.should_quit = true,
         "status" => {
-            let snapshot = state.leader_status.snapshot().await;
+            let leader_state = state.leader_state.lock().await.clone();
             let peer_count = state.peers.lock().await.len();
             app.log(format!(
                 "address={} can_lead={} leader={} peers={peer_count}",
                 state.my_address,
                 state.can_lead,
-                leader_mode_line(&snapshot.mode)
+                leader_mode_line(&leader_state.mode)
             ));
         }
         "peers" => {
@@ -902,7 +925,7 @@ async fn run_command(
                         peer.latency.map(|latency| latency.get()),
                         peer.leader_info
                             .as_ref()
-                            .and_then(|info| info.leader_state.published_leader(peer.addr)),
+                            .and_then(|info| published_leader(peer.addr, &info.leader_state.mode)),
                     ));
                 }
             }
