@@ -12,9 +12,9 @@ use tokio::sync::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    new::node_state::NodeState,
+    cluster::node_state::NodeState,
     protocol::messages::{LeaderInfo, SharePeerDetails, SyncRequest, SyncResponse, PROTOCOL_VERSION},
-    state::determinstic_state::DeterministicState,
+    state::deterministic_state::DeterministicState,
     transport::{
         channels::NetIoSettings,
         traits::{SyncIO, SyncIOAddress},
@@ -26,11 +26,13 @@ const CONNECT_RETRY_LIMIT: u64 = 3;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const CONNECT_FAIL_HOLD_DELAY: Duration = Duration::from_secs(5);
 
+type ConnectionMap<I, D> = HashMap<<I as SyncIO>::Address, Connection<<I as SyncIO>::Address, D>>;
+
 pub struct PeerConnections<I: SyncIO, D: DeterministicState> {
     io: Arc<I>,
     conn_settings: NetIoSettings,
     state: Arc<NodeState<I::Address, D>>,
-    connections: Mutex<HashMap<I::Address, Connection<I::Address, D>>>,
+    connections: Mutex<ConnectionMap<I, D>>,
 }
 
 struct Connection<A: SyncIOAddress, D: DeterministicState> {
@@ -134,14 +136,6 @@ where
         let connection = self.connections.lock().await.remove(&peer);
         if let Some(connection) = connection {
             connection.kill().await;
-        }
-    }
-
-    pub async fn send_ping(&self, peer: I::Address, id: u64) -> Result<(), PeerRpcError> {
-        let response = self.send_rpc(peer, SyncRequest::Ping(id)).await?;
-        match response {
-            SyncResponse::Pong(response_id) if response_id == id => Ok(()),
-            response => self.unexpected_response(peer, "Pong with matching id", response).await,
         }
     }
 

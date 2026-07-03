@@ -1,4 +1,4 @@
-use super::determinstic_state::DeterministicState;
+use super::deterministic_state::DeterministicState;
 use crate::utils::unknown_id_err;
 use message_encoding::{m_opt_sum, MessageEncoding};
 use std::{collections::VecDeque, fmt::Debug};
@@ -260,7 +260,7 @@ impl<D: MessageEncoding + DeterministicState> MessageEncoding for RecoverableSta
 mod test {
     use message_encoding::{test_assert_valid_encoding, MessageEncoding};
 
-    use crate::state::determinstic_state::DeterministicState;
+    use crate::state::deterministic_state::DeterministicState;
 
     use super::*;
 

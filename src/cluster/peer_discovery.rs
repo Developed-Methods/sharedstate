@@ -2,16 +2,14 @@ use std::{future::Future, num::NonZeroU64, sync::Arc, time::Duration};
 
 use futures_util::{stream, StreamExt};
 use message_encoding::MessageEncoding;
-use tokio::sync::Mutex;
 
 use crate::{
-    new::{
-        node_state::{NodeState, PeerState},
-        subscribable_state::StateHandle,
-        tasks::peer_connections::PeerConnections,
+    cluster::{
+        node_state::{ConnectStatus, NodeState, PeerState},
+        peer_connections::PeerConnections,
     },
-    protocol::messages::{ConnectStatus, LeaderInfo, LeaderState, SharePeerDetails},
-    state::determinstic_state::DeterministicState,
+    protocol::messages::{LeaderInfo, LeaderState, SharePeerDetails},
+    state::deterministic_state::DeterministicState,
     transport::traits::{SyncIO, SyncIOAddress},
     utils::now_ms,
 };
@@ -27,7 +25,6 @@ pub struct PeerDiscoveryTask<I: SyncIO, D: DeterministicState> {
     state: Arc<NodeState<I::Address, D>>,
     peer_connections: Arc<PeerConnections<I, D>>,
     timing: PeerDiscoveryTiming,
-    state_handle: Mutex<StateHandle<D>>,
 }
 
 #[derive(Clone, Debug)]
@@ -57,12 +54,10 @@ where
         peer_connections: Arc<PeerConnections<I, D>>,
         timing: PeerDiscoveryTiming,
     ) -> Self {
-        let state_handle = Mutex::new(state.state.create_handle());
         Self {
             state,
             peer_connections,
             timing,
-            state_handle,
         }
     }
 
@@ -114,19 +109,13 @@ where
 
     async fn share_leader_info(&self) {
         self.process_data_for_peers(
-            |peers| async move {
+            |_peers| async move {
                 LeaderInfo {
                     can_lead: self.state.can_lead,
                     leader_state: {
                         let lock = self.state.leader_state.lock().await;
                         LeaderState::clone(&*lock)
                     },
-                    leader_connectivity: peers
-                        .iter()
-                        .filter(|peer| peer.can_lead.unwrap_or(false))
-                        .map(|peer| (peer.addr, peer.connect_status))
-                        .collect(),
-                    recover_details: self.state.state.recovery_details().await,
                 }
             },
             |peer, leader_info| {
@@ -172,10 +161,10 @@ where
 
         let mapped = map(peers).await;
 
-        let mut result_stream =
-            stream::iter(peer_targets.into_iter().map(|peer| action(peer, &mapped))).buffer_unordered(32);
+        let mut result_stream = stream::iter(peer_targets.into_iter().map(|peer| action(peer, &mapped)))
+            .buffer_unordered(self.timing.max_concurrent_observations);
 
-        while let Some(_) = result_stream.next().await {
+        while result_stream.next().await.is_some() {
             continue;
         }
     }

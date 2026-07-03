@@ -3,21 +3,15 @@ use std::sync::Arc;
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::SequencedReceiver;
 use tokio::{
-    sync::{
-        mpsc::{Receiver, Sender},
-        Mutex,
-    },
+    sync::mpsc::{Receiver, Sender},
     task::JoinHandle,
 };
 
 use crate::{
-    new::{
-        node_state::{NodeState, PeerState},
-        subscribable_state::StateHandle,
-    },
+    cluster::node_state::{NodeState, PeerState},
     protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
-        determinstic_state::DeterministicState,
+        deterministic_state::DeterministicState,
         recoverable_state::{RecoverableState, RecoverableStateAction},
     },
     transport::{
@@ -28,19 +22,12 @@ use crate::{
 
 pub struct RpcServer<A: SyncIOAddress, D: DeterministicState> {
     state: Arc<NodeState<A, D>>,
-    state_handle: Mutex<StateHandle<D>>,
     actions_tx: Sender<(A, D::Action)>,
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
     pub fn new(state: Arc<NodeState<A, D>>, actions_tx: Sender<(A, D::Action)>) -> Self {
-        let state_handle = Mutex::new(state.state.create_handle());
-
-        RpcServer {
-            state,
-            state_handle,
-            actions_tx,
-        }
+        RpcServer { state, actions_tx }
     }
 
     pub async fn handle(&self, peer_addr: A, request: SyncRequest<A, D>) -> ResponseOrFeed<A, D> {
@@ -78,7 +65,6 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
                 let (state, feed) = self.state.state.subscribe_fresh().await;
                 return ResponseOrFeed::FreshState { state, feed };
             }
-            SyncRequest::Ping(id) => SyncResponse::Pong(id),
             SyncRequest::SharePeers(shared_peers) => {
                 self.state.merge_peer_details(shared_peers).await;
                 let share_peer_details = self.state.known_peer_details().await;

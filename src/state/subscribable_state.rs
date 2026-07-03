@@ -5,7 +5,7 @@ use sequenced_broadcast::{
 use tokio::sync::Mutex;
 
 use crate::state::{
-    determinstic_state::DeterministicState,
+    deterministic_state::DeterministicState,
     recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
 };
 

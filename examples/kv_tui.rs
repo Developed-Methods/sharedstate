@@ -23,20 +23,18 @@ use ratatui::{
 };
 use sequenced_broadcast::SequencedBroadcastSettings;
 use sharedstate::{
-    new::{
-        node_state::{NodeState, PeerState},
-        subscribable_state::StateHandle,
-        tasks::{
-            leader_logic::{CurrentLeaderTask, CurrentLeaderTiming, LeaderMode},
-            peer_connections::PeerConnections,
-            peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
-            rpc_server::RpcServer,
-        },
+    cluster::{
+        leader::{LeaderMode, LeaderTask, LeaderTiming},
+        node_state::{ConnectStatus, NodeState, PeerState},
+        peer_connections::PeerConnections,
+        peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
+        rpc_server::RpcServer,
     },
-    protocol::messages::{ConnectStatus, LeaderState, SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{LeaderState, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
-        determinstic_state::DeterministicState,
+        deterministic_state::DeterministicState,
         recoverable_state::{RecoverableState, RecoverableStateAction},
+        subscribable_state::StateHandle,
     },
     transport::{
         channels::NetIoSettings,
@@ -418,7 +416,6 @@ async fn main() -> io::Result<()> {
                 peer,
                 PeerState {
                     addr: peer,
-                    latency: None,
                     can_lead: None,
                     connect_status: ConnectStatus::NotConnected,
                     last_global_connectivity: None,
@@ -432,7 +429,7 @@ async fn main() -> io::Result<()> {
         my_address: local_address,
         can_lead: args.can_lead,
         peers: Mutex::new(initial_peers),
-        state: sharedstate::new::subscribable_state::SubscribableState::new(
+        state: sharedstate::state::subscribable_state::SubscribableState::new(
             RecoverableState::new(local_address as u64, KvStore::new()),
             SequencedBroadcastSettings::default(),
         )
@@ -449,7 +446,7 @@ async fn main() -> io::Result<()> {
     let _server_task = rpc_server.start_listener(io.clone(), settings.clone());
 
     tokio::spawn(PeerDiscoveryTask::new(state.clone(), peer_connections.clone(), PeerDiscoveryTiming::default()).run());
-    tokio::spawn(CurrentLeaderTask::new(state.clone(), CurrentLeaderTiming::default()).run());
+    tokio::spawn(LeaderTask::new(state.clone(), LeaderTiming::default()).run());
 
     start_action_router(state.clone(), peer_connections.clone(), actions_rx, log_tx.clone());
     start_follower_subscription(state.clone(), io.clone(), settings.clone(), log_tx.clone());
@@ -793,11 +790,10 @@ async fn build_summary(state: &Arc<NodeState<u16, KvStore>>, state_handle: &mut 
     } else {
         for peer in peers.values() {
             lines.push(format!(
-                "  {} status={} can_lead={:?} latency_ms={:?} last_global={:?} observed_leader={:?} observed_vote={:?} observed_term={:?}",
+                "  {} status={} can_lead={:?} last_global={:?} observed_leader={:?} observed_vote={:?} observed_term={:?}",
                 peer.addr,
                 connect_status_line(peer.connect_status),
                 peer.can_lead,
-                peer.latency.map(|latency| latency.get()),
                 peer.last_global_connectivity.map(|value| value.get()),
                 peer.leader_info.as_ref().and_then(|info| published_leader(peer.addr, &info.leader_state.mode)),
                 peer.leader_info.as_ref().and_then(|info| observed_vote(&info.leader_state.mode)),
@@ -918,11 +914,10 @@ async fn run_command(
             } else {
                 for peer in peers.values() {
                     app.log(format!(
-                        "{} status={} can_lead={:?} latency_ms={:?} observed_leader={:?}",
+                        "{} status={} can_lead={:?} observed_leader={:?}",
                         peer.addr,
                         connect_status_line(peer.connect_status),
                         peer.can_lead,
-                        peer.latency.map(|latency| latency.get()),
                         peer.leader_info
                             .as_ref()
                             .and_then(|info| published_leader(peer.addr, &info.leader_state.mode)),

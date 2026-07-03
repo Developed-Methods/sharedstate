@@ -3,9 +3,8 @@ use std::{collections::HashMap, num::NonZeroU64};
 use tokio::sync::Mutex;
 
 use crate::{
-    new::subscribable_state::SubscribableState,
-    protocol::messages::{ConnectStatus, LeaderInfo, LeaderState, SharePeerDetails},
-    state::determinstic_state::DeterministicState,
+    protocol::messages::{LeaderInfo, LeaderState, SharePeerDetails},
+    state::{deterministic_state::DeterministicState, subscribable_state::SubscribableState},
     transport::traits::SyncIOAddress,
     utils::now_ms,
 };
@@ -21,26 +20,29 @@ pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
 #[derive(Clone)]
 pub struct PeerState<A: SyncIOAddress> {
     pub addr: A,
-    pub latency: Option<NonZeroU64>,
     pub can_lead: Option<bool>,
     pub connect_status: ConnectStatus,
     pub last_global_connectivity: Option<NonZeroU64>,
     pub leader_info: Option<LeaderInfo<A>>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PeerMergeResult {
-    pub shared_count: usize,
-    pub inserted: usize,
-    pub updated: usize,
-    pub skipped_local: usize,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectStatus {
+    Connected { epoch_ms: u64 },
+    FailedToConnect { epoch_ms: u64 },
+    NotConnected,
+}
+
+impl ConnectStatus {
+    pub fn is_connected(&self) -> bool {
+        matches!(self, Self::Connected { .. })
+    }
 }
 
 impl<A: SyncIOAddress> PeerState<A> {
     pub(crate) fn empty(addr: A) -> Self {
         Self {
             addr,
-            latency: None,
             can_lead: None,
             connect_status: ConnectStatus::NotConnected,
             last_global_connectivity: None,
@@ -62,25 +64,17 @@ where
     A: SyncIOAddress,
     D: DeterministicState,
 {
-    pub(crate) async fn merge_peer_details(&self, shared_peers: Vec<SharePeerDetails<A>>) -> PeerMergeResult {
-        let shared_count = shared_peers.len();
-        let mut result = PeerMergeResult {
-            shared_count,
-            ..PeerMergeResult::default()
-        };
+    pub(crate) async fn merge_peer_details(&self, shared_peers: Vec<SharePeerDetails<A>>) {
         let mut peers = self.peers.lock().await;
 
         for shared in shared_peers {
             if shared.address == self.my_address {
-                result.skipped_local += 1;
                 continue;
             }
 
-            let peer_state = peers.entry(shared.address).or_insert_with(|| {
-                result.inserted += 1;
-                PeerState::empty(shared.address)
-            });
-            result.updated += 1;
+            let peer_state = peers
+                .entry(shared.address)
+                .or_insert_with(|| PeerState::empty(shared.address));
 
             if let Some(can_lead) = shared.can_be_leader {
                 peer_state.can_lead = Some(can_lead);
@@ -89,8 +83,6 @@ where
             peer_state.last_global_connectivity =
                 merge_last_activity(peer_state.last_global_connectivity, shared.last_global_activity);
         }
-
-        result
     }
 
     pub(crate) async fn known_peer_details(&self) -> Vec<SharePeerDetails<A>> {

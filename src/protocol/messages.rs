@@ -4,7 +4,7 @@ use message_encoding::MessageEncoding;
 
 use crate::{
     state::{
-        determinstic_state::DeterministicState,
+        deterministic_state::DeterministicState,
         recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
     },
     transport::traits::SyncIOAddress,
@@ -16,7 +16,6 @@ pub const PROTOCOL_VERSION: u64 = 1;
 pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
     ProtocolVersion(u64),
     MyAddress(A),
-    Ping(u64),
     SharePeers(Vec<SharePeerDetails<A>>),
     LeaderInformation(LeaderInfo<A>),
 
@@ -31,17 +30,6 @@ pub struct LeaderState<A: SyncIOAddress> {
     pub mode: LeaderMode<A>,
 }
 
-impl<A: SyncIOAddress> LeaderState<A> {
-    pub fn start_election(&mut self, can_lead: bool) {
-        self.term += 1;
-        if can_lead {
-            self.mode = LeaderMode::Electing { vote: None };
-        } else {
-            self.mode = LeaderMode::NoLeader;
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LeaderMode<A: SyncIOAddress> {
     NoLeader,
@@ -51,18 +39,9 @@ pub enum LeaderMode<A: SyncIOAddress> {
 }
 
 #[derive(Clone, Debug)]
-pub struct LeaderInfoMessage<A: SyncIOAddress> {
-    pub leader: Option<A>,
-    pub path: Option<Vec<A>>,
-    pub term: u64,
-}
-
-#[derive(Clone, Debug)]
 pub struct LeaderInfo<A: SyncIOAddress> {
     pub leader_state: LeaderState<A>,
     pub can_lead: bool,
-    pub leader_connectivity: Vec<(A, ConnectStatus)>,
-    pub recover_details: RecoverableStateDetails,
 }
 
 #[derive(Clone, Debug)]
@@ -70,64 +49,6 @@ pub struct SharePeerDetails<A: SyncIOAddress> {
     pub address: A,
     pub can_be_leader: Option<bool>,
     pub last_global_activity: Option<NonZeroU64>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConnectStatus {
-    Connected { epoch_ms: u64 },
-    FailedToConnect { epoch_ms: u64 },
-    NotConnected,
-}
-
-impl ConnectStatus {
-    pub fn is_connected(&self) -> bool {
-        matches!(self, Self::Connected { .. })
-    }
-
-    pub fn connected_at_ms(&self) -> Option<u64> {
-        match self {
-            Self::Connected { epoch_ms } => Some(*epoch_ms),
-            Self::FailedToConnect { .. } | Self::NotConnected => None,
-        }
-    }
-
-    pub fn failed_at_ms(&self) -> Option<u64> {
-        match self {
-            Self::FailedToConnect { epoch_ms } => Some(*epoch_ms),
-            Self::Connected { .. } | Self::NotConnected => None,
-        }
-    }
-}
-
-impl MessageEncoding for ConnectStatus {
-    fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
-        let mut sum = 0;
-        sum += match self {
-            ConnectStatus::Connected { epoch_ms } => {
-                sum += 0u16.write_to(out)?;
-                epoch_ms.write_to(out)?
-            }
-            ConnectStatus::FailedToConnect { epoch_ms } => {
-                sum += 1u16.write_to(out)?;
-                epoch_ms.write_to(out)?
-            }
-            ConnectStatus::NotConnected => 2u16.write_to(out)?,
-        };
-        Ok(sum)
-    }
-
-    fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
-        Ok(match u16::read_from(read)? {
-            0 => ConnectStatus::Connected {
-                epoch_ms: MessageEncoding::read_from(read)?,
-            },
-            1 => ConnectStatus::FailedToConnect {
-                epoch_ms: MessageEncoding::read_from(read)?,
-            },
-            2 => ConnectStatus::NotConnected,
-            other => return Err(unknown_id_err(other, "ConnectStatus")),
-        })
-    }
 }
 
 impl<A: SyncIOAddress> From<A> for SharePeerDetails<A> {
@@ -145,24 +66,19 @@ impl<A: SyncIOAddress, D: DeterministicState> Debug for SyncRequest<A, D> {
         match self {
             Self::ProtocolVersion(v) => write!(f, "ProtocolVersion({v})"),
             Self::MyAddress(address) => write!(f, "MyAddress({address:?})"),
-            Self::Ping(num) => write!(f, "Ping({num})"),
             Self::SharePeers(peers) => write!(f, "SharePeers({peers:?})"),
+            Self::LeaderInformation(info) => write!(f, "LeaderInformation({info:?})"),
             Self::SubscribeFresh => write!(f, "SubscribeFresh"),
             Self::SubscribeRecovery(details) => write!(f, "SubscribeRecovery({details:?})"),
             Self::Action { source, .. } => write!(f, "Action(source: {source:?})"),
-            Self::LeaderInformation(info) => write!(f, "LeaderInformation({info:?})"),
         }
     }
 }
 
 pub enum SyncResponse<A: SyncIOAddress, D: DeterministicState> {
-    Pong(u64),
     Ok,
     FailedToQueueAction { source: A },
     Peers(Vec<SharePeerDetails<A>>),
-    LeaderInfo(LeaderInfo<A>),
-    LeaderPath(Vec<A>),
-    NoPathToLeader,
     Accepted(u64),
     RecoveryFailed,
     FreshState(RecoverableState<D>),
@@ -174,13 +90,9 @@ pub enum SyncResponse<A: SyncIOAddress, D: DeterministicState> {
 impl<A: SyncIOAddress, D: DeterministicState> SyncResponse<A, D> {
     pub fn name(&self) -> &'static str {
         match self {
-            SyncResponse::Pong(_) => "Pong",
             SyncResponse::Ok => "Ok",
             SyncResponse::FailedToQueueAction { .. } => "FailedToQueueAction",
             SyncResponse::Peers(_) => "Peers",
-            SyncResponse::LeaderInfo(_) => "LeaderInfo",
-            SyncResponse::LeaderPath(_) => "LeaderPath",
-            SyncResponse::NoPathToLeader => "NoPathToLeader",
             SyncResponse::Accepted(_) => "Accepted",
             SyncResponse::RecoveryFailed => "RecoveryFailed",
             SyncResponse::FreshState(_) => "FreshState",
@@ -206,13 +118,13 @@ where
                 sum += 1u16.write_to(out)?;
                 addr.write_to(out)?
             }
-            Self::Ping(num) => {
-                sum += 2u16.write_to(out)?;
-                num.write_to(out)?
-            }
             Self::SharePeers(peers) => {
-                sum += 3u16.write_to(out)?;
+                sum += 2u16.write_to(out)?;
                 write_vec(peers, out)?
+            }
+            Self::LeaderInformation(info) => {
+                sum += 3u16.write_to(out)?;
+                info.write_to(out)?
             }
             Self::SubscribeFresh => 4u16.write_to(out)?,
             Self::SubscribeRecovery(details) => {
@@ -224,10 +136,6 @@ where
                 sum += source.write_to(out)?;
                 action.write_to(out)?
             }
-            Self::LeaderInformation(info) => {
-                sum += 7u16.write_to(out)?;
-                info.write_to(out)?
-            }
         };
 
         Ok(sum)
@@ -237,40 +145,15 @@ where
         Ok(match u16::read_from(read)? {
             0 => Self::ProtocolVersion(MessageEncoding::read_from(read)?),
             1 => Self::MyAddress(MessageEncoding::read_from(read)?),
-            2 => Self::Ping(MessageEncoding::read_from(read)?),
-            3 => Self::SharePeers(read_vec(read)?),
+            2 => Self::SharePeers(read_vec(read)?),
+            3 => Self::LeaderInformation(MessageEncoding::read_from(read)?),
             4 => Self::SubscribeFresh,
             5 => Self::SubscribeRecovery(MessageEncoding::read_from(read)?),
             6 => Self::Action {
                 source: MessageEncoding::read_from(read)?,
                 action: MessageEncoding::read_from(read)?,
             },
-            7 => Self::LeaderInformation(MessageEncoding::read_from(read)?),
             other => return Err(unknown_id_err(other, "SyncRequest")),
-        })
-    }
-}
-
-impl<A: SyncIOAddress> MessageEncoding for LeaderInfoMessage<A> {
-    fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
-        let mut sum = 0;
-        sum += 1u16.write_to(out)?;
-        sum += self.leader.write_to(out)?;
-        sum += write_opt_vec(&self.path, out)?;
-        sum += self.term.write_to(out)?;
-        Ok(sum)
-    }
-
-    fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
-        let version = u16::read_from(read)?;
-        if version != 1 {
-            return Err(unknown_version_err(version, "LeaderInfoMessage"));
-        }
-
-        Ok(Self {
-            leader: MessageEncoding::read_from(read)?,
-            path: read_opt_vec(read)?,
-            term: MessageEncoding::read_from(read)?,
         })
     }
 }
@@ -278,25 +161,21 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderInfoMessage<A> {
 impl<A: SyncIOAddress> MessageEncoding for LeaderInfo<A> {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
-        sum += 4u16.write_to(out)?;
+        sum += 5u16.write_to(out)?;
         sum += self.leader_state.write_to(out)?;
         sum += self.can_lead.write_to(out)?;
-        sum += write_vec(&self.leader_connectivity, out)?;
-        sum += self.recover_details.write_to(out)?;
         Ok(sum)
     }
 
     fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
         let version = u16::read_from(read)?;
-        if version != 4 {
+        if version != 5 {
             return Err(unknown_version_err(version, "LeaderInfo"));
         }
 
         Ok(Self {
             leader_state: MessageEncoding::read_from(read)?,
             can_lead: MessageEncoding::read_from(read)?,
-            leader_connectivity: read_vec(read)?,
-            recover_details: MessageEncoding::read_from(read)?,
         })
     }
 }
@@ -396,44 +275,31 @@ where
     fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
         sum += match self {
-            Self::Pong(num) => {
-                sum += 0u16.write_to(out)?;
-                num.write_to(out)?
-            }
-            Self::Ok => 1u16.write_to(out)?,
+            Self::Ok => 0u16.write_to(out)?,
             Self::FailedToQueueAction { source } => {
-                sum += 2u16.write_to(out)?;
+                sum += 1u16.write_to(out)?;
                 source.write_to(out)?
             }
             Self::Peers(peers) => {
-                sum += 3u16.write_to(out)?;
+                sum += 2u16.write_to(out)?;
                 write_vec(peers, out)?
             }
-            Self::LeaderInfo(info) => {
-                sum += 4u16.write_to(out)?;
-                info.write_to(out)?
-            }
-            Self::LeaderPath(path) => {
-                sum += 5u16.write_to(out)?;
-                write_vec(path, out)?
-            }
-            Self::NoPathToLeader => 6u16.write_to(out)?,
             Self::Accepted(next_seq) => {
-                sum += 7u16.write_to(out)?;
+                sum += 3u16.write_to(out)?;
                 next_seq.write_to(out)?
             }
-            Self::RecoveryFailed => 8u16.write_to(out)?,
+            Self::RecoveryFailed => 4u16.write_to(out)?,
             Self::FreshState(state) => {
-                sum += 9u16.write_to(out)?;
+                sum += 5u16.write_to(out)?;
                 state.write_to(out)?
             }
             Self::AuthorityAction(seq, action) => {
-                sum += 10u16.write_to(out)?;
+                sum += 6u16.write_to(out)?;
                 sum += seq.write_to(out)?;
                 action.write_to(out)?
             }
-            Self::ActionStreamClosed => 11u16.write_to(out)?,
-            Self::UnexpectedRequest => 12u16.write_to(out)?,
+            Self::ActionStreamClosed => 7u16.write_to(out)?,
+            Self::UnexpectedRequest => 8u16.write_to(out)?,
         };
 
         Ok(sum)
@@ -441,21 +307,17 @@ where
 
     fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
         Ok(match u16::read_from(read)? {
-            0 => Self::Pong(MessageEncoding::read_from(read)?),
-            1 => Self::Ok,
-            2 => Self::FailedToQueueAction {
+            0 => Self::Ok,
+            1 => Self::FailedToQueueAction {
                 source: MessageEncoding::read_from(read)?,
             },
-            3 => Self::Peers(read_vec(read)?),
-            4 => Self::LeaderInfo(MessageEncoding::read_from(read)?),
-            5 => Self::LeaderPath(read_vec(read)?),
-            6 => Self::NoPathToLeader,
-            7 => Self::Accepted(MessageEncoding::read_from(read)?),
-            8 => Self::RecoveryFailed,
-            9 => Self::FreshState(MessageEncoding::read_from(read)?),
-            10 => Self::AuthorityAction(MessageEncoding::read_from(read)?, MessageEncoding::read_from(read)?),
-            11 => Self::ActionStreamClosed,
-            12 => Self::UnexpectedRequest,
+            2 => Self::Peers(read_vec(read)?),
+            3 => Self::Accepted(MessageEncoding::read_from(read)?),
+            4 => Self::RecoveryFailed,
+            5 => Self::FreshState(MessageEncoding::read_from(read)?),
+            6 => Self::AuthorityAction(MessageEncoding::read_from(read)?, MessageEncoding::read_from(read)?),
+            7 => Self::ActionStreamClosed,
+            8 => Self::UnexpectedRequest,
             other => return Err(unknown_id_err(other, "SyncResponse")),
         })
     }
@@ -476,22 +338,6 @@ fn read_vec<T: MessageEncoding, R: std::io::Read>(read: &mut R) -> std::io::Resu
         vec.push(MessageEncoding::read_from(read)?);
     }
     Ok(vec)
-}
-
-fn write_opt_vec<T: MessageEncoding, W: std::io::Write>(v: &Option<Vec<T>>, out: &mut W) -> std::io::Result<usize> {
-    let mut sum = v.is_some().write_to(out)?;
-    if let Some(v) = v {
-        sum += write_vec(v, out)?;
-    }
-    Ok(sum)
-}
-
-fn read_opt_vec<T: MessageEncoding, R: std::io::Read>(read: &mut R) -> std::io::Result<Option<Vec<T>>> {
-    if bool::read_from(read)? {
-        Ok(Some(read_vec(read)?))
-    } else {
-        Ok(None)
-    }
 }
 
 #[cfg(test)]
@@ -550,8 +396,6 @@ mod tests {
                 mode: LeaderMode::Following { leader: 3 },
             },
             can_lead: true,
-            leader_connectivity: vec![(1, ConnectStatus::NotConnected), (3, ConnectStatus::Connected { epoch_ms: 5 })],
-            recover_details: RecoverableStateDetails::new(1, 1),
         }
     }
 
@@ -562,19 +406,17 @@ mod tests {
     }
 
     #[test]
-    fn leader_info_encoding_version_four_roundtrips_mode() {
+    fn leader_info_encoding_roundtrips() {
         let info = leader_info();
         let mut bytes = Vec::new();
 
         info.write_to(&mut bytes).unwrap();
 
-        assert_eq!(u16::read_from(&mut &bytes[..]).unwrap(), 4);
+        assert_eq!(u16::read_from(&mut &bytes[..]).unwrap(), 5);
 
         let decoded: LeaderInfo<u64> = LeaderInfo::read_from(&mut &bytes[..]).unwrap();
         assert_eq!(decoded.leader_state, info.leader_state);
         assert_eq!(decoded.can_lead, info.can_lead);
-        assert_eq!(decoded.leader_connectivity, info.leader_connectivity);
-        assert_eq!(decoded.recover_details.next_seq(), info.recover_details.next_seq());
     }
 
     #[test]
@@ -582,8 +424,8 @@ mod tests {
         let cases: Vec<(SyncRequest<u64, TestState>, u16)> = vec![
             (SyncRequest::ProtocolVersion(PROTOCOL_VERSION), 0),
             (SyncRequest::MyAddress(1), 1),
-            (SyncRequest::Ping(2), 2),
-            (SyncRequest::SharePeers(vec![SharePeerDetails::from(3)]), 3),
+            (SyncRequest::SharePeers(vec![SharePeerDetails::from(3)]), 2),
+            (SyncRequest::LeaderInformation(leader_info()), 3),
             (SyncRequest::SubscribeFresh, 4),
             (SyncRequest::SubscribeRecovery(RecoverableStateDetails::new(4, 5)), 5),
             (
@@ -593,7 +435,6 @@ mod tests {
                 },
                 6,
             ),
-            (SyncRequest::LeaderInformation(leader_info()), 7),
         ];
 
         for (request, tag) in cases {
@@ -604,19 +445,15 @@ mod tests {
     #[test]
     fn sync_response_tags_are_canonical() {
         let cases: Vec<(SyncResponse<u64, TestState>, u16)> = vec![
-            (SyncResponse::Pong(1), 0),
-            (SyncResponse::Ok, 1),
-            (SyncResponse::FailedToQueueAction { source: 2 }, 2),
-            (SyncResponse::Peers(vec![SharePeerDetails::from(3)]), 3),
-            (SyncResponse::LeaderInfo(leader_info()), 4),
-            (SyncResponse::LeaderPath(vec![4, 5]), 5),
-            (SyncResponse::NoPathToLeader, 6),
-            (SyncResponse::Accepted(6), 7),
-            (SyncResponse::RecoveryFailed, 8),
-            (SyncResponse::FreshState(RecoverableState::new(7, TestState(8))), 9),
-            (SyncResponse::AuthorityAction(9, RecoverableStateAction::StateAction { action: TestAction(10) }), 10),
-            (SyncResponse::ActionStreamClosed, 11),
-            (SyncResponse::UnexpectedRequest, 12),
+            (SyncResponse::Ok, 0),
+            (SyncResponse::FailedToQueueAction { source: 2 }, 1),
+            (SyncResponse::Peers(vec![SharePeerDetails::from(3)]), 2),
+            (SyncResponse::Accepted(6), 3),
+            (SyncResponse::RecoveryFailed, 4),
+            (SyncResponse::FreshState(RecoverableState::new(7, TestState(8))), 5),
+            (SyncResponse::AuthorityAction(9, RecoverableStateAction::StateAction { action: TestAction(10) }), 6),
+            (SyncResponse::ActionStreamClosed, 7),
+            (SyncResponse::UnexpectedRequest, 8),
         ];
 
         for (response, tag) in cases {
