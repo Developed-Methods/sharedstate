@@ -81,10 +81,9 @@ where
     }
 
     pub async fn tick(&self) {
-        /* every node exchanges peer details: this is how a node announces
-         * itself to the cluster and learns which peers can lead, so it must
-         * not be gated on can_lead */
-        self.broadcast_peer_details().await;
+        if self.state.can_lead {
+            self.broadcast_peer_details().await;
+        }
         self.share_leader_info().await;
     }
 
@@ -136,8 +135,10 @@ where
 
                 async move {
                     /* voters broadcast to everyone so observers learn the
-                     * leader; observers only report their state to voters */
-                    if !self.state.can_lead && !peer.can_lead.unwrap_or(false) {
+                     * leader; observers only report their state to voters.
+                     * If we don't know if peer is leader, assume it is so
+                     * we can get peer discovery */
+                    if !self.state.can_lead && !peer.can_lead.unwrap_or(true) {
                         return;
                     }
 
