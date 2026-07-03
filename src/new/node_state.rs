@@ -1,4 +1,4 @@
-use std::{collections::HashMap, num::NonZeroU64, sync::atomic::Ordering};
+use std::{collections::HashMap, num::NonZeroU64};
 
 use tokio::sync::Mutex;
 
@@ -97,13 +97,14 @@ where
         self.peers.lock().await.values().map(PeerState::share_details).collect()
     }
 
+    /// Records activity from a peer, registering it if this is first contact.
+    /// Returns whether the peer was already known.
     pub(crate) async fn note_known_peer_activity(&self, peer: A) -> bool {
         let mut peers = self.peers.lock().await;
-        let Some(peer_state) = peers.get_mut(&peer) else {
-            return false;
-        };
+        let known = peers.contains_key(&peer);
+        let peer_state = peers.entry(peer).or_insert_with(|| PeerState::empty(peer));
         peer_state.last_global_connectivity = NonZeroU64::new(now_ms());
-        true
+        known
     }
 
     pub(crate) async fn mark_peer_connected(&self, peer: A) {

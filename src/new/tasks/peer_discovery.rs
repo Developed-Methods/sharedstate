@@ -81,9 +81,10 @@ where
     }
 
     pub async fn tick(&self) {
-        if self.state.can_lead {
-            self.broadcast_peer_details().await;
-        }
+        /* every node exchanges peer details: this is how a node announces
+         * itself to the cluster and learns which peers can lead, so it must
+         * not be gated on can_lead */
+        self.broadcast_peer_details().await;
         self.share_leader_info().await;
     }
 

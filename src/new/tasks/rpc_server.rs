@@ -45,7 +45,7 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
 
     pub async fn handle(&self, peer_addr: A, request: SyncRequest<A, D>) -> ResponseOrFeed<A, D> {
         if !self.state.note_known_peer_activity(peer_addr).await {
-            tracing::error!("got message from peer but they are not in state");
+            tracing::debug!(?peer_addr, "learned about new peer from inbound connection");
         }
 
         let resp = match request {
