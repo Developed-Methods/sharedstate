@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     future::Future,
     pin::Pin,
-    sync::{Arc as StdArc, Mutex as StdMutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc as StdArc, Mutex as StdMutex,
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -27,6 +30,7 @@ struct SimulatedNetInner {
     blocked_nodes: HashSet<u64>,
     blocked_edges: HashSet<(u64, u64)>,
     edge_latencies: HashMap<(u64, u64), Duration>,
+    blackholed_edges: HashMap<(u64, u64), StdArc<AtomicBool>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +50,7 @@ impl SimulatedNet {
                 blocked_nodes: HashSet::new(),
                 blocked_edges: HashSet::new(),
                 edge_latencies: HashMap::new(),
+                blackholed_edges: HashMap::new(),
             })),
         }
     }
@@ -92,6 +97,20 @@ impl SimulatedNet {
 
     pub async fn clear_edge_blocks(&self) {
         self.inner.lock().await.blocked_edges.clear();
+    }
+
+    /// Silently stalls all traffic on an edge without closing connections,
+    /// like a half-open TCP connection: reads and writes hang instead of
+    /// erroring, and new connections establish but carry no bytes.
+    pub async fn set_edge_blackholed(&self, a: u64, b: u64, blackholed: bool) {
+        let edge = Self::edge_key(a, b);
+        self.inner
+            .lock()
+            .await
+            .blackholed_edges
+            .entry(edge)
+            .or_default()
+            .store(blackholed, Ordering::Relaxed);
     }
 
     pub async fn set_edge_latency(&self, a: u64, b: u64, latency: Option<Duration>) {
@@ -171,7 +190,7 @@ impl SyncIO for SimulatedIo {
     type Write = KillableIo<WriteHalf<DuplexStream>>;
 
     async fn connect(&self, remote: &Self::Address) -> std::io::Result<SyncConnection<Self>> {
-        let (tx, handles, latency) = {
+        let (tx, handles, latency, blackhole) = {
             let mut net = self.net.inner.lock().await;
             let edge = SimulatedNet::edge_key(self.address, *remote);
             if net.blocked_nodes.contains(&self.address)
@@ -182,6 +201,7 @@ impl SyncIO for SimulatedIo {
             }
             let tx = net.listeners.get(remote).cloned();
             let latency = net.edge_latencies.get(&edge).copied().unwrap_or_default();
+            let blackhole = net.blackholed_edges.entry(edge).or_default().clone();
             let handles = [
                 KillHandle::new(),
                 KillHandle::new(),
@@ -194,7 +214,7 @@ impl SyncIO for SimulatedIo {
             active.extend(handles.iter().map(|(handle, _)| handle.clone()));
             let active = net.active_connection_edges.entry(edge).or_default();
             active.extend(handles.iter().map(|(handle, _)| handle.clone()));
-            (tx, handles, latency)
+            (tx, handles, latency, blackhole)
         };
 
         let Some(tx) = tx else {
@@ -210,16 +230,16 @@ impl SyncIO for SimulatedIo {
 
         tx.send(SimulatedIncoming {
             remote: self.address,
-            read: KillableIo::new(server_read, server_read_kill, latency),
-            write: KillableIo::new(server_write, server_write_kill, latency),
+            read: KillableIo::new(server_read, server_read_kill, latency, blackhole.clone()),
+            write: KillableIo::new(server_write, server_write_kill, latency, blackhole.clone()),
         })
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotConnected, "remote listener closed"))?;
 
         Ok(SyncConnection {
             remote: *remote,
-            read: KillableIo::new(client_read, client_read_kill, latency),
-            write: KillableIo::new(client_write, client_write_kill, latency),
+            read: KillableIo::new(client_read, client_read_kill, latency, blackhole.clone()),
+            write: KillableIo::new(client_write, client_write_kill, latency, blackhole),
         })
     }
 }
@@ -257,22 +277,29 @@ impl KillHandle {
     }
 }
 
+/// How often a blackholed stream re-checks whether the blackhole lifted.
+const BLACKHOLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 pub struct KillableIo<I> {
     inner: I,
     kill: oneshot::Receiver<()>,
     killed: bool,
     latency: Duration,
     delay: Option<Pin<Box<tokio::time::Sleep>>>,
+    blackhole: StdArc<AtomicBool>,
+    blackhole_delay: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<I> KillableIo<I> {
-    fn new(inner: I, kill: oneshot::Receiver<()>, latency: Duration) -> Self {
+    fn new(inner: I, kill: oneshot::Receiver<()>, latency: Duration, blackhole: StdArc<AtomicBool>) -> Self {
         Self {
             inner,
             kill,
             killed: false,
             latency,
             delay: None,
+            blackhole,
+            blackhole_delay: None,
         }
     }
 
@@ -287,6 +314,28 @@ impl<I> KillableIo<I> {
                 Some(Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection killed"))))
             }
             Poll::Pending => None,
+        }
+    }
+
+    /// Pending while the edge is blackholed. Wakes on a timer to re-check, so
+    /// a lifted blackhole resumes traffic without an explicit wake-up.
+    fn poll_blackhole(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        loop {
+            if !self.blackhole.load(Ordering::Relaxed) {
+                self.blackhole_delay = None;
+                return Poll::Ready(());
+            }
+
+            if self.blackhole_delay.is_none() {
+                self.blackhole_delay = Some(Box::pin(tokio::time::sleep(BLACKHOLE_POLL_INTERVAL)));
+            }
+
+            match self.blackhole_delay.as_mut().expect("delay initialized").as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    self.blackhole_delay = None;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
     }
 
@@ -315,6 +364,10 @@ impl<I: AsyncRead + Unpin> AsyncRead for KillableIo<I> {
             return kill;
         }
 
+        if self.poll_blackhole(cx).is_pending() {
+            return Poll::Pending;
+        }
+
         if self.poll_latency(cx).is_pending() {
             return Poll::Pending;
         }
@@ -331,6 +384,10 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for KillableIo<I> {
                 Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
                 Poll::Pending => Poll::Pending,
             };
+        }
+
+        if self.poll_blackhole(cx).is_pending() {
+            return Poll::Pending;
         }
 
         Pin::new(&mut self.inner).poll_write(cx, buf)

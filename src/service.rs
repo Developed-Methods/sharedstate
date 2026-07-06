@@ -419,6 +419,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn follower_recovers_when_leader_link_goes_silent() {
+        let net = SimulatedNet::new();
+        let node1 = start_node(&net, 1, true, &[2, 3]).await;
+        let node2 = start_node(&net, 2, true, &[1, 3]).await;
+        let node3 = start_node(&net, 3, false, &[1, 2]).await;
+
+        wait_for_leader(&[&node1, &node2, &node3], 1).await;
+        node1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&node3, 1, 1).await;
+
+        /* silently stall the observer's link to the leader, like a half-open
+         * TCP connection: connections stay up but carry no bytes. The
+         * subscription must time out instead of idling forever, and sync must
+         * continue through node 2 */
+        net.set_edge_blackholed(1, 3, true).await;
+
+        node1.submit_action((2, 2)).await.unwrap();
+        wait_for_value(&node3, 2, 2).await;
+
+        /* the observer's actions must still reach the leader via the relay */
+        node3.submit_action((3, 3)).await.unwrap();
+        wait_for_value(&node1, 3, 3).await;
+        wait_for_value(&node2, 3, 3).await;
+    }
+
+    #[tokio::test]
     async fn old_leader_rejoins_as_follower_and_its_actions_apply() {
         let net = SimulatedNet::new();
         let node1 = start_node(&net, 1, true, &[2, 3]).await;

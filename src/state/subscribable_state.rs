@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use hotread::{HotRead, HotReadHandle, HotReadState};
 use sequenced_broadcast::{
     SequencedBroadcast, SequencedBroadcastSettings, SequencedReceiver, SequencedSender, SettingsError, SubscribeError,
@@ -72,13 +74,41 @@ impl<D: DeterministicState> SubscribableState<D> {
     /// update. Publication can be deferred when a reader is mid-read, and
     /// nothing else retries it, so updates must settle before they can be
     /// relied on to be visible.
+    ///
+    /// A reader handle that never goes quiescent blocks publication
+    /// indefinitely; after a burst of yields this backs off to sleeping (so a
+    /// stuck reader degrades update latency instead of busy-spinning a core)
+    /// and warns periodically so the stall is diagnosable.
     async fn settle(&self) {
+        const YIELD_LIMIT: u32 = 64;
+        const RETRY_DELAY: Duration = Duration::from_millis(1);
+        const WARN_INTERVAL: Duration = Duration::from_secs(1);
+
+        let started = tokio::time::Instant::now();
+        let mut last_warned: Option<tokio::time::Instant> = None;
+        let mut yields = 0u32;
+
         loop {
             if self.state.copy_applied_seq(self.state.active_index()) == self.state.latest_seq() {
                 return;
             }
-            self.state.maintain();
-            tokio::task::yield_now().await;
+            let maintenance = self.state.maintain();
+
+            if yields < YIELD_LIMIT {
+                yields += 1;
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            if last_warned.is_none_or(|at| WARN_INTERVAL <= at.elapsed()) {
+                tracing::warn!(
+                    blocked_by_workers = maintenance.blocked_by_workers,
+                    elapsed = ?started.elapsed(),
+                    "state updates are not settling; a state handle may be missing a quiescent() call"
+                );
+                last_warned = Some(tokio::time::Instant::now());
+            }
+            tokio::time::sleep(RETRY_DELAY).await;
         }
     }
 
@@ -214,5 +244,81 @@ impl<D: DeterministicState + Clone> HotReadState for HotReadRecoverable<D> {
                 self.0 = new_state.clone();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{iter, sync::Arc};
+
+    use super::*;
+    use crate::state::deterministic_state::DeterministicState;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Counter(u64);
+
+    impl DeterministicState for Counter {
+        type Action = u64;
+        type AuthorityAction = u64;
+
+        fn accept_seq(&self) -> u64 {
+            self.0
+        }
+
+        fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
+            action
+        }
+
+        fn update(&mut self, _action: &Self::AuthorityAction) {
+            self.0 += 1;
+        }
+    }
+
+    fn new_state() -> Arc<SubscribableState<Counter>> {
+        Arc::new(
+            SubscribableState::new(
+                RecoverableState::new(1, Counter(0)),
+                SequencedBroadcastSettings::default(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn action() -> RecoverableStateAction<u64> {
+        RecoverableStateAction::StateAction { action: 7 }
+    }
+
+    /// A handle that read the state and never went quiescent blocks hot-read
+    /// publication: updates must wait (without busy-spinning forever being
+    /// the only observable behavior) and resume once the reader lets go.
+    #[tokio::test(start_paused = true)]
+    async fn pinned_read_handle_defers_updates_until_quiescent() {
+        let state = new_state();
+        let mut handle = state.create_handle();
+
+        /* pin the currently published copy mid-read */
+        let _ = handle.current();
+
+        let updates = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                state.update(iter::once(action())).await;
+                state.update(iter::once(action())).await;
+            })
+        };
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !updates.is_finished(),
+            "updates must not settle while a read handle is pinned"
+        );
+
+        handle.quiescent();
+        tokio::time::timeout(std::time::Duration::from_secs(5), updates)
+            .await
+            .expect("updates must settle once the reader goes quiescent")
+            .unwrap();
+
+        assert_eq!(handle.read_with(|state| state.state().0), 2);
     }
 }

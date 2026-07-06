@@ -263,7 +263,18 @@ where
         let mut retry_wait = CONNECT_RETRY_DELAY;
 
         let connection = loop {
-            match io.connect(&self.remote_addr).await {
+            /* connect gives no timing guarantee; bound it so a hanging
+             * transport surfaces as a normal connect failure */
+            let connect_result = match tokio::time::timeout(settings.message_timeout, io.connect(&self.remote_addr)).await
+            {
+                Ok(result) => result,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out connecting to peer",
+                )),
+            };
+
+            match connect_result {
                 Ok(connection) => break connection,
                 Err(error) => {
                     tracing::error!(?error, repeat_failures, "failed to connect to peer {:?}", self.remote_addr);
