@@ -49,7 +49,14 @@ impl Default for ElectionTerm {
 
 impl ElectionTerm {
     pub fn from_term(term: u64) -> Self {
-        ElectionTerm(term << 32)
+        Self::from_parts(term, 0)
+    }
+
+    /// Builds a term with an explicit nonce. Terms with the same number but
+    /// different nonces come from different election roots and must not be
+    /// treated as the same election.
+    pub fn from_parts(term: u64, nonce: u32) -> Self {
+        ElectionTerm((term << 32) | nonce as u64)
     }
 
     pub fn bump(self) -> Self {
