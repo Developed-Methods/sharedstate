@@ -18,13 +18,13 @@ use clap::Parser;
 use message_encoding::MessageEncoding;
 use serde::{Deserialize, Serialize};
 use sharedstate::{
-    net::message_channel::NetIoSettings,
-    shared::node::NodeTiming,
+    cluster::NodeTiming,
     state::{determinstic_state::DeterministicState, recoverable_state::RecoverableState},
-    test_orchestrator::{
+    testing::{
         AddNodeRequest, NodeView, OrchestratorError, OrchestratorRecording, OrchestratorSnapshot,
         SetBlockedPeersRequest, SetNetworkingRequest, SharedStateTestOrchestrator, SharedStateTestOrchestratorConfig,
     },
+    transport::channels::NetIoSettings,
 };
 use tower_http::{cors::CorsLayer, services::ServeDir};
 

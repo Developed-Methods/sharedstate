@@ -152,21 +152,25 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
 
     if let Some(max_size) = M::MAX_SIZE {
         buffer.reserve(MESSAGE_HEADER_SIZE + max_size);
-        assert!(max_size < (MessageSizeHeader::MAX as usize));
+        debug_assert!(max_size < (MessageSizeHeader::MAX as usize));
     }
 
     buffer.extend((0 as MessageSizeHeader).to_be_bytes());
-    assert_eq!(buffer.len(), MESSAGE_HEADER_SIZE);
+    debug_assert_eq!(buffer.len(), MESSAGE_HEADER_SIZE);
 
     let bytes_written = message.write_to(buffer)?;
-    assert_eq!(bytes_written + MESSAGE_HEADER_SIZE, buffer.len(), "M::write_to returned incorrect number of bytes");
+    debug_assert_eq!(
+        bytes_written + MESSAGE_HEADER_SIZE,
+        buffer.len(),
+        "M::write_to returned incorrect number of bytes"
+    );
     if bytes_written >= CLOSE_FRAME_SIZE as usize {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "message too large for framing protocol"));
     }
 
     /* if static size is known, we've already written size with MAX_SIZE var */
     if let Some(size) = M::STATIC_SIZE {
-        assert_eq!(size, bytes_written, "M::STATIC_SIZE does not match M::write_to");
+        debug_assert_eq!(size, bytes_written, "M::STATIC_SIZE does not match M::write_to");
     }
     /* write size to start of buffer */
     else {

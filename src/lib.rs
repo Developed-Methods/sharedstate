@@ -1,11 +1,14 @@
-// pub mod worker;
+//! Synchronize deterministic state machines across a cluster.
+//!
+//! The crate is organized into focused layers: state management, protocol
+//! framing, transport adapters, and cluster coordination.
 
-pub mod net;
-pub mod shared;
+pub mod cluster;
+pub mod protocol;
+pub mod service;
 pub mod state;
-pub mod test_orchestrator;
+pub mod transport;
 
 mod utils;
 
-// #[cfg(test)]
-// mod testing;
+pub use service::{SharedState, SharedStateConfig, SharedStateSettings};

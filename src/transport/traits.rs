@@ -6,9 +6,9 @@ use tokio::{
 };
 
 use crate::{
-    net::message_channel::{NetIoSettings, ReadChannel, WriteChannel},
-    shared::messages::{SyncRequest, SyncResponse},
-    state::determinstic_state::DeterministicState,
+    protocol::messages::{SyncRequest, SyncResponse},
+    state::deterministic_state::DeterministicState,
+    transport::channels::{NetIoSettings, ReadChannel, WriteChannel},
 };
 
 pub trait SyncIOAddress:
@@ -39,25 +39,31 @@ pub struct SyncConnection<I: SyncIO> {
     pub write: I::Write,
 }
 
+pub type ClientChannels<I, D> = (
+    <I as SyncIO>::Address,
+    Sender<SyncRequest<<I as SyncIO>::Address, D>>,
+    Receiver<SyncResponse<<I as SyncIO>::Address, D>>,
+);
+
+pub type ServerChannels<I, D> = (
+    <I as SyncIO>::Address,
+    Sender<SyncResponse<<I as SyncIO>::Address, D>>,
+    Receiver<SyncRequest<<I as SyncIO>::Address, D>>,
+);
+
 impl<I: SyncIO> SyncConnection<I> {
-    pub fn client_channels<D: DeterministicState>(
-        self,
-        settings: NetIoSettings,
-    ) -> (I::Address, Sender<SyncRequest<I::Address, D>>, Receiver<SyncResponse<I::Address, D>>)
+    pub fn client_channels<D>(self, settings: NetIoSettings) -> ClientChannels<I, D>
     where
-        D: MessageEncoding,
+        D: DeterministicState + MessageEncoding,
         D::Action: MessageEncoding,
         D::AuthorityAction: MessageEncoding,
     {
         self.channels(settings)
     }
 
-    pub fn server_channels<D: DeterministicState>(
-        self,
-        settings: NetIoSettings,
-    ) -> (I::Address, Sender<SyncResponse<I::Address, D>>, Receiver<SyncRequest<I::Address, D>>)
+    pub fn server_channels<D>(self, settings: NetIoSettings) -> ServerChannels<I, D>
     where
-        D: MessageEncoding,
+        D: DeterministicState + MessageEncoding,
         D::Action: MessageEncoding,
         D::AuthorityAction: MessageEncoding,
     {

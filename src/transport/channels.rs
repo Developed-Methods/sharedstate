@@ -4,9 +4,9 @@ use message_encoding::MessageEncoding;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use super::{
-    message_io::{read_message_opt, send_close_message, send_message, send_zero_message, ReadMessageResult},
-    sync_io::SyncIO,
+use crate::{
+    protocol::framing::{read_message_opt, send_close_message, send_message, send_zero_message, ReadMessageResult},
+    transport::traits::SyncIO,
 };
 
 #[derive(Clone, Debug)]
@@ -157,7 +157,7 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Future, time::Duration};
+    use std::time::Duration;
 
     use tokio::{
         io::{duplex, AsyncReadExt, DuplexStream},
@@ -165,9 +165,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::net::{
-        message_io::{send_close_message, MessageSizeHeader},
-        sync_io::{SyncConnection, SyncIO},
+    use crate::{
+        protocol::framing::{send_close_message, MessageSizeHeader},
+        transport::traits::{SyncConnection, SyncIO},
     };
 
     struct DuplexSyncIo;
@@ -177,11 +177,8 @@ mod tests {
         type Read = DuplexStream;
         type Write = DuplexStream;
 
-        fn connect(
-            &self,
-            _remote: &Self::Address,
-        ) -> impl Future<Output = std::io::Result<SyncConnection<Self>>> + Send {
-            async { Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "test io cannot connect")) }
+        async fn connect(&self, _remote: &Self::Address) -> std::io::Result<SyncConnection<Self>> {
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "test io cannot connect"))
         }
     }
 

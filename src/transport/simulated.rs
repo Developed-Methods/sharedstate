@@ -13,7 +13,7 @@ use tokio::{
     sync::{mpsc, oneshot, Mutex},
 };
 
-use crate::net::sync_io::{SyncConnection, SyncIO, SyncIOListener};
+use crate::transport::traits::{SyncConnection, SyncIO, SyncIOListener};
 
 #[derive(Clone)]
 pub struct SimulatedNet {
