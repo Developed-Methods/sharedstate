@@ -405,7 +405,7 @@ fn read_vec<T: MessageEncoding, R: std::io::Read>(read: &mut R) -> std::io::Resu
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, io::Result};
+    use std::io::Result;
 
     use super::*;
 

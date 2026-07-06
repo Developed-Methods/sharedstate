@@ -110,13 +110,21 @@ where
     async fn share_leader_info(&self) {
         self.process_data_for_peers(
             |peers| async move {
+                let mut reachable_voters = peers
+                    .iter()
+                    .filter_map(|peer| peer.connect_status.is_connected().then_some(peer.addr))
+                    .collect::<Vec<_>>();
+                if self.state.can_lead {
+                    reachable_voters.push(self.state.my_address);
+                }
+
                 LeaderInfo {
                     can_lead: self.state.can_lead,
                     leader_state: {
                         let lock = self.state.leader_state.lock().await;
                         LeaderState::clone(&*lock)
                     },
-                    reachable_voters: peers.iter().filter_map(|peer| peer.connect_status.is_connected().then_some(peer.addr)).collect(),
+                    reachable_voters,
                     recovery_details: self.state.state.recovery_details().await,
                 }
             },

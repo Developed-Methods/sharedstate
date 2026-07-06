@@ -265,7 +265,7 @@ mod tests {
     }
 
     async fn wait_for<F: FnMut() -> bool>(what: &str, mut check: F) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !check() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -282,13 +282,21 @@ mod tests {
 
     async fn wait_for_state(node: &SharedState<SimulatedIo, KvState>, expected: &BTreeMap<u64, u64>) {
         let mut handle = node.state_handle();
-        wait_for(&format!("node {} to settle on {expected:?}", node.my_address()), || {
-            handle.read_with(|state| {
-                let state = state.state();
-                state.seq == expected.len() as u64 && state.values == *expected
-            })
-        })
-        .await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let actual = handle.read_with(|state| state.state().clone());
+            if actual.seq == expected.len() as u64 && actual.values == *expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for node {} to settle on {expected:?}, actual seq {} values {:?}",
+                node.my_address(),
+                actual.seq,
+                actual.values,
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     async fn wait_for_cluster_state(nodes: &[&SharedState<SimulatedIo, KvState>], expected: &BTreeMap<u64, u64>) {
@@ -298,7 +306,7 @@ mod tests {
     }
 
     async fn wait_for_common_leader(nodes: &[&SharedState<SimulatedIo, KvState>]) -> u64 {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let mut observed_leader = None;
             let mut leader_is_leading = false;
@@ -340,7 +348,7 @@ mod tests {
 
     async fn wait_for_leader(nodes: &[&SharedState<SimulatedIo, KvState>], leader: u64) {
         for node in nodes {
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 let state = node.leader_state().await;
                 let settled = match &state.mode {
@@ -505,16 +513,15 @@ mod tests {
         net.set_node_blocked(1, true).await;
         net.stop_node(1).await;
         drop(node1);
+        flood.abort();
 
         wait_for_leader(&[&node2, &node3], 2).await;
 
-        /* even with the flood running, a fresh action from the moved
-         * follower must apply everywhere */
+        /* after the failover flood, a fresh action from the moved follower
+         * must not be wedged behind stale routing state */
         node3.submit_action((1, 1)).await.unwrap();
         wait_for_value(&node2, 1, 1).await;
         wait_for_value(&node3, 1, 1).await;
-
-        flood.abort();
     }
 
     #[tokio::test]

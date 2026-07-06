@@ -139,6 +139,17 @@ where
                         return Flow::Shutdown;
                     };
 
+                    let current = self.state.leader_state.lock().await.mode.clone();
+                    if let LeaderMode::Following { leader } = current {
+                        tracing::info!(?leader, "no longer leading, forwarding queued action to new leader");
+                        self.forward_action(leader, source, action).await;
+                        return Flow::Continue;
+                    }
+                    if !matches!(current, LeaderMode::Leading) {
+                        tracing::info!("no longer leading, releasing authority before applying queued action");
+                        return Flow::Continue;
+                    }
+
                     let authority = self
                         .handle
                         .read_with(move |state| state.authority(RecoverableStateAction::StateAction { action }));
@@ -315,17 +326,28 @@ where
                     let Some((source, action)) = action else {
                         return SyncAttempt::Shutdown;
                     };
+                    let current = self.state.leader_state.lock().await.mode.clone();
+                    if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
+                        tracing::info!(?leader, "leader changed before forwarding action, dropping subscription");
+                        self.drop_queued_actions();
+                        return SyncAttempt::Finished;
+                    }
                     self.forward_action(target, source, action).await;
                 }
                 _ = tokio::time::sleep(self.timing.leader_poll_interval) => {
                     let current = self.state.leader_state.lock().await.mode.clone();
                     if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
                         tracing::info!(?leader, "leader changed, dropping subscription");
+                        self.drop_queued_actions();
                         return SyncAttempt::Finished;
                     }
                 }
             }
         }
+    }
+
+    fn drop_queued_actions(&mut self) {
+        while self.actions_rx.try_recv().is_ok() {}
     }
 
     async fn forward_action(&self, target: I::Address, source: I::Address, action: D::Action) {

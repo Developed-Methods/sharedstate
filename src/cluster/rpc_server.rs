@@ -40,7 +40,7 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
             SyncRequest::MyAddress(_) => SyncResponse::UnexpectedRequest,
 
             SyncRequest::Action { source, action } => {
-                if self.actions_tx.try_send((source, action)).is_ok() {
+                if self.actions_tx.send((source, action)).await.is_ok() {
                     SyncResponse::Ok
                 } else {
                     SyncResponse::FailedToQueueAction { source }

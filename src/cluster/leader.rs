@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use crate::{
     cluster::node_state::{ConnectStatus, NodeState, PeerState},
     protocol::messages::{ElectionTerm, LeaderState},
-    state::{deterministic_state::DeterministicState, recoverable_state::RecoverableStateDetails},
+    state::deterministic_state::DeterministicState,
     transport::traits::SyncIOAddress,
 };
 
@@ -74,7 +74,6 @@ where
         let mut leader_state = self.state.leader_state.lock().await;
 
         let next = if self.state.can_lead {
-            let peer_views: Vec<PeerViewWithDetails<_>> = peer_views.into_iter().filter_map(|v| v.with_details()).collect();
             next_voter_state(self.state.my_address, &leader_state, &peer_views)
         } else {
             next_observer_state(&leader_state, &peer_views)
@@ -94,17 +93,6 @@ struct PeerView<A: SyncIOAddress> {
     connected: bool,
     unreachable: bool,
     leader_state: Option<LeaderState<A>>,
-    recovery_details: Option<RecoverableStateDetails>,
-}
-
-#[derive(Clone, Debug)]
-struct PeerViewWithDetails<A: SyncIOAddress> {
-    addr: A,
-    is_voter: bool,
-    connected: bool,
-    unreachable: bool,
-    leader_state: LeaderState<A>,
-    recovery_details: RecoverableStateDetails,
 }
 
 impl<A: SyncIOAddress> PeerView<A> {
@@ -123,25 +111,13 @@ impl<A: SyncIOAddress> PeerView<A> {
             connected: peer.connect_status.is_connected(),
             unreachable,
             leader_state: peer.leader_info.as_ref().map(|info| info.leader_state.clone()),
-            recovery_details: peer.leader_info.as_ref().map(|info| info.recovery_details.clone()),
         }
     }
 
-    fn with_details(&self) -> Option<PeerViewWithDetails<A>> {
-        Some(PeerViewWithDetails {
-            addr: self.addr,
-            is_voter: self.is_voter,
-            connected: self.connected,
-            unreachable: self.unreachable,
-            leader_state: self.leader_state.clone()?,
-            recovery_details: self.recovery_details.clone()?,
-        })
-    }
-}
-
-impl<A: SyncIOAddress> PeerViewWithDetails<A> {
     fn mode_at_term(&self, term: ElectionTerm) -> Option<&LeaderMode<A>> {
-        (self.leader_state.term == term).then_some(&self.leader_state.mode)
+        self.leader_state
+            .as_ref()
+            .and_then(|state| (state.term.term() == term.term()).then_some(&state.mode))
     }
 }
 
@@ -154,16 +130,16 @@ impl<A: SyncIOAddress> PeerViewWithDetails<A> {
 ///  - leadership requires a strict majority of the known voter set, and
 ///    conflicting claims in one term resolve to the lowest address without
 ///    bumping the term (term bumps are reserved for leader failure)
-fn next_voter_state<A: SyncIOAddress>(me: A, current: &LeaderState<A>, peers: &[PeerViewWithDetails<A>]) -> LeaderState<A> {
+fn next_voter_state<A: SyncIOAddress>(me: A, current: &LeaderState<A>, peers: &[PeerView<A>]) -> LeaderState<A> {
     let voters = || peers.iter().filter(|peer| peer.is_voter);
 
     let term = voters()
-        .map(|peer| peer.leader_state.term)
+        .filter_map(|peer| peer.leader_state.as_ref().map(|state| state.term))
         .chain(std::iter::once(current.term))
-        .max_by_key(ElectionTerm::id)
+        .max_by_key(|term| term.term())
         .unwrap();
 
-    let mode = if term == current.term {
+    let mode = if term.term() == current.term.term() {
         current.mode.clone()
     } else {
         LeaderMode::Electing { vote: None }
@@ -347,7 +323,6 @@ mod tests {
             connected: true,
             unreachable: false,
             leader_state: state,
-            recovery_details: None,
         }
     }
 
@@ -365,6 +340,11 @@ mod tests {
         LeaderMode::Following { leader }
     }
 
+    fn assert_logical_state(actual: LeaderState<u16>, term: u64, mode: LeaderMode<u16>) {
+        assert_eq!(actual.term.term(), term);
+        assert_eq!(actual.mode, mode);
+    }
+
     #[test]
     fn lone_voter_becomes_leader() {
         let next = next_voter_state(1, &ls(0, LeaderMode::NoLeader), &[]);
@@ -379,7 +359,6 @@ mod tests {
             connected: false,
             unreachable: false,
             leader_state: None,
-            recovery_details: None,
         }];
 
         let next = next_voter_state(1, &ls(0, LeaderMode::NoLeader), &peers);
@@ -467,7 +446,7 @@ mod tests {
     fn follower_starts_new_term_when_leader_is_unreachable() {
         let peers = [unreachable(voter(1, Some(ls(4, LeaderMode::Leading)))), voter(3, None)];
         let next = next_voter_state(2, &ls(4, following(1)), &peers);
-        assert_eq!(next, ls(5, LeaderMode::Electing { vote: None }));
+        assert_logical_state(next, 5, LeaderMode::Electing { vote: None });
     }
 
     #[test]
@@ -497,7 +476,7 @@ mod tests {
     fn leader_steps_down_without_reachable_majority() {
         let peers = [unreachable(voter(2, None)), unreachable(voter(3, None))];
         let next = next_voter_state(1, &ls(4, LeaderMode::Leading), &peers);
-        assert_eq!(next, ls(5, LeaderMode::Electing { vote: None }));
+        assert_logical_state(next, 5, LeaderMode::Electing { vote: None });
     }
 
     #[test]
@@ -589,7 +568,6 @@ mod tests {
                         connected: !down.contains(addr),
                         unreachable: down.contains(addr),
                         leader_state: Some(state.clone()),
-                        recovery_details: None,
                     })
                     .collect::<Vec<_>>();
 
@@ -608,11 +586,12 @@ mod tests {
                 continue;
             }
             let expected = if node.addr == leader {
-                ls(term, LeaderMode::Leading)
+                LeaderMode::Leading
             } else {
-                ls(term, following(leader))
+                following(leader)
             };
-            assert_eq!(node.state, expected, "node {} disagrees", node.addr);
+            assert_eq!(node.state.term.term(), term, "node {} disagrees", node.addr);
+            assert_eq!(node.state.mode, expected, "node {} disagrees", node.addr);
         }
     }
 
