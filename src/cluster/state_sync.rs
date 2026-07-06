@@ -20,7 +20,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
     cluster::{node_state::NodeState, peer_connections::PeerConnections},
-    protocol::messages::{LeaderMode, SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{ElectionTerm, LeaderMode, PROTOCOL_VERSION, SyncRequest, SyncResponse},
     state::{
         deterministic_state::DeterministicState, recoverable_state::RecoverableStateAction,
         subscribable_state::StateHandle,
@@ -122,7 +122,7 @@ where
         Flow::Continue
     }
 
-    async fn lead(&mut self, term: u64) -> Flow {
+    async fn lead(&mut self, term: ElectionTerm) -> Flow {
         /* bump the recovery generation so followers of the previous leader
          * can recover from us without a full state transfer */
         let new_id = unique_state_id(&self.state.my_address);
@@ -130,7 +130,7 @@ where
             .state
             .update(iter::once(RecoverableStateAction::BumpGeneration { new_id }))
             .await;
-        tracing::info!(term, "leading, taking authority over shared state");
+        tracing::info!(%term, "leading, taking authority over shared state");
 
         loop {
             tokio::select! {
@@ -147,7 +147,7 @@ where
                 }
                 _ = tokio::time::sleep(self.timing.leader_poll_interval) => {
                     if !matches!(self.state.leader_state.lock().await.mode, LeaderMode::Leading) {
-                        tracing::info!(term, "no longer leading, releasing authority");
+                        tracing::info!(%term, "no longer leading, releasing authority");
                         return Flow::Continue;
                     }
                 }

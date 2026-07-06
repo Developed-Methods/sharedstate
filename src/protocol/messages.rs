@@ -40,7 +40,18 @@ impl Display for ElectionTerm {
     }
 }
 
+impl Default for ElectionTerm {
+    fn default() -> Self {
+        let num = ElectionTerm(0).bump().id();
+        ElectionTerm(num & (u32::MAX as u64))
+    }
+}
+
 impl ElectionTerm {
+    pub fn from_term(term: u64) -> Self {
+        ElectionTerm(term << 32)
+    }
+
     pub fn bump(self) -> Self {
         let term = self.term();
         let epoch = now_ms();

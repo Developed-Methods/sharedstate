@@ -24,7 +24,7 @@ mod tests {
             peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
             rpc_server::RpcServer,
         },
-        protocol::messages::LeaderState,
+        protocol::messages::{ElectionTerm, LeaderState},
         state::{
             deterministic_state::DeterministicState, recoverable_state::RecoverableState,
             subscribable_state::SubscribableState,
@@ -92,7 +92,7 @@ mod tests {
                 )
                 .unwrap(),
                 leader_state: Mutex::new(LeaderState {
-                    term: 0,
+                    term: ElectionTerm::from_term(0),
                     mode: LeaderMode::NoLeader,
                 }),
             });

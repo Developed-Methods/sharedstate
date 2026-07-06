@@ -23,7 +23,7 @@ use crate::{
         rpc_server::RpcServer,
         state_sync::{StateSyncTask, StateSyncTiming},
     },
-    protocol::messages::{LeaderMode, LeaderState},
+    protocol::messages::{ElectionTerm, LeaderMode, LeaderState},
     state::{
         deterministic_state::DeterministicState,
         recoverable_state::RecoverableState,
@@ -92,7 +92,7 @@ where
                 settings.broadcast.clone(),
             )?,
             leader_state: Mutex::new(LeaderState {
-                term: 0,
+                term: ElectionTerm::default(),
                 mode: LeaderMode::NoLeader,
             }),
         });
