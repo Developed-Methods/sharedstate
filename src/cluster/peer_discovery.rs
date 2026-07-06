@@ -112,8 +112,10 @@ where
             |peers| async move {
                 let mut reachable_voters = peers
                     .iter()
-                    .filter_map(|peer| peer.connect_status.is_connected().then_some(peer.addr))
+                    .filter(|peer| peer.connect_status.is_connected() && peer.can_lead.unwrap_or(true))
+                    .map(|peer| peer.addr)
                     .collect::<Vec<_>>();
+
                 if self.state.can_lead {
                     reachable_voters.push(self.state.my_address);
                 }
