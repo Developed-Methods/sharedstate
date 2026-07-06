@@ -517,37 +517,42 @@ mod tests {
         let node2 = Arc::new(start_node(&net, 2, true, &[1, 3]).await);
         let node3 = Arc::new(start_node(&net, 3, true, &[1, 2]).await);
 
-        wait_for_leader(&[&node1, &node2, &node3], 1).await;
+        let old_leader = wait_for_common_leader(&[&node1, &node2, &node3]).await;
+        let (survivor_a, survivor_b, new_leader, moved_follower) = match old_leader {
+            1 => (node2.clone(), node3.clone(), 2, node3.clone()),
+            2 => (node1.clone(), node3.clone(), 1, node3.clone()),
+            3 => (node1.clone(), node2.clone(), 1, node2.clone()),
+            _ => unreachable!("test only starts nodes 1, 2, and 3"),
+        };
 
         /* keep a continuous stream of actions flowing from both survivors
          * while the leader dies; the sync tasks must still notice the leader
          * change instead of forwarding in circles forever */
         let flood = {
-            let node2 = node2.clone();
-            let node3 = node3.clone();
+            let survivor_a = survivor_a.clone();
+            let survivor_b = survivor_b.clone();
             tokio::spawn(async move {
                 let mut i = 0u64;
                 loop {
-                    let _ = node2.submit_action((1000 + i, i)).await;
-                    let _ = node3.submit_action((2000 + i, i)).await;
+                    let _ = survivor_a.submit_action((1000 + i, i)).await;
+                    let _ = survivor_b.submit_action((2000 + i, i)).await;
                     i += 1;
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             })
         };
 
-        net.set_node_blocked(1, true).await;
-        net.stop_node(1).await;
-        drop(node1);
+        net.set_node_blocked(old_leader, true).await;
+        net.stop_node(old_leader).await;
         flood.abort();
 
-        wait_for_leader(&[&node2, &node3], 2).await;
+        wait_for_leader(&[&survivor_a, &survivor_b], new_leader).await;
 
         /* after the failover flood, a fresh action from the moved follower
          * must not be wedged behind stale routing state */
-        node3.submit_action((1, 1)).await.unwrap();
-        wait_for_value(&node2, 1, 1).await;
-        wait_for_value(&node3, 1, 1).await;
+        moved_follower.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&survivor_a, 1, 1).await;
+        wait_for_value(&survivor_b, 1, 1).await;
     }
 
     #[tokio::test]
