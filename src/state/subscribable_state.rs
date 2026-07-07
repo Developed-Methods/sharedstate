@@ -80,7 +80,7 @@ impl<D: DeterministicState> SubscribableState<D> {
     /// stuck reader degrades update latency instead of busy-spinning a core)
     /// and warns periodically so the stall is diagnosable.
     async fn settle(&self) {
-        const YIELD_LIMIT: u32 = 64;
+        const YIELD_LIMIT: u32 = 1024;
         const RETRY_DELAY: Duration = Duration::from_millis(1);
         const WARN_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -100,14 +100,19 @@ impl<D: DeterministicState> SubscribableState<D> {
                 continue;
             }
 
-            if last_warned.is_none_or(|at| WARN_INTERVAL <= at.elapsed()) {
+            if yields == YIELD_LIMIT {
+                last_warned = Some(tokio::time::Instant::now());
+            }
+            else if last_warned.is_none_or(|at| WARN_INTERVAL <= at.elapsed()) {
                 tracing::warn!(
                     blocked_by_workers = maintenance.blocked_by_workers,
                     elapsed = ?started.elapsed(),
                     "state updates are not settling; a state handle may be missing a quiescent() call"
                 );
+
                 last_warned = Some(tokio::time::Instant::now());
             }
+
             tokio::time::sleep(RETRY_DELAY).await;
         }
     }
