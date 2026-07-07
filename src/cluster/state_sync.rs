@@ -20,7 +20,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
     cluster::{node_state::NodeState, peer_connections::PeerConnections},
-    protocol::messages::{ElectionTerm, LeaderMode, PROTOCOL_VERSION, SyncRequest, SyncResponse},
+    protocol::messages::{ElectionTerm, LeaderMode, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         deterministic_state::DeterministicState, recoverable_state::RecoverableStateAction,
         subscribable_state::StateHandle,
@@ -384,13 +384,10 @@ where
     async fn forward_action(&self, target: I::Address, source: I::Address, action: D::Action) {
         match self
             .peer_connections
-            .send_rpc(target, SyncRequest::Action { source, action })
+            .enqueue_forwarded_action(target, source, action)
             .await
         {
-            Ok(SyncResponse::Ok) => {}
-            Ok(response) => {
-                tracing::warn!(?target, ?source, response = response.name(), "sync target rejected forwarded action");
-            }
+            Ok(()) => {}
             Err(error) => {
                 tracing::warn!(?target, ?source, ?error, "failed to forward action to sync target");
             }
