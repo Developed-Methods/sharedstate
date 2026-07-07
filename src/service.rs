@@ -42,6 +42,15 @@ pub struct SharedStateConfig<I: SyncIOListener, D: DeterministicState> {
     pub settings: SharedStateSettings,
 }
 
+pub struct SharedStateRecoverableConfig<I: SyncIOListener, D: DeterministicState> {
+    pub io: Arc<I>,
+    pub my_address: I::Address,
+    pub can_lead: bool,
+    pub initial_peers: Vec<I::Address>,
+    pub initial_state: RecoverableState<D>,
+    pub settings: SharedStateSettings,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SharedStateSettings {
     pub net: NetIoSettings,
@@ -77,6 +86,26 @@ where
             settings,
         } = config;
 
+        Self::start_recoverable(SharedStateRecoverableConfig {
+            io,
+            my_address,
+            can_lead,
+            initial_peers,
+            initial_state: RecoverableState::new(unique_state_id(&my_address), initial_state),
+            settings,
+        })
+    }
+
+    pub fn start_recoverable(config: SharedStateRecoverableConfig<I, D>) -> Result<Self, SettingsError> {
+        let SharedStateRecoverableConfig {
+            io,
+            my_address,
+            can_lead,
+            initial_peers,
+            initial_state,
+            settings,
+        } = config;
+
         let peers = initial_peers
             .into_iter()
             .filter(|peer| *peer != my_address)
@@ -87,10 +116,7 @@ where
             my_address,
             can_lead,
             peers: Mutex::new(peers),
-            state: SubscribableState::new(
-                RecoverableState::new(unique_state_id(&my_address), initial_state),
-                settings.broadcast.clone(),
-            )?,
+            state: SubscribableState::new(initial_state, settings.broadcast.clone())?,
             leader_state: Mutex::new(LeaderState {
                 term: ElectionTerm::default(),
                 mode: LeaderMode::NoLeader,
@@ -108,19 +134,16 @@ where
             ),
             tokio::spawn(LeaderTask::new(node.clone(), settings.leader_timing).run()),
             tokio::spawn(
-                StateSyncTask::new(
-                    node.clone(),
-                    peer_connections,
-                    io,
-                    settings.net,
-                    actions_rx,
-                    settings.sync_timing,
-                )
-                .run(),
+                StateSyncTask::new(node.clone(), peer_connections, io, settings.net, actions_rx, settings.sync_timing)
+                    .run(),
             ),
         ];
 
-        Ok(Self { node, actions_tx, tasks })
+        Ok(Self {
+            node,
+            actions_tx,
+            tasks,
+        })
     }
 
     pub fn my_address(&self) -> I::Address {
@@ -176,6 +199,7 @@ mod tests {
     use super::*;
     use crate::{
         cluster::{leader::LeaderTiming, peer_discovery::PeerDiscoveryTiming, state_sync::StateSyncTiming},
+        state::recoverable_state::RecoverableStateAction,
         transport::simulated::{SimulatedIo, SimulatedNet},
     };
 
@@ -391,6 +415,33 @@ mod tests {
             wait_for_value(node, 20, 200).await;
             wait_for_value(node, 30, 300).await;
         }
+    }
+
+    #[tokio::test]
+    async fn start_recoverable_preserves_initial_recovery_details() {
+        let net = SimulatedNet::new();
+        let io = net.start_io(1).await;
+
+        let mut initial_state = RecoverableState::new(101, KvState::default());
+        initial_state.update(&RecoverableStateAction::StateAction { action: (1, 10) });
+        initial_state.update(&RecoverableStateAction::BumpGeneration { new_id: 202 });
+        initial_state.update(&RecoverableStateAction::StateAction { action: (2, 20) });
+        let expected_details = initial_state.details().clone();
+
+        let node = SharedState::start_recoverable(SharedStateRecoverableConfig {
+            io,
+            my_address: 1,
+            can_lead: true,
+            initial_peers: Vec::new(),
+            initial_state,
+            settings: fast_settings(),
+        })
+        .unwrap();
+
+        let mut handle = node.state_handle();
+        let actual_details = handle.recover_details();
+
+        assert_eq!(actual_details, expected_details);
     }
 
     #[tokio::test]
