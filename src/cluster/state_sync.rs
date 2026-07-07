@@ -19,10 +19,7 @@ use message_encoding::MessageEncoding;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
-    cluster::{
-        node_state::NodeState,
-        peer_connections::{PeerConnections, PeerRpcError},
-    },
+    cluster::{node_state::NodeState, peer_connections::PeerConnections},
     protocol::messages::{ElectionTerm, LeaderMode, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         deterministic_state::DeterministicState, recoverable_state::RecoverableStateAction,
@@ -387,39 +384,15 @@ where
     async fn forward_action(&self, target: I::Address, source: I::Address, action: D::Action) {
         match self
             .peer_connections
-            .enqueue_rpc(target, SyncRequest::Action { source, action })
+            .enqueue_forwarded_action(target, source, action)
             .await
         {
-            Ok(response) => monitor_forwarded_action(target, source, response),
+            Ok(()) => {}
             Err(error) => {
                 tracing::warn!(?target, ?source, ?error, "failed to forward action to sync target");
             }
         }
     }
-}
-
-fn monitor_forwarded_action<A, D>(
-    target: A,
-    source: A,
-    response: tokio::sync::oneshot::Receiver<Result<SyncResponse<A, D>, PeerRpcError>>,
-) where
-    A: SyncIOAddress,
-    D: DeterministicState,
-{
-    tokio::spawn(async move {
-        match response.await {
-            Ok(Ok(SyncResponse::Ok)) => {}
-            Ok(Ok(response)) => {
-                tracing::warn!(?target, ?source, response = response.name(), "sync target rejected forwarded action");
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(?target, ?source, ?error, "failed to forward action to sync target");
-            }
-            Err(_) => {
-                tracing::warn!(?target, ?source, "forwarded action response dropped");
-            }
-        }
-    });
 }
 
 async fn send<A: SyncIOAddress, D: DeterministicState>(

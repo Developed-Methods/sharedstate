@@ -42,10 +42,32 @@ struct Connection<A: SyncIOAddress, D: DeterministicState> {
 
 struct RpcMessage<A: SyncIOAddress, D: DeterministicState> {
     request: SyncRequest<A, D>,
-    response: oneshot::Sender<Result<SyncResponse<A, D>, PeerRpcError>>,
+    response: RpcResponseHandler<A, D>,
 }
 
-type RpcResponseSender<A, D> = oneshot::Sender<Result<SyncResponse<A, D>, PeerRpcError>>;
+enum RpcResponseHandler<A: SyncIOAddress, D: DeterministicState> {
+    Sender(oneshot::Sender<Result<SyncResponse<A, D>, PeerRpcError>>),
+    ForwardedAction { target: A, source: A },
+}
+
+impl<A: SyncIOAddress, D: DeterministicState> RpcResponseHandler<A, D> {
+    fn handle(self, response: Result<SyncResponse<A, D>, PeerRpcError>) {
+        match self {
+            Self::Sender(tx) => {
+                let _ = tx.send(response);
+            }
+            Self::ForwardedAction { target, source } => match response {
+                Ok(SyncResponse::Ok) => {}
+                Ok(response) => {
+                    tracing::warn!(?target, ?source, response = response.name(), "sync target rejected forwarded action");
+                }
+                Err(error) => {
+                    tracing::warn!(?target, ?source, ?error, "failed to forward action to sync target");
+                }
+            },
+        }
+    }
+}
 
 impl<I, D> PeerConnections<I, D>
 where
@@ -82,7 +104,39 @@ where
         }
 
         let (tx, rx) = oneshot::channel();
-        let mut pending = Some(RpcMessage { request, response: tx });
+        self.enqueue_message(
+            peer,
+            RpcMessage {
+                request,
+                response: RpcResponseHandler::Sender(tx),
+            },
+        )
+        .await?;
+        Ok(rx)
+    }
+
+    pub async fn enqueue_forwarded_action(
+        &self,
+        peer: I::Address,
+        source: I::Address,
+        action: D::Action,
+    ) -> Result<(), PeerRpcError> {
+        self.enqueue_message(
+            peer,
+            RpcMessage {
+                request: SyncRequest::Action { source, action },
+                response: RpcResponseHandler::ForwardedAction { target: peer, source },
+            },
+        )
+        .await
+    }
+
+    async fn enqueue_message(
+        &self,
+        peer: I::Address,
+        msg: RpcMessage<I::Address, D>,
+    ) -> Result<(), PeerRpcError> {
+        let mut pending = Some(msg);
 
         loop {
             let msg = pending.take().expect("rpc message missing while send is still pending");
@@ -99,7 +153,7 @@ where
                         match entry.get().tx.try_send(msg) {
                             Ok(()) => {
                                 drop(connections);
-                                return Ok(rx);
+                                return Ok(());
                             }
                             Err(TrySendError::Closed(msg)) => {
                                 entry.remove();
@@ -110,7 +164,7 @@ where
                                 drop(connections);
 
                                 match sender.send(msg).await {
-                                    Ok(()) => return Ok(rx),
+                                    Ok(()) => return Ok(()),
                                     Err(error) => {
                                         pending = Some(error.0);
                                         let mut connections = self.connections.lock().await;
@@ -316,7 +370,7 @@ where
         tokio::spawn(
             ResponseReader::<A, D> {
                 responses: read,
-                response_senders: response_rx,
+                response_handlers: response_rx,
                 timeout: settings.message_timeout,
                 cancel: self.cancel.clone(),
             }
@@ -336,13 +390,13 @@ where
                     };
 
                     if write.send(msg.request).await.is_err() {
-                        let _ = msg.response.send(Err(PeerRpcError::FailedToSendRequest));
+                        msg.response.handle(Err(PeerRpcError::FailedToSendRequest));
                         self.drain_with_error(PeerRpcError::FailedToSendRequest).await;
                         break;
                     }
 
                     if let Err(error) = response_tx.send(msg.response).await {
-                        let _ = error.0.send(Err(PeerRpcError::FailedToReceiveResponse));
+                        error.0.handle(Err(PeerRpcError::FailedToReceiveResponse));
                         self.drain_with_error(PeerRpcError::FailedToReceiveResponse).await;
                         break;
                     }
@@ -378,24 +432,24 @@ where
     async fn drain_with_error(&mut self, error: PeerRpcError) {
         self.rx.close();
         while let Some(msg) = self.rx.recv().await {
-            let _ = msg.response.send(Err(error.clone()));
+            msg.response.handle(Err(error.clone()));
         }
     }
 }
 
 struct ResponseReader<A: SyncIOAddress, D: DeterministicState> {
     responses: Receiver<SyncResponse<A, D>>,
-    response_senders: Receiver<RpcResponseSender<A, D>>,
+    response_handlers: Receiver<RpcResponseHandler<A, D>>,
     timeout: Duration,
     cancel: CancellationToken,
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> ResponseReader<A, D> {
     async fn run(mut self) {
-        while let Some(response_sender) = self.response_senders.recv().await {
+        while let Some(response_handler) = self.response_handlers.recv().await {
             let response = read_response(&mut self.responses, self.timeout).await;
             let fatal_error = response.as_ref().err().cloned();
-            let _ = response_sender.send(response);
+            response_handler.handle(response);
 
             if let Some(error) = fatal_error {
                 self.cancel.cancel();
@@ -406,9 +460,9 @@ impl<A: SyncIOAddress, D: DeterministicState> ResponseReader<A, D> {
     }
 
     async fn drain_with_error(&mut self, error: PeerRpcError) {
-        self.response_senders.close();
-        while let Some(response_sender) = self.response_senders.recv().await {
-            let _ = response_sender.send(Err(error.clone()));
+        self.response_handlers.close();
+        while let Some(response_handler) = self.response_handlers.recv().await {
+            response_handler.handle(Err(error.clone()));
         }
     }
 }
