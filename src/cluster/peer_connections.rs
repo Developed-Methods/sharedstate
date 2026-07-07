@@ -68,6 +68,15 @@ where
         peer: I::Address,
         request: SyncRequest<I::Address, D>,
     ) -> Result<SyncResponse<I::Address, D>, PeerRpcError> {
+        let rx = self.enqueue_rpc(peer, request).await?;
+        await_rpc_response(rx).await
+    }
+
+    pub async fn enqueue_rpc(
+        &self,
+        peer: I::Address,
+        request: SyncRequest<I::Address, D>,
+    ) -> Result<oneshot::Receiver<Result<SyncResponse<I::Address, D>, PeerRpcError>>, PeerRpcError> {
         if matches!(&request, SyncRequest::SubscribeFresh | SyncRequest::SubscribeRecovery(_)) {
             return Err(PeerRpcError::RequestNotAllowedOverRpc);
         }
@@ -90,7 +99,7 @@ where
                         match entry.get().tx.try_send(msg) {
                             Ok(()) => {
                                 drop(connections);
-                                return await_rpc_response(rx).await;
+                                return Ok(rx);
                             }
                             Err(TrySendError::Closed(msg)) => {
                                 entry.remove();
@@ -101,7 +110,7 @@ where
                                 drop(connections);
 
                                 match sender.send(msg).await {
-                                    Ok(()) => return await_rpc_response(rx).await,
+                                    Ok(()) => return Ok(rx),
                                     Err(error) => {
                                         pending = Some(error.0);
                                         let mut connections = self.connections.lock().await;
@@ -419,5 +428,185 @@ fn require_ok<A: SyncIOAddress, D: DeterministicState>(response: SyncResponse<A,
     match response {
         SyncResponse::Ok => Ok(()),
         _ => Err(PeerRpcError::HandshakeRejected),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    use message_encoding::MessageEncoding;
+    use sequenced_broadcast::SequencedBroadcastSettings;
+    use tokio::{
+        io::{duplex, split, DuplexStream, ReadHalf, WriteHalf},
+        sync::{Mutex, Notify, Semaphore},
+    };
+
+    use super::*;
+    use crate::{
+        protocol::messages::{ElectionTerm, LeaderMode},
+        state::{recoverable_state::RecoverableState, subscribable_state::SubscribableState},
+        transport::traits::SyncConnection,
+    };
+
+    #[derive(Clone, Debug)]
+    struct TestState;
+
+    impl DeterministicState for TestState {
+        type Action = u64;
+        type AuthorityAction = u64;
+
+        fn accept_seq(&self) -> u64 {
+            0
+        }
+
+        fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
+            action
+        }
+
+        fn update(&mut self, _action: &Self::AuthorityAction) {}
+    }
+
+    impl MessageEncoding for TestState {
+        fn write_to<T: std::io::Write>(&self, _out: &mut T) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
+        fn read_from<T: std::io::Read>(_read: &mut T) -> std::io::Result<Self> {
+            Ok(Self)
+        }
+    }
+
+    struct DelayedResponseIo {
+        actions_seen: Arc<AtomicUsize>,
+        second_action_seen: Arc<Notify>,
+        release_responses: Arc<Semaphore>,
+    }
+
+    impl DelayedResponseIo {
+        fn new() -> Self {
+            Self {
+                actions_seen: Arc::new(AtomicUsize::new(0)),
+                second_action_seen: Arc::new(Notify::new()),
+                release_responses: Arc::new(Semaphore::new(0)),
+            }
+        }
+    }
+
+    impl SyncIO for DelayedResponseIo {
+        type Address = u64;
+        type Read = ReadHalf<DuplexStream>;
+        type Write = WriteHalf<DuplexStream>;
+
+        async fn connect(&self, remote: &u64) -> std::io::Result<SyncConnection<Self>> {
+            let (client, server) = duplex(64 * 1024);
+            let (client_read, client_write) = split(client);
+            let (server_read, server_write) = split(server);
+
+            let (_, write, read) = SyncConnection::<Self> {
+                remote: *remote,
+                read: server_read,
+                write: server_write,
+            }
+            .server_channels::<TestState>(test_settings());
+
+            tokio::spawn(serve_delayed_responses(
+                write,
+                read,
+                self.actions_seen.clone(),
+                self.second_action_seen.clone(),
+                self.release_responses.clone(),
+            ));
+
+            Ok(SyncConnection {
+                remote: *remote,
+                read: client_read,
+                write: client_write,
+            })
+        }
+    }
+
+    async fn serve_delayed_responses(
+        write: Sender<SyncResponse<u64, TestState>>,
+        mut read: Receiver<SyncRequest<u64, TestState>>,
+        actions_seen: Arc<AtomicUsize>,
+        second_action_seen: Arc<Notify>,
+        release_responses: Arc<Semaphore>,
+    ) {
+        while let Some(request) = read.recv().await {
+            match request {
+                SyncRequest::ProtocolVersion(_) | SyncRequest::MyAddress(_) => {
+                    if write.send(SyncResponse::Ok).await.is_err() {
+                        return;
+                    }
+                }
+                SyncRequest::Action { .. } => {
+                    if actions_seen.fetch_add(1, Ordering::SeqCst) == 1 {
+                        second_action_seen.notify_waiters();
+                    }
+                    let write = write.clone();
+                    let release_responses = release_responses.clone();
+                    tokio::spawn(async move {
+                        let _permit = release_responses.acquire().await;
+                        let _ = write.send(SyncResponse::Ok).await;
+                    });
+                }
+                _ => {
+                    let _ = write.send(SyncResponse::UnexpectedRequest).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn test_settings() -> NetIoSettings {
+        NetIoSettings {
+            process_timeout: Duration::from_millis(100),
+            message_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn node_state() -> Arc<NodeState<u64, TestState>> {
+        Arc::new(NodeState {
+            my_address: 1,
+            can_lead: true,
+            peers: Mutex::new(HashMap::new()),
+            state: SubscribableState::new(RecoverableState::new(1, TestState), SequencedBroadcastSettings::default())
+                .unwrap(),
+            leader_state: Mutex::new(LeaderState {
+                term: ElectionTerm::from_term(0),
+                mode: LeaderMode::Following { leader: 2 },
+            }),
+        })
+    }
+
+    #[tokio::test]
+    async fn enqueue_rpc_does_not_wait_for_previous_response() {
+        let io = Arc::new(DelayedResponseIo::new());
+        let connections = PeerConnections::new(io.clone(), test_settings(), node_state());
+
+        let first = connections
+            .enqueue_rpc(2, SyncRequest::Action { source: 1, action: 10 })
+            .await
+            .unwrap();
+        let second = connections
+            .enqueue_rpc(2, SyncRequest::Action { source: 1, action: 20 })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), io.second_action_seen.notified())
+            .await
+            .expect("second action should be sent before the first response arrives");
+
+        io.release_responses.add_permits(2);
+        assert!(matches!(first.await.unwrap().unwrap(), SyncResponse::Ok));
+        assert!(matches!(second.await.unwrap().unwrap(), SyncResponse::Ok));
     }
 }
