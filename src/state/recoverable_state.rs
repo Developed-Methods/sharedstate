@@ -1,6 +1,7 @@
 use super::deterministic_state::DeterministicState;
 use crate::utils::unknown_id_err;
 use message_encoding::{m_opt_sum, MessageEncoding};
+use serde::Serialize;
 use std::{collections::VecDeque, fmt::Debug};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -35,7 +36,7 @@ impl<D: DeterministicState + Clone> Clone for RecoverableState<D> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RecoverableStateDetails {
     id: u64,
     generation: u64,
@@ -44,7 +45,7 @@ pub struct RecoverableStateDetails {
     history: VecDeque<RecovGenerationEnd>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct RecovGenerationEnd {
     old_id: u64,
     generation: u64,
