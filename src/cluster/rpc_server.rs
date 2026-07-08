@@ -54,7 +54,7 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
 
                 SyncResponse::Ok
             }
-            SyncRequest::SubscribeRecovery(details) => match self.state.state.subscribe(details).await {
+            SyncRequest::Subscribe(details) => match self.state.state.subscribe(details).await {
                 Ok(feed) => return ResponseOrFeed::Subscription { feed },
                 Err(error) => {
                     tracing::warn!(?error, "client recovery failed");
