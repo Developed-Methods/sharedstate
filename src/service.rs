@@ -8,7 +8,10 @@ use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedBroadcastSettings, SettingsError};
 use tokio::{
     sync::{
-        mpsc::{self, error::SendError},
+        mpsc::{
+            self,
+            error::{SendError, TrySendError},
+        },
         Mutex,
     },
     task::JoinHandle,
@@ -21,7 +24,7 @@ use crate::{
         peer_connections::PeerConnections,
         peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
         rpc_server::RpcServer,
-        state_sync::{StateSyncTask, StateSyncTiming},
+        state_sync::{QueuedAction, StateSyncTask, StateSyncTiming, DEFAULT_ACTION_FORWARD_TTL},
     },
     protocol::messages::{ElectionTerm, LeaderMode, LeaderState},
     state::{
@@ -65,7 +68,7 @@ const ACTION_QUEUE_CAPACITY: usize = 512;
 /// A running shared-state node. Dropping it stops the background tasks.
 pub struct SharedState<I: SyncIOListener, D: DeterministicState> {
     node: Arc<NodeState<I::Address, D>>,
-    actions_tx: mpsc::Sender<(I::Address, D::Action)>,
+    actions_tx: mpsc::Sender<QueuedAction<I::Address, D>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -168,14 +171,52 @@ where
         self.node.leader_state.lock().await.clone()
     }
 
-    /// Queues an action originating from this node. The sync task applies it
-    /// with authority when leading and forwards it to the leader otherwise.
+    /// Queues an action originating from this node.
+    ///
+    /// The sync task applies the action with authority when this node is
+    /// leading and forwards it to the leader otherwise. This method applies
+    /// backpressure when the local action queue is full; during leaderless
+    /// periods or network partitions that wait can be unbounded. Latency
+    /// sensitive callers should use [`SharedState::try_submit_action`] or wrap
+    /// this call in a timeout.
     pub async fn submit_action(&self, action: D::Action) -> Result<(), SendError<(I::Address, D::Action)>> {
-        self.actions_tx.send((self.node.my_address, action)).await
+        self.actions_tx
+            .send(QueuedAction {
+                source: self.node.my_address,
+                ttl: DEFAULT_ACTION_FORWARD_TTL,
+                action,
+            })
+            .await
+            .map_err(|error| SendError((error.0.source, error.0.action)))
+    }
+
+    /// Attempts to queue an action without waiting for queue capacity.
+    pub fn try_submit_action(&self, action: D::Action) -> Result<(), TrySendError<(I::Address, D::Action)>> {
+        self.actions_tx
+            .try_send(QueuedAction {
+                source: self.node.my_address,
+                ttl: DEFAULT_ACTION_FORWARD_TTL,
+                action,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(queued) => TrySendError::Full((queued.source, queued.action)),
+                TrySendError::Closed(queued) => TrySendError::Closed((queued.source, queued.action)),
+            })
+    }
+
+    /// Returns a clone of the current recoverable state for application-managed
+    /// checkpointing. Restart with [`SharedState::start_recoverable`] to keep
+    /// lineage details intact across full-cluster restarts.
+    pub fn snapshot(&self) -> RecoverableState<D>
+    where
+        D: Clone,
+    {
+        let mut handle = self.node.state.create_handle();
+        handle.read_with(Clone::clone)
     }
 
     /// Sender for queueing actions on behalf of other sources.
-    pub fn actions_sender(&self) -> mpsc::Sender<(I::Address, D::Action)> {
+    pub fn actions_sender(&self) -> mpsc::Sender<QueuedAction<I::Address, D>> {
         self.actions_tx.clone()
     }
 }
@@ -254,6 +295,7 @@ mod tests {
             net: NetIoSettings {
                 process_timeout: Duration::from_secs(1),
                 message_timeout: Duration::from_secs(2),
+                max_frame_size: crate::protocol::framing::DEFAULT_MAX_FRAME_SIZE,
             },
             broadcast: SequencedBroadcastSettings::default(),
             discovery_timing: PeerDiscoveryTiming {
@@ -442,6 +484,49 @@ mod tests {
         let actual_details = handle.recover_details();
 
         assert_eq!(actual_details, expected_details);
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_current_recoverable_state() {
+        let net = SimulatedNet::new();
+        let io = net.start_io(1).await;
+
+        let mut initial_state = RecoverableState::new(101, KvState::default());
+        initial_state.update(&RecoverableStateAction::StateAction { action: (1, 10) });
+        let expected = initial_state.clone();
+
+        let node = SharedState::start_recoverable(SharedStateRecoverableConfig {
+            io,
+            my_address: 1,
+            can_lead: true,
+            initial_peers: Vec::new(),
+            initial_state,
+            settings: fast_settings(),
+        })
+        .unwrap();
+
+        assert_eq!(node.snapshot(), expected);
+    }
+
+    #[tokio::test]
+    async fn try_submit_action_reports_full_queue_without_waiting() {
+        let net = SimulatedNet::new();
+        let io = net.start_io(1).await;
+        let node = SharedState::start(SharedStateConfig {
+            io,
+            my_address: 1,
+            can_lead: false,
+            initial_peers: Vec::new(),
+            initial_state: KvState::default(),
+            settings: fast_settings(),
+        })
+        .unwrap();
+
+        for i in 0..ACTION_QUEUE_CAPACITY {
+            node.try_submit_action((i as u64, i as u64)).unwrap();
+        }
+
+        assert!(matches!(node.try_submit_action((999, 999)), Err(TrySendError::Full((1, (999, 999))))));
     }
 
     #[tokio::test]

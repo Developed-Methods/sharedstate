@@ -59,7 +59,12 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcResponseHandler<A, D> {
             Self::ForwardedAction { target, source } => match response {
                 Ok(SyncResponse::Ok) => {}
                 Ok(response) => {
-                    tracing::warn!(?target, ?source, response = response.name(), "sync target rejected forwarded action");
+                    tracing::warn!(
+                        ?target,
+                        ?source,
+                        response = response.name(),
+                        "sync target rejected forwarded action"
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(?target, ?source, ?error, "failed to forward action to sync target");
@@ -119,23 +124,20 @@ where
         &self,
         peer: I::Address,
         source: I::Address,
+        ttl: u8,
         action: D::Action,
     ) -> Result<(), PeerRpcError> {
         self.enqueue_message(
             peer,
             RpcMessage {
-                request: SyncRequest::Action { source, action },
+                request: SyncRequest::Action { source, ttl, action },
                 response: RpcResponseHandler::ForwardedAction { target: peer, source },
             },
         )
         .await
     }
 
-    async fn enqueue_message(
-        &self,
-        peer: I::Address,
-        msg: RpcMessage<I::Address, D>,
-    ) -> Result<(), PeerRpcError> {
+    async fn enqueue_message(&self, peer: I::Address, msg: RpcMessage<I::Address, D>) -> Result<(), PeerRpcError> {
         let mut pending = Some(msg);
 
         loop {
@@ -328,14 +330,11 @@ where
         let connection = loop {
             /* connect gives no timing guarantee; bound it so a hanging
              * transport surfaces as a normal connect failure */
-            let connect_result = match tokio::time::timeout(settings.message_timeout, io.connect(&self.remote_addr)).await
-            {
-                Ok(result) => result,
-                Err(_) => Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "timed out connecting to peer",
-                )),
-            };
+            let connect_result =
+                match tokio::time::timeout(settings.message_timeout, io.connect(&self.remote_addr)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out connecting to peer")),
+                };
 
             match connect_result {
                 Ok(connection) => break connection,
@@ -624,6 +623,7 @@ mod tests {
         NetIoSettings {
             process_timeout: Duration::from_millis(100),
             message_timeout: Duration::from_secs(5),
+            max_frame_size: crate::protocol::framing::DEFAULT_MAX_FRAME_SIZE,
         }
     }
 
@@ -647,11 +647,25 @@ mod tests {
         let connections = PeerConnections::new(io.clone(), test_settings(), node_state());
 
         let first = connections
-            .enqueue_rpc(2, SyncRequest::Action { source: 1, action: 10 })
+            .enqueue_rpc(
+                2,
+                SyncRequest::Action {
+                    source: 1,
+                    ttl: 4,
+                    action: 10,
+                },
+            )
             .await
             .unwrap();
         let second = connections
-            .enqueue_rpc(2, SyncRequest::Action { source: 1, action: 20 })
+            .enqueue_rpc(
+                2,
+                SyncRequest::Action {
+                    source: 1,
+                    ttl: 4,
+                    action: 20,
+                },
+            )
             .await
             .unwrap();
 

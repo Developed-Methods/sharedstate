@@ -4,6 +4,8 @@ use message_encoding::{m_opt_sum, MessageEncoding};
 use serde::Serialize;
 use std::{collections::VecDeque, fmt::Debug};
 
+const DECODE_PREALLOC_LIMIT: usize = 4096;
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct RecoverableState<D: DeterministicState> {
     details: RecoverableStateDetails,
@@ -88,18 +90,6 @@ impl RecoverableStateDetails {
 
         self.generation += 1;
         self.id = new_id;
-    }
-
-    pub fn progress_recover(&mut self, seq: u64) -> bool {
-        while let Some(oldest) = self.history.front() {
-            if seq < oldest.next_sequence {
-                return false;
-            }
-
-            self.history.pop_front();
-        }
-
-        self.history.is_empty()
     }
 
     pub fn can_recover_follower(&self, follower: &RecoverableStateDetails) -> bool {
@@ -229,7 +219,7 @@ impl MessageEncoding for RecoverableStateDetails {
             inner_state_next_seq: MessageEncoding::read_from(read)?,
             history: {
                 let len = u64::read_from(read)? as usize;
-                let mut history = VecDeque::with_capacity(len);
+                let mut history = VecDeque::with_capacity(len.min(DECODE_PREALLOC_LIMIT));
 
                 for _ in 0..len {
                     history.push_back(RecovGenerationEnd::read_from(read)?);

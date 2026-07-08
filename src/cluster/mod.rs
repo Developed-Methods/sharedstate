@@ -23,6 +23,7 @@ mod tests {
             peer_connections::PeerConnections,
             peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
             rpc_server::RpcServer,
+            state_sync::QueuedAction,
         },
         protocol::messages::{ElectionTerm, LeaderState},
         state::{
@@ -69,7 +70,7 @@ mod tests {
         state: Arc<NodeState<u64, TestState>>,
         discovery: PeerDiscoveryTask<SimulatedIo, TestState>,
         leader: LeaderTask<u64, TestState>,
-        _actions_rx: mpsc::Receiver<(u64, u64)>,
+        _actions_rx: mpsc::Receiver<QueuedAction<u64, TestState>>,
     }
 
     impl TestNode {

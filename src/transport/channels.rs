@@ -1,11 +1,18 @@
-use std::time::Duration;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use message_encoding::MessageEncoding;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
-    protocol::framing::{read_message_opt, send_close_message, send_message, send_zero_message, ReadMessageResult},
+    protocol::framing::{
+        read_message_opt, send_close_message, send_message, send_zero_message, MessageSizeHeader, ReadMessageResult,
+        DEFAULT_MAX_FRAME_SIZE,
+    },
     transport::traits::SyncIO,
 };
 
@@ -13,6 +20,7 @@ use crate::{
 pub struct NetIoSettings {
     pub process_timeout: Duration,
     pub message_timeout: Duration,
+    pub max_frame_size: MessageSizeHeader,
 }
 
 impl Default for NetIoSettings {
@@ -20,6 +28,7 @@ impl Default for NetIoSettings {
         Self {
             process_timeout: Duration::from_secs(2),
             message_timeout: Duration::from_secs(12),
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
         }
     }
 }
@@ -51,6 +60,7 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> ReadChannel<I, M> {
                     &mut self.input,
                     self.settings.process_timeout,
                     Some(self.settings.message_timeout),
+                    self.settings.max_frame_size,
                 ) => read_opt_res,
                 _ = self.output.closed() => {
                     tracing::info!(remote = ?self.remote, "output closed, stopping read");
@@ -87,12 +97,29 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> ReadChannel<I, M> {
 
 const MIN_MESSAGE_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_MESSAGE_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_WRITE_BATCH_MESSAGES: usize = 256;
+
+struct DeferredFlush<'a, W>(&'a mut W);
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for DeferredFlush<'_, W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut *self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.0).poll_shutdown(cx)
+    }
+}
 
 impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
     pub async fn start(mut self) {
         let mut buffer = vec![0u8; 2048];
-        let keep_alive_msg_timeout = (self.settings.message_timeout / 3)
-            .clamp(MIN_MESSAGE_INTERVAL, MAX_MESSAGE_INTERVAL);
+        let keep_alive_msg_timeout =
+            (self.settings.message_timeout / 3).clamp(MIN_MESSAGE_INTERVAL, MAX_MESSAGE_INTERVAL);
 
         loop {
             tokio::task::yield_now().await;
@@ -130,7 +157,14 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
                 Some(msg) => {
                     tokio::time::timeout(
                         self.settings.process_timeout,
-                        send_message(&mut buffer, &msg, &mut self.output, self.settings.process_timeout),
+                        send_message_batch(
+                            &mut buffer,
+                            &mut self.input,
+                            &mut self.output,
+                            msg,
+                            self.settings.process_timeout,
+                            self.settings.max_frame_size,
+                        ),
                     )
                     .await
                 }
@@ -157,6 +191,33 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
             Err(error) => tracing::debug!(remote = ?self.remote, ?error, "timed out shutting down write"),
         }
     }
+}
+
+async fn send_message_batch<W, M>(
+    buffer: &mut Vec<u8>,
+    input: &mut Receiver<M>,
+    output: &mut W,
+    first: M,
+    process_timeout: Duration,
+    max_frame_size: MessageSizeHeader,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    M: MessageEncoding,
+{
+    {
+        let mut deferred = DeferredFlush(output);
+        send_message(buffer, &first, &mut deferred, process_timeout, max_frame_size).await?;
+
+        for _ in 1..MAX_WRITE_BATCH_MESSAGES {
+            let Ok(next) = input.try_recv() else {
+                break;
+            };
+            send_message(buffer, &next, &mut deferred, process_timeout, max_frame_size).await?;
+        }
+    }
+
+    output.flush().await
 }
 
 #[cfg(test)]
@@ -190,6 +251,7 @@ mod tests {
         NetIoSettings {
             process_timeout: Duration::from_secs(1),
             message_timeout: Duration::from_secs(1),
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
         }
     }
 

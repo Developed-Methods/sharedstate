@@ -1,4 +1,7 @@
-use std::{fmt::{Debug, Display}, num::NonZeroU64};
+use std::{
+    fmt::{Debug, Display},
+    num::NonZeroU64,
+};
 
 use message_encoding::MessageEncoding;
 
@@ -11,7 +14,8 @@ use crate::{
     utils::{now_ms, unknown_id_err, unknown_version_err},
 };
 
-pub const PROTOCOL_VERSION: u64 = 1;
+pub const PROTOCOL_VERSION: u64 = 2;
+const DECODE_PREALLOC_LIMIT: usize = 4096;
 
 pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
     ProtocolVersion(u64),
@@ -21,7 +25,7 @@ pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
 
     SubscribeFresh,
     SubscribeRecovery(RecoverableStateDetails),
-    Action { source: A, action: D::Action },
+    Action { source: A, ttl: u8, action: D::Action },
     LeaderQuery,
 }
 
@@ -60,9 +64,15 @@ impl ElectionTerm {
     }
 
     pub fn bump(self) -> Self {
+        self.bump_with_salt(0)
+    }
+
+    pub fn bump_with_salt(self, salt: u32) -> Self {
         let term = self.term();
+        debug_assert!(term < u32::MAX as u64, "election term number overflow");
         let epoch = now_ms();
-        ElectionTerm((term.saturating_add(1) << 32) | (epoch as u32 ^ (epoch >> 32) as u32) as u64)
+        let nonce = (epoch as u32 ^ (epoch >> 32) as u32) ^ salt;
+        ElectionTerm((term.saturating_add(1) << 32) | nonce as u64)
     }
 
     pub fn id(&self) -> u64 {
@@ -126,7 +136,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Debug for SyncRequest<A, D> {
             Self::LeaderInformation(info) => write!(f, "LeaderInformation({info:?})"),
             Self::SubscribeFresh => write!(f, "SubscribeFresh"),
             Self::SubscribeRecovery(details) => write!(f, "SubscribeRecovery({details:?})"),
-            Self::Action { source, .. } => write!(f, "Action(source: {source:?})"),
+            Self::Action { source, ttl, .. } => write!(f, "Action(source: {source:?}, ttl: {ttl})"),
             Self::LeaderQuery => write!(f, "LeaderQuery"),
         }
     }
@@ -190,9 +200,10 @@ where
                 sum += 5u16.write_to(out)?;
                 details.write_to(out)?
             }
-            Self::Action { source, action } => {
+            Self::Action { source, ttl, action } => {
                 sum += 6u16.write_to(out)?;
                 sum += source.write_to(out)?;
+                sum += ttl.write_to(out)?;
                 action.write_to(out)?
             }
             Self::LeaderQuery => 7u16.write_to(out)?,
@@ -211,6 +222,7 @@ where
             5 => Self::SubscribeRecovery(MessageEncoding::read_from(read)?),
             6 => Self::Action {
                 source: MessageEncoding::read_from(read)?,
+                ttl: MessageEncoding::read_from(read)?,
                 action: MessageEncoding::read_from(read)?,
             },
             7 => Self::LeaderQuery,
@@ -403,7 +415,7 @@ fn write_vec<T: MessageEncoding, W: std::io::Write>(v: &[T], out: &mut W) -> std
 
 fn read_vec<T: MessageEncoding, R: std::io::Read>(read: &mut R) -> std::io::Result<Vec<T>> {
     let count = u64::read_from(read)? as usize;
-    let mut vec = Vec::with_capacity(count);
+    let mut vec = Vec::with_capacity(count.min(DECODE_PREALLOC_LIMIT));
     for _ in 0..count {
         vec.push(MessageEncoding::read_from(read)?);
     }
@@ -503,6 +515,7 @@ mod tests {
             (
                 SyncRequest::Action {
                     source: 6,
+                    ttl: 4,
                     action: TestAction(7),
                 },
                 6,

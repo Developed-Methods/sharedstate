@@ -32,6 +32,15 @@ use crate::{
     utils::unique_state_id,
 };
 
+pub const DEFAULT_ACTION_FORWARD_TTL: u8 = 4;
+
+#[derive(Debug)]
+pub struct QueuedAction<A: SyncIOAddress, D: DeterministicState> {
+    pub source: A,
+    pub ttl: u8,
+    pub action: D::Action,
+}
+
 #[derive(Clone, Debug)]
 pub struct StateSyncTiming {
     /// How often the task re-checks the node's leader state while working.
@@ -54,7 +63,7 @@ pub struct StateSyncTask<I: SyncIO, D: DeterministicState> {
     peer_connections: Arc<PeerConnections<I, D>>,
     io: Arc<I>,
     settings: NetIoSettings,
-    actions_rx: Receiver<(I::Address, D::Action)>,
+    actions_rx: Receiver<QueuedAction<I::Address, D>>,
     handle: StateHandle<D>,
     timing: StateSyncTiming,
 }
@@ -68,7 +77,9 @@ enum SyncAttempt {
     /// Could not establish a subscription with the target.
     Unreachable,
     /// A subscription ran and ended; the leader state should be re-checked.
-    Finished { applied_actions: bool },
+    Finished {
+        applied_actions: bool,
+    },
     /// The leader changed while streaming; re-check immediately.
     LeaderChanged,
     Shutdown,
@@ -86,7 +97,7 @@ where
         peer_connections: Arc<PeerConnections<I, D>>,
         io: Arc<I>,
         settings: NetIoSettings,
-        actions_rx: Receiver<(I::Address, D::Action)>,
+        actions_rx: Receiver<QueuedAction<I::Address, D>>,
         timing: StateSyncTiming,
     ) -> Self {
         let handle = state.state.create_handle();
@@ -137,14 +148,14 @@ where
         loop {
             tokio::select! {
                 action = self.actions_rx.recv() => {
-                    let Some((source, action)) = action else {
+                    let Some(QueuedAction { source, ttl, action }) = action else {
                         return Flow::Shutdown;
                     };
 
                     let current = self.state.leader_state.lock().await.mode.clone();
                     if let LeaderMode::Following { leader } = current {
                         tracing::info!(?leader, "no longer leading, forwarding queued action to new leader");
-                        self.forward_action(leader, source, action).await;
+                        self.forward_action(leader, source, ttl, action).await;
                         return Flow::Continue;
                     }
                     if !matches!(current, LeaderMode::Leading) {
@@ -188,7 +199,8 @@ where
 
         for relay in self.relay_candidates(leader).await {
             match self.peer_connections.query_leader(relay).await {
-                Ok(state) if matches!(&state.mode, LeaderMode::Following { leader: relayed } if *relayed == leader) => {}
+                Ok(state) if matches!(&state.mode, LeaderMode::Following { leader: relayed } if *relayed == leader) => {
+                }
                 Ok(state) => {
                     tracing::debug!(?relay, ?state, "relay candidate does not follow our leader, skipping");
                     continue;
@@ -229,6 +241,14 @@ where
         let mut candidates = peers
             .values()
             .filter(|peer| peer.addr != leader && peer.addr != self.state.my_address)
+            .filter(|peer| {
+                peer.leader_info
+                    .as_ref()
+                    .is_none_or(|info| {
+                        info.reachable_voters.contains(&leader)
+                            || matches!(&info.leader_state.mode, LeaderMode::Following { leader: followed } if *followed == leader)
+                    })
+            })
             .map(|peer| (peer.connect_status.is_connected(), peer.addr))
             .collect::<Vec<_>>();
         drop(peers);
@@ -309,6 +329,14 @@ where
                 match recv(read, timeout).await? {
                     SyncResponse::FreshState(fresh) => {
                         let next_seq = fresh.details().next_seq();
+                        if local_next_seq > 1 {
+                            tracing::warn!(
+                                ?target,
+                                discarded_local_next_seq = local_next_seq,
+                                replacement_next_seq = next_seq,
+                                "resetting from fresh snapshot; local lineage actions may be discarded"
+                            );
+                        }
                         self.state.state.reset(fresh).await;
                         tracing::info!(?target, next_seq, "reset local state from fresh snapshot");
                         Ok(next_seq)
@@ -354,7 +382,7 @@ where
                     }
                 },
                 action = self.actions_rx.recv() => {
-                    let Some((source, action)) = action else {
+                    let Some(QueuedAction { source, ttl, action }) = action else {
                         return SyncAttempt::Shutdown;
                     };
                     let current = self.state.leader_state.lock().await.mode.clone();
@@ -363,7 +391,7 @@ where
                         self.drop_queued_actions();
                         return SyncAttempt::LeaderChanged;
                     }
-                    self.forward_action(target, source, action).await;
+                    self.forward_action(target, source, ttl, action).await;
                 }
                 _ = tokio::time::sleep(self.timing.leader_poll_interval) => {
                     let current = self.state.leader_state.lock().await.mode.clone();
@@ -378,13 +406,24 @@ where
     }
 
     fn drop_queued_actions(&mut self) {
-        while self.actions_rx.try_recv().is_ok() {}
+        let mut dropped = 0usize;
+        while self.actions_rx.try_recv().is_ok() {
+            dropped += 1;
+        }
+        if dropped > 0 {
+            tracing::warn!(dropped, "discarded queued actions after leader change");
+        }
     }
 
-    async fn forward_action(&self, target: I::Address, source: I::Address, action: D::Action) {
+    async fn forward_action(&self, target: I::Address, source: I::Address, ttl: u8, action: D::Action) {
+        let Some(ttl) = ttl.checked_sub(1) else {
+            tracing::warn!(?target, ?source, "dropping forwarded action after TTL expired");
+            return;
+        };
+
         match self
             .peer_connections
-            .enqueue_forwarded_action(target, source, action)
+            .enqueue_forwarded_action(target, source, ttl, action)
             .await
         {
             Ok(()) => {}
@@ -422,10 +461,9 @@ fn expect_ok<A: SyncIOAddress, D: DeterministicState>(
 ) -> std::io::Result<()> {
     match response {
         SyncResponse::Ok => Ok(()),
-        response => Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("expected Ok during {step}, got {}", response.name()),
-        )),
+        response => {
+            Err(Error::new(ErrorKind::InvalidData, format!("expected Ok during {step}, got {}", response.name())))
+        }
     }
 }
 
@@ -490,6 +528,7 @@ mod tests {
         NetIoSettings {
             process_timeout: Duration::from_millis(100),
             message_timeout: Duration::from_millis(250),
+            max_frame_size: crate::protocol::framing::DEFAULT_MAX_FRAME_SIZE,
         }
     }
 
@@ -520,7 +559,7 @@ mod tests {
     fn start_task<I: SyncIO<Address = u64>>(
         state: &Arc<NodeState<u64, TestState>>,
         io: &Arc<I>,
-    ) -> mpsc::Sender<(u64, u64)> {
+    ) -> mpsc::Sender<QueuedAction<u64, TestState>> {
         let connections = Arc::new(PeerConnections::new(io.clone(), test_settings(), state.clone()));
         let (actions_tx, actions_rx) = mpsc::channel(16);
         tokio::spawn(
@@ -581,11 +620,15 @@ mod tests {
         .await;
 
         /* and it must apply queued actions with local authority */
-        actions_tx.send((1, 42)).await.unwrap();
-        wait_until("an action applied with local authority", || {
-            handle.read_with(|state| state.state().0) == 1
-        })
-        .await;
+        actions_tx
+            .send(QueuedAction {
+                source: 1,
+                ttl: DEFAULT_ACTION_FORWARD_TTL,
+                action: 42,
+            })
+            .await
+            .unwrap();
+        wait_until("an action applied with local authority", || handle.read_with(|state| state.state().0) == 1).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -595,11 +638,7 @@ mod tests {
         let _actions_tx = start_task(&state, &io);
 
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(
-            io.connects.load(Ordering::SeqCst),
-            0,
-            "the sync task must not subscribe to its own address"
-        );
+        assert_eq!(io.connects.load(Ordering::SeqCst), 0, "the sync task must not subscribe to its own address");
 
         /* the task must still be responsive to leader changes */
         *state.leader_state.lock().await = LeaderState {

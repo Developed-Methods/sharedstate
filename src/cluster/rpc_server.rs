@@ -8,7 +8,10 @@ use tokio::{
 };
 
 use crate::{
-    cluster::node_state::{NodeState, PeerState},
+    cluster::{
+        node_state::{NodeState, PeerState},
+        state_sync::QueuedAction,
+    },
     protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         deterministic_state::DeterministicState,
@@ -22,11 +25,11 @@ use crate::{
 
 pub struct RpcServer<A: SyncIOAddress, D: DeterministicState> {
     state: Arc<NodeState<A, D>>,
-    actions_tx: Sender<(A, D::Action)>,
+    actions_tx: Sender<QueuedAction<A, D>>,
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
-    pub fn new(state: Arc<NodeState<A, D>>, actions_tx: Sender<(A, D::Action)>) -> Self {
+    pub fn new(state: Arc<NodeState<A, D>>, actions_tx: Sender<QueuedAction<A, D>>) -> Self {
         RpcServer { state, actions_tx }
     }
 
@@ -39,8 +42,11 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
             SyncRequest::ProtocolVersion(_) => SyncResponse::UnexpectedRequest,
             SyncRequest::MyAddress(_) => SyncResponse::UnexpectedRequest,
 
-            SyncRequest::Action { source, action } => {
-                if self.actions_tx.send((source, action)).await.is_ok() {
+            SyncRequest::Action { source, ttl, action } => {
+                if ttl == 0 {
+                    tracing::warn!(?source, "dropping forwarded action with exhausted ttl");
+                    SyncResponse::FailedToQueueAction { source }
+                } else if self.actions_tx.send(QueuedAction { source, ttl, action }).await.is_ok() {
                     SyncResponse::Ok
                 } else {
                     SyncResponse::FailedToQueueAction { source }
