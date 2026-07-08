@@ -1,7 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::watch;
 
 use crate::{
     state::{deterministic_state::DeterministicState, subscribable_state::SubscribableState},
@@ -10,7 +9,7 @@ use crate::{
 
 pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
     pub my_address: A,
-    pub leader_address: A,
+    pub leader_address: watch::Receiver<A>,
     pub state: SubscribableState<D>,
     connected_to_leader: AtomicBool,
 }
@@ -20,8 +19,8 @@ where
     A: SyncIOAddress,
     D: DeterministicState,
 {
-    pub fn new(my_address: A, leader_address: A, state: SubscribableState<D>) -> Self {
-        let is_leader = my_address == leader_address;
+    pub fn new(my_address: A, leader_address: watch::Receiver<A>, state: SubscribableState<D>) -> Self {
+        let is_leader = my_address == *leader_address.borrow();
         Self {
             my_address,
             leader_address,
@@ -30,8 +29,12 @@ where
         }
     }
 
+    pub fn leader_address(&self) -> A {
+        *self.leader_address.borrow()
+    }
+
     pub fn is_leader(&self) -> bool {
-        self.my_address == self.leader_address
+        self.my_address == self.leader_address()
     }
 
     pub fn is_connected_to_leader(&self) -> bool {

@@ -1,4 +1,4 @@
-//! Drives the local deterministic state from a fixed leader address.
+//! Drives the local deterministic state from the current leader address.
 
 use std::{
     io::{Error, ErrorKind},
@@ -8,8 +8,10 @@ use std::{
 };
 
 use message_encoding::MessageEncoding;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{
+    mpsc::{Receiver, Sender},
+    watch,
+};
 
 use crate::{
     cluster::node_state::NodeState,
@@ -42,11 +44,14 @@ pub struct StateSyncTask<I: SyncIO, D: DeterministicState> {
     settings: NetIoSettings,
     actions_rx: Receiver<D::Action>,
     handle: StateHandle<D>,
+    leader_address: watch::Receiver<I::Address>,
+    leader_updates_open: bool,
     timing: StateSyncTiming,
 }
 
 enum SyncFlow {
     Retry,
+    RoleChanged,
     Shutdown,
 }
 
@@ -65,32 +70,51 @@ where
         timing: StateSyncTiming,
     ) -> Self {
         let handle = state.state.create_handle();
+        let leader_address = state.leader_address.clone();
         Self {
             state,
             io,
             settings,
             actions_rx,
             handle,
+            leader_address,
+            leader_updates_open: true,
             timing,
         }
     }
 
     pub async fn run(mut self) {
-        if self.state.is_leader() {
-            self.lead().await;
-            return;
-        }
-
         loop {
+            if self.is_leader() {
+                match self.lead().await {
+                    SyncFlow::RoleChanged | SyncFlow::Retry => continue,
+                    SyncFlow::Shutdown => return,
+                }
+            }
+
             self.state.set_connected_to_leader(false);
             match self.follow().await {
-                SyncFlow::Retry => tokio::time::sleep(self.timing.retry_delay).await,
+                SyncFlow::RoleChanged => continue,
+                SyncFlow::Retry => {
+                    if self.leader_updates_open {
+                        tokio::select! {
+                            _ = tokio::time::sleep(self.timing.retry_delay) => {}
+                            changed = self.leader_address.changed() => {
+                                if changed.is_err() {
+                                    self.leader_updates_open = false;
+                                }
+                            }
+                        }
+                    } else {
+                        tokio::time::sleep(self.timing.retry_delay).await;
+                    }
+                }
                 SyncFlow::Shutdown => return,
             }
         }
     }
 
-    async fn lead(&mut self) {
+    async fn lead(&mut self) -> SyncFlow {
         let new_id = unique_state_id(&self.state.my_address);
         self.state
             .state
@@ -99,25 +123,67 @@ where
         self.state.set_connected_to_leader(true);
         tracing::info!("running as shared-state leader");
 
-        while let Some(action) = self.actions_rx.recv().await {
-            let authority = self
-                .handle
-                .read_with(move |state| state.authority(RecoverableStateAction::StateAction { action }));
-            self.state.state.update(iter::once(authority)).await;
+        loop {
+            tokio::select! {
+                action = self.actions_rx.recv() => {
+                    let Some(action) = action else {
+                        return SyncFlow::Shutdown;
+                    };
+                    let authority = self
+                        .handle
+                        .read_with(move |state| state.authority(RecoverableStateAction::StateAction { action }));
+                    self.state.state.update(iter::once(authority)).await;
+                }
+                changed = self.leader_address.changed(), if self.leader_updates_open => {
+                    if changed.is_err() {
+                        self.leader_updates_open = false;
+                    } else if !self.is_leader() {
+                        tracing::info!(leader = ?self.current_leader(), "shared-state leadership revoked");
+                        self.state.set_connected_to_leader(false);
+                        return SyncFlow::RoleChanged;
+                    }
+                }
+            }
         }
     }
 
     async fn follow(&mut self) -> SyncFlow {
-        let leader = self.state.leader_address;
-        let connection = match tokio::time::timeout(self.settings.message_timeout, self.io.connect(&leader)).await {
-            Ok(Ok(connection)) => connection,
-            Ok(Err(error)) => {
-                tracing::debug!(?leader, ?error, "failed to connect to leader");
-                return SyncFlow::Retry;
+        let leader = self.current_leader();
+        let connect = tokio::time::timeout(self.settings.message_timeout, self.io.connect(&leader));
+        let connection = if self.leader_updates_open {
+            tokio::select! {
+                result = connect => match result {
+                    Ok(Ok(connection)) => connection,
+                    Ok(Err(error)) => {
+                        tracing::debug!(?leader, ?error, "failed to connect to leader");
+                        return SyncFlow::Retry;
+                    }
+                    Err(_) => {
+                        tracing::debug!(?leader, "timed out connecting to leader");
+                        return SyncFlow::Retry;
+                    }
+                },
+                changed = self.leader_address.changed() => {
+                    if changed.is_err() {
+                        self.leader_updates_open = false;
+                    } else if self.is_leader() {
+                        tracing::info!("shared-state leadership granted");
+                        return SyncFlow::RoleChanged;
+                    }
+                    return SyncFlow::Retry;
+                }
             }
-            Err(_) => {
-                tracing::debug!(?leader, "timed out connecting to leader");
-                return SyncFlow::Retry;
+        } else {
+            match connect.await {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(error)) => {
+                    tracing::debug!(?leader, ?error, "failed to connect to leader");
+                    return SyncFlow::Retry;
+                }
+                Err(_) => {
+                    tracing::debug!(?leader, "timed out connecting to leader");
+                    return SyncFlow::Retry;
+                }
             }
         };
 
@@ -163,8 +229,24 @@ where
                         return SyncFlow::Retry;
                     }
                 }
+                changed = self.leader_address.changed(), if self.leader_updates_open => {
+                    if changed.is_err() {
+                        self.leader_updates_open = false;
+                    } else if self.is_leader() {
+                        tracing::info!("shared-state leadership granted");
+                        return SyncFlow::RoleChanged;
+                    }
+                }
             }
         }
+    }
+
+    fn current_leader(&self) -> I::Address {
+        *self.leader_address.borrow()
+    }
+
+    fn is_leader(&self) -> bool {
+        self.state.my_address == self.current_leader()
     }
 
     async fn subscribe(

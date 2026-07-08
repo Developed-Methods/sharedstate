@@ -9,13 +9,16 @@ use std::{
 
 use message_encoding::MessageEncoding;
 use sharedstate::{
-    state::deterministic_state::DeterministicState,
+    state::{deterministic_state::DeterministicState, recoverable_state::RecoverableState},
     transport::traits::{SyncConnection, SyncIO, SyncIOListener},
     SharedState, SharedStateConfig, SharedStateSettings,
 };
-use tokio::net::{
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
-    TcpListener, TcpStream,
+use tokio::{
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpListener, TcpStream,
+    },
+    sync::watch,
 };
 
 #[derive(Clone)]
@@ -110,12 +113,20 @@ impl MessageEncoding for KvState {
 }
 
 async fn start_node(io: LocalhostTcpIo, leader_address: u16) -> SharedState<LocalhostTcpIo, KvState> {
+    let (_leader_tx, leader_rx) = watch::channel(leader_address);
+    start_node_with_leader_rx(io, leader_rx).await
+}
+
+async fn start_node_with_leader_rx(
+    io: LocalhostTcpIo,
+    leader_address: watch::Receiver<u16>,
+) -> SharedState<LocalhostTcpIo, KvState> {
     let my_address = io.address;
     SharedState::start(SharedStateConfig {
         io: Arc::new(io),
         my_address,
         leader_address,
-        initial_state: KvState::default(),
+        initial_state: RecoverableState::new(my_address as u64, KvState::default()),
         settings: SharedStateSettings::default(),
     })
     .unwrap()
@@ -129,6 +140,34 @@ async fn wait_for_value(node: &SharedState<LocalhostTcpIo, KvState>, key: &str, 
             return;
         }
         assert!(Instant::now() < deadline, "timed out waiting for node {} to see {key}={value}", node.my_address(),);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_missing(node: &SharedState<LocalhostTcpIo, KvState>, key: &str, timeout: Duration) {
+    let mut handle = node.state_handle();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if handle.read_with(|state| !state.state().values.contains_key(key)) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for node {} to remove {key}", node.my_address(),);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_accept_seq(node: &SharedState<LocalhostTcpIo, KvState>, min_seq: u64, timeout: Duration) {
+    let mut handle = node.state_handle();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if handle.read_with(|state| state.accept_seq() >= min_seq) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for node {} to reach accept sequence {min_seq}",
+            node.my_address(),
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -164,4 +203,58 @@ async fn follower_actions_apply_through_fixed_leader_over_tcp() {
         .await
         .unwrap();
     wait_for_value(&follower, "from-leader", "2", Duration::from_secs(10)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn node_switches_between_following_and_leading_when_leader_address_changes() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init();
+
+    let original_leader_io = LocalhostTcpIo::bind_ephemeral().await.unwrap();
+    let switching_io = LocalhostTcpIo::bind_ephemeral().await.unwrap();
+    let original_leader_address = original_leader_io.address;
+    let switching_address = switching_io.address;
+
+    let original_leader = start_node(original_leader_io, original_leader_address).await;
+    let (leader_tx, leader_rx) = watch::channel(original_leader_address);
+    let switching = start_node_with_leader_rx(switching_io, leader_rx).await;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !switching.is_connected_to_leader() {
+        assert!(Instant::now() < deadline, "switching node never connected to original leader");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!switching.is_leader());
+
+    leader_tx.send(switching_address).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !switching.is_leader() {
+        assert!(Instant::now() < deadline, "switching node never became leader");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    wait_for_accept_seq(&switching, 3, Duration::from_secs(10)).await;
+
+    switching
+        .submit_action(("while-leader".to_owned(), "1".to_owned()))
+        .await
+        .unwrap();
+    wait_for_value(&switching, "while-leader", "1", Duration::from_secs(10)).await;
+
+    leader_tx.send(original_leader_address).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while switching.is_leader() {
+        assert!(Instant::now() < deadline, "switching node never stepped down");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    wait_for_missing(&switching, "while-leader", Duration::from_secs(10)).await;
+
+    switching
+        .submit_action(("after-step-down".to_owned(), "2".to_owned()))
+        .await
+        .unwrap();
+    wait_for_value(&original_leader, "after-step-down", "2", Duration::from_secs(10)).await;
+    wait_for_value(&switching, "after-step-down", "2", Duration::from_secs(10)).await;
 }

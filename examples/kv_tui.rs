@@ -22,7 +22,9 @@ use ratatui::{
 };
 use sharedstate::{
     cluster::node_state::NodeState,
-    state::{deterministic_state::DeterministicState, subscribable_state::StateHandle},
+    state::{
+        deterministic_state::DeterministicState, recoverable_state::RecoverableState, subscribable_state::StateHandle,
+    },
     transport::traits::{SyncConnection, SyncIO, SyncIOListener},
     SharedState, SharedStateConfig, SharedStateSettings,
 };
@@ -387,19 +389,18 @@ async fn main() -> io::Result<()> {
     let io = Arc::new(LocalhostTcpIo::bind_ephemeral().await?);
     let local_address = io.address;
 
+    let leader_address = args.leader.unwrap_or(local_address);
+    let (_leader_tx, leader_rx) = tokio::sync::watch::channel(leader_address);
     let shared = SharedState::start(SharedStateConfig {
         io,
         my_address: local_address,
-        leader_address: args.leader.unwrap_or(local_address),
-        initial_state: KvStore::new(),
+        leader_address: leader_rx,
+        initial_state: RecoverableState::new(local_address as u64, KvStore::new()),
         settings: SharedStateSettings::default(),
     })
     .map_err(|error| Error::other(format!("failed to start shared state: {error:?}")))?;
 
-    let _ = log_tx.send(format!(
-        "listening on 127.0.0.1:{local_address} leader=127.0.0.1:{}",
-        args.leader.unwrap_or(local_address)
-    ));
+    let _ = log_tx.send(format!("listening on 127.0.0.1:{local_address} leader=127.0.0.1:{}", leader_address));
     let _ = log_tx.send(COMMAND_HELP.to_owned());
 
     let mut state_handle = shared.state_handle();
@@ -559,7 +560,7 @@ async fn build_summary(state: &NodeState<u16, KvStore>, state_handle: &mut State
 
     let mut lines = vec![
         format!("address: 127.0.0.1:{}", state.my_address),
-        format!("leader: 127.0.0.1:{} ({})", state.leader_address, if state.is_leader() { "self" } else { "remote" }),
+        format!("leader: 127.0.0.1:{} ({})", state.leader_address(), if state.is_leader() { "self" } else { "remote" }),
         format!(
             "leader connection: {}",
             if state.is_connected_to_leader() {

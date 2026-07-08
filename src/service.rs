@@ -5,7 +5,7 @@ use std::sync::Arc;
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedBroadcastSettings, SettingsError};
 use tokio::{
-    sync::{mpsc, mpsc::error::SendError},
+    sync::{mpsc, mpsc::error::SendError, watch},
     task::JoinHandle,
 };
 
@@ -26,7 +26,7 @@ use crate::{
 pub struct SharedStateConfig<I: SyncIOListener, D: DeterministicState> {
     pub io: Arc<I>,
     pub my_address: I::Address,
-    pub leader_address: I::Address,
+    pub leader_address: watch::Receiver<I::Address>,
     pub initial_state: RecoverableState<D>,
     pub settings: SharedStateSettings,
 }
@@ -86,7 +86,7 @@ where
     }
 
     pub fn leader_address(&self) -> I::Address {
-        self.node.leader_address
+        self.node.leader_address()
     }
 
     pub fn is_leader(&self) -> bool {
