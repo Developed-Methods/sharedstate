@@ -32,12 +32,11 @@ use crate::{
     utils::unique_state_id,
 };
 
-pub const DEFAULT_ACTION_FORWARD_TTL: u8 = 4;
+pub const MAX_ACTION_FORWARD_PATH_LEN: usize = 32;
 
 #[derive(Debug)]
 pub struct QueuedAction<A: SyncIOAddress, D: DeterministicState> {
-    pub source: A,
-    pub ttl: u8,
+    pub path: Vec<A>,
     pub action: D::Action,
 }
 
@@ -148,14 +147,14 @@ where
         loop {
             tokio::select! {
                 action = self.actions_rx.recv() => {
-                    let Some(QueuedAction { source, ttl, action }) = action else {
+                    let Some(QueuedAction { path, action }) = action else {
                         return Flow::Shutdown;
                     };
 
                     let current = self.state.leader_state.lock().await.mode.clone();
                     if let LeaderMode::Following { leader } = current {
                         tracing::info!(?leader, "no longer leading, forwarding queued action to new leader");
-                        self.forward_action(leader, source, ttl, action).await;
+                        self.forward_action(leader, path, action).await;
                         return Flow::Continue;
                     }
                     if !matches!(current, LeaderMode::Leading) {
@@ -167,7 +166,7 @@ where
                         .handle
                         .read_with(move |state| state.authority(RecoverableStateAction::StateAction { action }));
                     self.state.state.update(iter::once(authority)).await;
-                    tracing::debug!(?source, "applied action with local authority");
+                    tracing::debug!(?path, "applied action with local authority");
                 }
                 _ = tokio::time::sleep(self.timing.leader_poll_interval) => {
                     if !matches!(self.state.leader_state.lock().await.mode, LeaderMode::Leading) {
@@ -382,7 +381,7 @@ where
                     }
                 },
                 action = self.actions_rx.recv() => {
-                    let Some(QueuedAction { source, ttl, action }) = action else {
+                    let Some(QueuedAction { path, action }) = action else {
                         return SyncAttempt::Shutdown;
                     };
                     let current = self.state.leader_state.lock().await.mode.clone();
@@ -391,7 +390,7 @@ where
                         self.drop_queued_actions();
                         return SyncAttempt::LeaderChanged;
                     }
-                    self.forward_action(target, source, ttl, action).await;
+                    self.forward_action(target, path, action).await;
                 }
                 _ = tokio::time::sleep(self.timing.leader_poll_interval) => {
                     let current = self.state.leader_state.lock().await.mode.clone();
@@ -415,20 +414,38 @@ where
         }
     }
 
-    async fn forward_action(&self, target: I::Address, source: I::Address, ttl: u8, action: D::Action) {
-        let Some(ttl) = ttl.checked_sub(1) else {
-            tracing::warn!(?target, ?source, "dropping forwarded action after TTL expired");
+    async fn forward_action(&self, target: I::Address, mut path: Vec<I::Address>, action: D::Action) {
+        if path.contains(&target) {
+            tracing::warn!(?target, ?path, "dropping forwarded action because target is already in path");
             return;
-        };
+        }
+
+        if path.contains(&self.state.my_address) && path.last() != Some(&self.state.my_address) {
+            tracing::warn!(?target, ?path, "dropping forwarded action because local node appears earlier in path");
+            return;
+        }
+
+        if path.last() != Some(&self.state.my_address) {
+            if path.len() >= MAX_ACTION_FORWARD_PATH_LEN {
+                tracing::warn!(?target, ?path, "dropping forwarded action because path is too long");
+                return;
+            }
+            path.push(self.state.my_address);
+        }
+
+        if path.len() > MAX_ACTION_FORWARD_PATH_LEN {
+            tracing::warn!(?target, ?path, "dropping forwarded action because path is too long");
+            return;
+        }
 
         match self
             .peer_connections
-            .enqueue_forwarded_action(target, source, ttl, action)
+            .enqueue_forwarded_action(target, path, action)
             .await
         {
             Ok(()) => {}
             Err(error) => {
-                tracing::warn!(?target, ?source, ?error, "failed to forward action to sync target");
+                tracing::warn!(?target, ?error, "failed to forward action to sync target");
             }
         }
     }
@@ -622,8 +639,7 @@ mod tests {
         /* and it must apply queued actions with local authority */
         actions_tx
             .send(QueuedAction {
-                source: 1,
-                ttl: DEFAULT_ACTION_FORWARD_TTL,
+                path: vec![1],
                 action: 42,
             })
             .await

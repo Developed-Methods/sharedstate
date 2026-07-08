@@ -14,7 +14,7 @@ use crate::{
     utils::{now_ms, unknown_id_err, unknown_version_err},
 };
 
-pub const PROTOCOL_VERSION: u64 = 2;
+pub const PROTOCOL_VERSION: u64 = 3;
 const DECODE_PREALLOC_LIMIT: usize = 4096;
 
 pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
@@ -25,7 +25,7 @@ pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
 
     SubscribeFresh,
     SubscribeRecovery(RecoverableStateDetails),
-    Action { source: A, ttl: u8, action: D::Action },
+    Action { path: Vec<A>, action: D::Action },
     LeaderQuery,
 }
 
@@ -136,7 +136,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Debug for SyncRequest<A, D> {
             Self::LeaderInformation(info) => write!(f, "LeaderInformation({info:?})"),
             Self::SubscribeFresh => write!(f, "SubscribeFresh"),
             Self::SubscribeRecovery(details) => write!(f, "SubscribeRecovery({details:?})"),
-            Self::Action { source, ttl, .. } => write!(f, "Action(source: {source:?}, ttl: {ttl})"),
+            Self::Action { path, .. } => write!(f, "Action(path: {path:?})"),
             Self::LeaderQuery => write!(f, "LeaderQuery"),
         }
     }
@@ -144,7 +144,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Debug for SyncRequest<A, D> {
 
 pub enum SyncResponse<A: SyncIOAddress, D: DeterministicState> {
     Ok,
-    FailedToQueueAction { source: A },
+    FailedToQueueAction { path: Vec<A> },
     Peers(Vec<SharePeerDetails<A>>),
     Accepted(u64),
     RecoveryFailed,
@@ -200,10 +200,9 @@ where
                 sum += 5u16.write_to(out)?;
                 details.write_to(out)?
             }
-            Self::Action { source, ttl, action } => {
+            Self::Action { path, action } => {
                 sum += 6u16.write_to(out)?;
-                sum += source.write_to(out)?;
-                sum += ttl.write_to(out)?;
+                sum += write_vec(path, out)?;
                 action.write_to(out)?
             }
             Self::LeaderQuery => 7u16.write_to(out)?,
@@ -221,8 +220,7 @@ where
             4 => Self::SubscribeFresh,
             5 => Self::SubscribeRecovery(MessageEncoding::read_from(read)?),
             6 => Self::Action {
-                source: MessageEncoding::read_from(read)?,
-                ttl: MessageEncoding::read_from(read)?,
+                path: read_vec(read)?,
                 action: MessageEncoding::read_from(read)?,
             },
             7 => Self::LeaderQuery,
@@ -353,9 +351,9 @@ where
         let mut sum = 0;
         sum += match self {
             Self::Ok => 0u16.write_to(out)?,
-            Self::FailedToQueueAction { source } => {
+            Self::FailedToQueueAction { path } => {
                 sum += 1u16.write_to(out)?;
-                source.write_to(out)?
+                write_vec(path, out)?
             }
             Self::Peers(peers) => {
                 sum += 2u16.write_to(out)?;
@@ -389,9 +387,7 @@ where
     fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
         Ok(match u16::read_from(read)? {
             0 => Self::Ok,
-            1 => Self::FailedToQueueAction {
-                source: MessageEncoding::read_from(read)?,
-            },
+            1 => Self::FailedToQueueAction { path: read_vec(read)? },
             2 => Self::Peers(read_vec(read)?),
             3 => Self::Accepted(MessageEncoding::read_from(read)?),
             4 => Self::RecoveryFailed,
@@ -514,8 +510,7 @@ mod tests {
             (SyncRequest::SubscribeRecovery(RecoverableStateDetails::new(4, 5)), 5),
             (
                 SyncRequest::Action {
-                    source: 6,
-                    ttl: 4,
+                    path: vec![6, 7],
                     action: TestAction(7),
                 },
                 6,
@@ -532,7 +527,7 @@ mod tests {
     fn sync_response_tags_are_canonical() {
         let cases: Vec<(SyncResponse<u64, TestState>, u16)> = vec![
             (SyncResponse::Ok, 0),
-            (SyncResponse::FailedToQueueAction { source: 2 }, 1),
+            (SyncResponse::FailedToQueueAction { path: vec![2, 3] }, 1),
             (SyncResponse::Peers(vec![SharePeerDetails::from(3)]), 2),
             (SyncResponse::Accepted(6), 3),
             (SyncResponse::RecoveryFailed, 4),

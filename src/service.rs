@@ -24,7 +24,7 @@ use crate::{
         peer_connections::PeerConnections,
         peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
         rpc_server::RpcServer,
-        state_sync::{QueuedAction, StateSyncTask, StateSyncTiming, DEFAULT_ACTION_FORWARD_TTL},
+        state_sync::{QueuedAction, StateSyncTask, StateSyncTiming},
     },
     protocol::messages::{ElectionTerm, LeaderMode, LeaderState},
     state::{
@@ -179,28 +179,26 @@ where
     /// periods or network partitions that wait can be unbounded. Latency
     /// sensitive callers should use [`SharedState::try_submit_action`] or wrap
     /// this call in a timeout.
-    pub async fn submit_action(&self, action: D::Action) -> Result<(), SendError<(I::Address, D::Action)>> {
+    pub async fn submit_action(&self, action: D::Action) -> Result<(), SendError<(Vec<I::Address>, D::Action)>> {
         self.actions_tx
             .send(QueuedAction {
-                source: self.node.my_address,
-                ttl: DEFAULT_ACTION_FORWARD_TTL,
+                path: vec![self.node.my_address],
                 action,
             })
             .await
-            .map_err(|error| SendError((error.0.source, error.0.action)))
+            .map_err(|error| SendError((error.0.path, error.0.action)))
     }
 
     /// Attempts to queue an action without waiting for queue capacity.
-    pub fn try_submit_action(&self, action: D::Action) -> Result<(), TrySendError<(I::Address, D::Action)>> {
+    pub fn try_submit_action(&self, action: D::Action) -> Result<(), TrySendError<(Vec<I::Address>, D::Action)>> {
         self.actions_tx
             .try_send(QueuedAction {
-                source: self.node.my_address,
-                ttl: DEFAULT_ACTION_FORWARD_TTL,
+                path: vec![self.node.my_address],
                 action,
             })
             .map_err(|error| match error {
-                TrySendError::Full(queued) => TrySendError::Full((queued.source, queued.action)),
-                TrySendError::Closed(queued) => TrySendError::Closed((queued.source, queued.action)),
+                TrySendError::Full(queued) => TrySendError::Full((queued.path, queued.action)),
+                TrySendError::Closed(queued) => TrySendError::Closed((queued.path, queued.action)),
             })
     }
 
@@ -526,7 +524,10 @@ mod tests {
             node.try_submit_action((i as u64, i as u64)).unwrap();
         }
 
-        assert!(matches!(node.try_submit_action((999, 999)), Err(TrySendError::Full((1, (999, 999))))));
+        assert!(matches!(
+            node.try_submit_action((999, 999)),
+            Err(TrySendError::Full((path, (999, 999)))) if path == vec![1]
+        ));
     }
 
     #[tokio::test]

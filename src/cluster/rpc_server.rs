@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::SequencedReceiver;
@@ -42,14 +42,15 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
             SyncRequest::ProtocolVersion(_) => SyncResponse::UnexpectedRequest,
             SyncRequest::MyAddress(_) => SyncResponse::UnexpectedRequest,
 
-            SyncRequest::Action { source, ttl, action } => {
-                if ttl == 0 {
-                    tracing::warn!(?source, "dropping forwarded action with exhausted ttl");
-                    SyncResponse::FailedToQueueAction { source }
-                } else if self.actions_tx.send(QueuedAction { source, ttl, action }).await.is_ok() {
-                    SyncResponse::Ok
+            SyncRequest::Action { path, action } => {
+                if !valid_forward_path(peer_addr, self.state.my_address, &path) {
+                    tracing::warn!(?peer_addr, ?path, "rejecting forwarded action with invalid path");
+                    SyncResponse::FailedToQueueAction { path }
                 } else {
-                    SyncResponse::FailedToQueueAction { source }
+                    match self.actions_tx.send(QueuedAction { path, action }).await {
+                        Ok(()) => SyncResponse::Ok,
+                        Err(error) => SyncResponse::FailedToQueueAction { path: error.0.path },
+                    }
                 }
             }
             SyncRequest::LeaderInformation(info) => {
@@ -84,6 +85,19 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
 
         ResponseOrFeed::Response(resp)
     }
+}
+
+fn valid_forward_path<A: SyncIOAddress>(peer_addr: A, my_address: A, path: &[A]) -> bool {
+    if path.is_empty() || path.len() > crate::cluster::state_sync::MAX_ACTION_FORWARD_PATH_LEN {
+        return false;
+    }
+
+    if path.last() != Some(&peer_addr) || path.contains(&my_address) {
+        return false;
+    }
+
+    let mut seen = HashSet::with_capacity(path.len());
+    path.iter().all(|addr| seen.insert(*addr))
 }
 
 impl<A, D> RpcServer<A, D>
@@ -217,4 +231,23 @@ pub enum ResponseOrFeed<A: SyncIOAddress, D: DeterministicState> {
     Subscription {
         feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::state_sync::MAX_ACTION_FORWARD_PATH_LEN;
+
+    #[test]
+    fn forward_path_validation_rejects_loops_and_malformed_paths() {
+        assert!(valid_forward_path(2u64, 3u64, &[1, 2]));
+
+        assert!(!valid_forward_path(2u64, 3u64, &[]));
+        assert!(!valid_forward_path(2u64, 3u64, &[1]));
+        assert!(!valid_forward_path(2u64, 3u64, &[1, 2, 1]));
+        assert!(!valid_forward_path(2u64, 3u64, &[1, 2, 3]));
+
+        let too_long = (0..=MAX_ACTION_FORWARD_PATH_LEN as u64).collect::<Vec<_>>();
+        assert!(!valid_forward_path(MAX_ACTION_FORWARD_PATH_LEN as u64, 100, &too_long));
+    }
 }

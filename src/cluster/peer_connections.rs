@@ -47,7 +47,7 @@ struct RpcMessage<A: SyncIOAddress, D: DeterministicState> {
 
 enum RpcResponseHandler<A: SyncIOAddress, D: DeterministicState> {
     Sender(oneshot::Sender<Result<SyncResponse<A, D>, PeerRpcError>>),
-    ForwardedAction { target: A, source: A },
+    ForwardedAction { target: A, path: Vec<A> },
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> RpcResponseHandler<A, D> {
@@ -56,18 +56,13 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcResponseHandler<A, D> {
             Self::Sender(tx) => {
                 let _ = tx.send(response);
             }
-            Self::ForwardedAction { target, source } => match response {
+            Self::ForwardedAction { target, path } => match response {
                 Ok(SyncResponse::Ok) => {}
                 Ok(response) => {
-                    tracing::warn!(
-                        ?target,
-                        ?source,
-                        response = response.name(),
-                        "sync target rejected forwarded action"
-                    );
+                    tracing::warn!(?target, ?path, response = response.name(), "sync target rejected forwarded action");
                 }
                 Err(error) => {
-                    tracing::warn!(?target, ?source, ?error, "failed to forward action to sync target");
+                    tracing::warn!(?target, ?path, ?error, "failed to forward action to sync target");
                 }
             },
         }
@@ -123,15 +118,17 @@ where
     pub async fn enqueue_forwarded_action(
         &self,
         peer: I::Address,
-        source: I::Address,
-        ttl: u8,
+        path: Vec<I::Address>,
         action: D::Action,
     ) -> Result<(), PeerRpcError> {
         self.enqueue_message(
             peer,
             RpcMessage {
-                request: SyncRequest::Action { source, ttl, action },
-                response: RpcResponseHandler::ForwardedAction { target: peer, source },
+                request: SyncRequest::Action {
+                    path: path.clone(),
+                    action,
+                },
+                response: RpcResponseHandler::ForwardedAction { target: peer, path },
             },
         )
         .await
@@ -650,8 +647,7 @@ mod tests {
             .enqueue_rpc(
                 2,
                 SyncRequest::Action {
-                    source: 1,
-                    ttl: 4,
+                    path: vec![1],
                     action: 10,
                 },
             )
@@ -661,8 +657,7 @@ mod tests {
             .enqueue_rpc(
                 2,
                 SyncRequest::Action {
-                    source: 1,
-                    ttl: 4,
+                    path: vec![1],
                     action: 20,
                 },
             )
