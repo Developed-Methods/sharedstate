@@ -85,10 +85,14 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> ReadChannel<I, M> {
     }
 }
 
+const MIN_MESSAGE_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_MESSAGE_INTERVAL: Duration = Duration::from_secs(2);
+
 impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
     pub async fn start(mut self) {
         let mut buffer = vec![0u8; 2048];
-        let zero_msg_timeout = self.settings.process_timeout / 3;
+        let keep_alive_msg_timeout = (self.settings.message_timeout / 3)
+            .clamp(MIN_MESSAGE_INTERVAL, MAX_MESSAGE_INTERVAL);
 
         loop {
             tokio::task::yield_now().await;
@@ -119,7 +123,7 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
                         }
                     }
                 }
-                _ = tokio::time::sleep(zero_msg_timeout) => None,
+                _ = tokio::time::sleep(keep_alive_msg_timeout) => None,
             };
 
             let send_res = match msg {
