@@ -80,6 +80,7 @@ where
                     return;
                 }
 
+                /* note keep lock while dealing with subscribe */
                 match self.state.state.subscribe(details).await {
                     Ok(feed) => (feed, None),
                     Err(error) => {
@@ -89,7 +90,7 @@ where
                     }
                 }
             }
-            SyncRequest::Action { action, .. } => {
+            SyncRequest::Action(action) => {
                 self.handle_action(action).await;
                 let _ = write.send(SyncResponse::Ok).await;
                 return;
@@ -131,7 +132,7 @@ where
                     }
                 },
                 request = read.recv() => match request {
-                    Some(SyncRequest::Action { action, .. }) => self.handle_action(action).await,
+                    Some(SyncRequest::Action(action)) => self.handle_action(action).await,
                     Some(request) => tracing::debug!(?request, "ignoring non-action request after subscription"),
                     None => break,
                 },
@@ -139,16 +140,9 @@ where
         }
     }
 
-    async fn handle_action(&self, action: RecoverableStateAction<D::Action>) {
-        match action {
-            RecoverableStateAction::StateAction { action } => {
-                if self.actions_tx.send(action).await.is_err() {
-                    tracing::warn!("failed to queue client action");
-                }
-            }
-            RecoverableStateAction::BumpGeneration { .. } => {
-                tracing::debug!("ignoring client generation bump request");
-            }
+    async fn handle_action(&self, action: D::Action) {
+        if self.actions_tx.send(action).await.is_err() {
+            tracing::warn!("failed to queue client action");
         }
     }
 }

@@ -11,4 +11,4 @@ pub mod transport;
 
 mod utils;
 
-pub use service::{SharedState, SharedStateConfig, SharedStateRecoverableConfig, SharedStateSettings};
+pub use service::{SharedState, SharedStateConfig, SharedStateSettings};

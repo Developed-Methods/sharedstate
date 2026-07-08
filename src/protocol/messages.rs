@@ -15,10 +15,7 @@ pub const PROTOCOL_VERSION: u64 = 1;
 pub enum SyncRequest<D: DeterministicState> {
     ProtocolVersion(u64),
     Subscribe(RecoverableStateDetails),
-    Action {
-        state_id: u64,
-        action: RecoverableStateAction<D::Action>,
-    },
+    Action(D::Action),
 }
 
 impl<D: DeterministicState> Debug for SyncRequest<D> {
@@ -26,7 +23,7 @@ impl<D: DeterministicState> Debug for SyncRequest<D> {
         match self {
             Self::ProtocolVersion(v) => write!(f, "ProtocolVersion({v})"),
             Self::Subscribe(details) => write!(f, "Subscribe({details:?})"),
-            Self::Action { state_id, .. } => write!(f, "Action(state_id: {state_id})"),
+            Self::Action(..) => write!(f, "Action"),
         }
     }
 }
@@ -67,9 +64,8 @@ where
                 sum += 1u16.write_to(out)?;
                 details.write_to(out)?
             }
-            Self::Action { state_id, action } => {
+            Self::Action(action) => {
                 sum += 2u16.write_to(out)?;
-                sum += state_id.write_to(out)?;
                 action.write_to(out)?
             }
         };
@@ -81,10 +77,7 @@ where
         Ok(match u16::read_from(read)? {
             0 => Self::ProtocolVersion(MessageEncoding::read_from(read)?),
             1 => Self::Subscribe(MessageEncoding::read_from(read)?),
-            2 => Self::Action {
-                state_id: MessageEncoding::read_from(read)?,
-                action: MessageEncoding::read_from(read)?,
-            },
+            2 => Self::Action(MessageEncoding::read_from(read)?),
             other => return Err(unknown_id_err(other, "SyncRequest")),
         })
     }

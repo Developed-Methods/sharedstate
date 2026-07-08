@@ -9,6 +9,7 @@ use std::{
 
 use message_encoding::MessageEncoding;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     cluster::node_state::NodeState,
@@ -157,10 +158,7 @@ where
                     let Some(action) = action else {
                         return SyncFlow::Shutdown;
                     };
-                    if send(&write, SyncRequest::Action {
-                        state_id: self.state.state.recovery_details().await.next_seq(),
-                        action: RecoverableStateAction::StateAction { action },
-                    }).await.is_err() {
+                    if send(&write, SyncRequest::Action(action)).await.is_err() {
                         tracing::warn!(?leader, "failed to forward action to leader");
                         return SyncFlow::Retry;
                     }

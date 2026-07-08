@@ -21,18 +21,9 @@ use crate::{
         subscribable_state::{StateHandle, SubscribableState},
     },
     transport::{channels::NetIoSettings, traits::SyncIOListener},
-    utils::unique_state_id,
 };
 
 pub struct SharedStateConfig<I: SyncIOListener, D: DeterministicState> {
-    pub io: Arc<I>,
-    pub my_address: I::Address,
-    pub leader_address: I::Address,
-    pub initial_state: D,
-    pub settings: SharedStateSettings,
-}
-
-pub struct SharedStateRecoverableConfig<I: SyncIOListener, D: DeterministicState> {
     pub io: Arc<I>,
     pub my_address: I::Address,
     pub leader_address: I::Address,
@@ -65,24 +56,6 @@ where
 {
     pub fn start(config: SharedStateConfig<I, D>) -> Result<Self, SettingsError> {
         let SharedStateConfig {
-            io,
-            my_address,
-            leader_address,
-            initial_state,
-            settings,
-        } = config;
-
-        Self::start_recoverable(SharedStateRecoverableConfig {
-            io,
-            my_address,
-            leader_address,
-            initial_state: RecoverableState::new(unique_state_id(&my_address), initial_state),
-            settings,
-        })
-    }
-
-    pub fn start_recoverable(config: SharedStateRecoverableConfig<I, D>) -> Result<Self, SettingsError> {
-        let SharedStateRecoverableConfig {
             io,
             my_address,
             leader_address,
