@@ -91,8 +91,8 @@ const MAX_MESSAGE_INTERVAL: Duration = Duration::from_secs(2);
 impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
     pub async fn start(mut self) {
         let mut buffer = vec![0u8; 2048];
-        let keep_alive_msg_timeout = (self.settings.message_timeout / 3)
-            .clamp(MIN_MESSAGE_INTERVAL, MAX_MESSAGE_INTERVAL);
+        let keep_alive_msg_timeout =
+            (self.settings.message_timeout / 3).clamp(MIN_MESSAGE_INTERVAL, MAX_MESSAGE_INTERVAL);
 
         loop {
             tokio::task::yield_now().await;

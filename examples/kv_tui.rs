@@ -21,10 +21,7 @@ use ratatui::{
     Terminal,
 };
 use sharedstate::{
-    cluster::{
-        leader::LeaderMode,
-        node_state::{ConnectStatus, NodeState},
-    },
+    cluster::node_state::NodeState,
     state::{deterministic_state::DeterministicState, subscribable_state::StateHandle},
     transport::traits::{SyncConnection, SyncIO, SyncIOListener},
     SharedState, SharedStateConfig, SharedStateSettings,
@@ -42,15 +39,14 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 type KvShared = SharedState<LocalhostTcpIo, KvStore>;
 
 const COMMAND_HELP: &str =
-    "commands: help, status, peers, get <key>, set <key> <value>, delete|del|rm <key>, list|print, quit|exit";
+    "commands: help, status, get <key>, set <key> <value>, delete|del|rm <key>, list|print, quit|exit";
 const PROMPT: &str = "kv> ";
 const LOG_LIMIT: usize = 250;
 const RENDER_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 struct Args {
-    can_lead: bool,
-    peers: Vec<u16>,
+    leader: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -394,16 +390,15 @@ async fn main() -> io::Result<()> {
     let shared = SharedState::start(SharedStateConfig {
         io,
         my_address: local_address,
-        can_lead: args.can_lead,
-        initial_peers: args.peers.clone(),
+        leader_address: args.leader.unwrap_or(local_address),
         initial_state: KvStore::new(),
         settings: SharedStateSettings::default(),
     })
     .map_err(|error| Error::other(format!("failed to start shared state: {error:?}")))?;
 
     let _ = log_tx.send(format!(
-        "listening on 127.0.0.1:{local_address} can_lead={} initial_peers={:?}",
-        args.can_lead, args.peers
+        "listening on 127.0.0.1:{local_address} leader=127.0.0.1:{}",
+        args.leader.unwrap_or(local_address)
     ));
     let _ = log_tx.send(COMMAND_HELP.to_owned());
 
@@ -413,37 +408,21 @@ async fn main() -> io::Result<()> {
 
 fn parse_args() -> io::Result<Args> {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
-    if args.len() != 1 && args.len() != 2 {
+    if 1 < args.len() {
         return Err(usage_error());
     }
 
-    let can_lead = match args.remove(0).to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => true,
-        "false" | "0" | "no" => false,
-        _ => return Err(usage_error()),
-    };
-
-    let peers = if let Some(raw) = args.pop() {
-        if raw.is_empty() {
-            return Err(usage_error());
-        }
-        raw.split(',')
-            .map(|part| {
-                if part.is_empty() {
-                    return Err(usage_error());
-                }
-                part.parse::<u16>().map_err(|_| usage_error())
-            })
-            .collect::<io::Result<Vec<_>>>()?
+    let leader = if let Some(raw) = args.pop() {
+        Some(raw.parse::<u16>().map_err(|_| usage_error())?)
     } else {
-        Vec::new()
+        None
     };
 
-    Ok(Args { can_lead, peers })
+    Ok(Args { leader })
 }
 
 fn usage_error() -> io::Error {
-    Error::new(ErrorKind::InvalidInput, "usage: cargo run --example kv_tui -- <can_lead:true|false> [peer_ports_csv]")
+    Error::new(ErrorKind::InvalidInput, "usage: cargo run --example kv_tui -- [leader_port]")
 }
 
 async fn run_tui(
@@ -567,7 +546,6 @@ fn input_view(input: &str, cursor: usize, max_width: u16) -> (String, u16) {
 }
 
 async fn build_summary(state: &NodeState<u16, KvStore>, state_handle: &mut StateHandle<KvStore>) -> Vec<String> {
-    let leader_state = state.leader_state.lock().await.clone();
     let (seq, item_count, values_preview) = state_handle.read_with(|recoverable| {
         let store = recoverable.state();
         let preview = store
@@ -578,68 +556,25 @@ async fn build_summary(state: &NodeState<u16, KvStore>, state_handle: &mut State
             .collect::<Vec<_>>();
         (store.seq, store.values.len(), preview)
     });
-    let peers = state.peers.lock().await;
 
     let mut lines = vec![
-        format!("address: 127.0.0.1:{}  can_lead: {}", state.my_address, state.can_lead),
-        format!("leader: term={} {}", leader_state.term, leader_mode_line(&leader_state.mode)),
+        format!("address: 127.0.0.1:{}", state.my_address),
+        format!("leader: 127.0.0.1:{} ({})", state.leader_address, if state.is_leader() { "self" } else { "remote" }),
+        format!(
+            "leader connection: {}",
+            if state.is_connected_to_leader() {
+                "connected"
+            } else {
+                "not connected"
+            }
+        ),
         format!("kv: seq={seq} items={item_count}"),
     ];
     if !values_preview.is_empty() {
         lines.push(format!("kv preview: {}", values_preview.join(", ")));
     }
-    lines.push("peers:".to_owned());
-
-    if peers.is_empty() {
-        lines.push("  (none)".to_owned());
-    } else {
-        for peer in peers.values() {
-            lines.push(format!(
-                "  {} status={} can_lead={:?} last_global={:?} observed_leader={:?} observed_vote={:?} observed_term={:?}",
-                peer.addr,
-                connect_status_line(peer.connect_status),
-                peer.can_lead,
-                peer.last_global_connectivity.map(|value| value.get()),
-                peer.leader_info.as_ref().and_then(|info| published_leader(peer.addr, &info.leader_state.mode)),
-                peer.leader_info.as_ref().and_then(|info| observed_vote(&info.leader_state.mode)),
-                peer.leader_info.as_ref().map(|info| info.leader_state.term),
-            ));
-        }
-    }
 
     lines
-}
-
-fn published_leader(observer: u16, mode: &LeaderMode<u16>) -> Option<u16> {
-    match mode {
-        LeaderMode::NoLeader | LeaderMode::Electing { .. } => None,
-        LeaderMode::Leading => Some(observer),
-        LeaderMode::Following { leader } => Some(*leader),
-    }
-}
-
-fn observed_vote(mode: &LeaderMode<u16>) -> Option<u16> {
-    match mode {
-        LeaderMode::Electing { vote } => *vote,
-        _ => None,
-    }
-}
-
-fn connect_status_line(status: ConnectStatus) -> String {
-    match status {
-        ConnectStatus::Connected { epoch_ms } => format!("Connected since={epoch_ms}"),
-        ConnectStatus::FailedToConnect { epoch_ms } => format!("FailedToConnect since={epoch_ms}"),
-        ConnectStatus::NotConnected => "NotConnected".to_owned(),
-    }
-}
-
-fn leader_mode_line(mode: &LeaderMode<u16>) -> String {
-    match mode {
-        LeaderMode::NoLeader => "NoLeader".to_owned(),
-        LeaderMode::Electing { vote } => format!("Electing vote={vote:?}"),
-        LeaderMode::Leading => "Leading".to_owned(),
-        LeaderMode::Following { leader } => format!("Following leader={leader}"),
-    }
 }
 
 async fn handle_key(key: KeyEvent, app: &mut App, shared: &KvShared, state_handle: &mut StateHandle<KvStore>) {
@@ -682,32 +617,13 @@ async fn run_command(command: String, app: &mut App, shared: &KvShared, state_ha
         "help" => app.log(COMMAND_HELP),
         "quit" | "exit" => app.should_quit = true,
         "status" => {
-            let leader_state = shared.leader_state().await;
-            let peer_count = shared.node().peers.lock().await.len();
             app.log(format!(
-                "address={} can_lead={} leader={} peers={peer_count}",
+                "address={} leader={} mode={} connected_to_leader={}",
                 shared.my_address(),
-                shared.can_lead(),
-                leader_mode_line(&leader_state.mode)
+                shared.leader_address(),
+                if shared.is_leader() { "leader" } else { "follower" },
+                shared.is_connected_to_leader()
             ));
-        }
-        "peers" => {
-            let peers = shared.node().peers.lock().await;
-            if peers.is_empty() {
-                app.log("(no peers)");
-            } else {
-                for peer in peers.values() {
-                    app.log(format!(
-                        "{} status={} can_lead={:?} observed_leader={:?}",
-                        peer.addr,
-                        connect_status_line(peer.connect_status),
-                        peer.can_lead,
-                        peer.leader_info
-                            .as_ref()
-                            .and_then(|info| published_leader(peer.addr, &info.leader_state.mode)),
-                    ));
-                }
-            }
         }
         "get" => handle_get(rest, app, state_handle),
         "set" => handle_set(rest, app, shared).await,

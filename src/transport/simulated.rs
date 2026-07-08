@@ -330,7 +330,13 @@ impl<I> KillableIo<I> {
                 self.blackhole_delay = Some(Box::pin(tokio::time::sleep(BLACKHOLE_POLL_INTERVAL)));
             }
 
-            match self.blackhole_delay.as_mut().expect("delay initialized").as_mut().poll(cx) {
+            match self
+                .blackhole_delay
+                .as_mut()
+                .expect("delay initialized")
+                .as_mut()
+                .poll(cx)
+            {
                 Poll::Ready(()) => {
                     self.blackhole_delay = None;
                 }

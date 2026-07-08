@@ -102,8 +102,7 @@ impl<D: DeterministicState> SubscribableState<D> {
 
             if yields == YIELD_LIMIT {
                 last_warned = Some(tokio::time::Instant::now());
-            }
-            else if last_warned.is_none_or(|at| WARN_INTERVAL <= at.elapsed()) {
+            } else if last_warned.is_none_or(|at| WARN_INTERVAL <= at.elapsed()) {
                 tracing::warn!(
                     blocked_by_workers = maintenance.blocked_by_workers,
                     elapsed = ?started.elapsed(),
@@ -281,11 +280,8 @@ mod tests {
 
     fn new_state() -> Arc<SubscribableState<Counter>> {
         Arc::new(
-            SubscribableState::new(
-                RecoverableState::new(1, Counter(0)),
-                SequencedBroadcastSettings::default(),
-            )
-            .unwrap(),
+            SubscribableState::new(RecoverableState::new(1, Counter(0)), SequencedBroadcastSettings::default())
+                .unwrap(),
         )
     }
 
@@ -313,10 +309,7 @@ mod tests {
         };
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(
-            !updates.is_finished(),
-            "updates must not settle while a read handle is pinned"
-        );
+        assert!(!updates.is_finished(), "updates must not settle while a read handle is pinned");
 
         handle.quiescent();
         tokio::time::timeout(std::time::Duration::from_secs(5), updates)

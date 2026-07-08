@@ -39,17 +39,9 @@ pub struct SyncConnection<I: SyncIO> {
     pub write: I::Write,
 }
 
-pub type ClientChannels<I, D> = (
-    <I as SyncIO>::Address,
-    Sender<SyncRequest<<I as SyncIO>::Address, D>>,
-    Receiver<SyncResponse<<I as SyncIO>::Address, D>>,
-);
+pub type ClientChannels<I, D> = (<I as SyncIO>::Address, Sender<SyncRequest<D>>, Receiver<SyncResponse<D>>);
 
-pub type ServerChannels<I, D> = (
-    <I as SyncIO>::Address,
-    Sender<SyncResponse<<I as SyncIO>::Address, D>>,
-    Receiver<SyncRequest<<I as SyncIO>::Address, D>>,
-);
+pub type ServerChannels<I, D> = (<I as SyncIO>::Address, Sender<SyncResponse<D>>, Receiver<SyncRequest<D>>);
 
 impl<I: SyncIO> SyncConnection<I> {
     pub fn client_channels<D>(self, settings: NetIoSettings) -> ClientChannels<I, D>
