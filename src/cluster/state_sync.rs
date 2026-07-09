@@ -310,7 +310,7 @@ where
 
     fn select_peer(&self) -> I::Address {
         let leader = self.current_leader();
-        let mut candidates = self.candidate_peers();
+        let candidates = self.candidate_peers();
         if candidates.is_empty() {
             return leader;
         }
@@ -320,12 +320,12 @@ where
             .get(&leader)
             .map(|health| health.consecutive_failures)
             .unwrap_or_default();
+
         if candidates.contains(&leader) && leader_failures < self.timing.peer_failure_threshold {
             return leader;
         }
 
-        candidates.sort_by_key(|peer| self.peer_score(*peer));
-        candidates[0]
+        candidates.iter().cloned().min_by_key(|peer| self.peer_score(*peer)).unwrap()
     }
 
     fn candidate_peers(&self) -> Vec<I::Address> {
