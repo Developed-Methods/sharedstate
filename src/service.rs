@@ -11,7 +11,7 @@ use tokio::{
 
 use crate::{
     cluster::{
-        node_state::NodeState,
+        node_state::{DebugInfo, NodeState},
         rpc_server::RpcServer,
         state_sync::{StateSyncTask, StateSyncTiming},
     },
@@ -104,6 +104,10 @@ where
 
     pub fn is_connected_to_leader(&self) -> bool {
         self.node.is_connected_to_leader()
+    }
+
+    pub fn debug_info(&self) -> DebugInfo<I::Address> {
+        self.node.debug_info()
     }
 
     pub fn node(&self) -> &Arc<NodeState<I::Address, D>> {

@@ -239,6 +239,7 @@ where
             }
         };
 
+        self.state.set_connected_peer(Some(peer));
         self.state.set_connected_to_leader(true);
         tracing::info!(?peer, ?leader, next_seq, "subscribed to shared-state peer");
 
@@ -248,6 +249,7 @@ where
                     Some(SyncResponse::Action { seq, action }) => {
                         if seq != next_seq {
                             self.record_peer_failure(peer);
+                            self.state.set_connected_to_leader(false);
                             tracing::warn!(?peer, ?leader, seq, next_seq, "sync peer action stream out of sequence");
                             return SyncFlow::Retry;
                         }
@@ -257,11 +259,13 @@ where
                     }
                     Some(response) => {
                         self.record_peer_failure(peer);
+                        self.state.set_connected_to_leader(false);
                         tracing::warn!(?peer, ?leader, response = response.name(), "unexpected response from sync peer");
                         return SyncFlow::Retry;
                     }
                     None => {
                         self.record_peer_failure(peer);
+                        self.state.set_connected_to_leader(false);
                         tracing::info!(?peer, ?leader, "sync peer subscription closed");
                         return SyncFlow::Retry;
                     }
@@ -272,6 +276,7 @@ where
                     };
                     if send(&write, SyncRequest::Action(action)).await.is_err() {
                         self.record_peer_failure(peer);
+                        self.state.set_connected_to_leader(false);
                         tracing::warn!(?peer, ?leader, "failed to forward action to sync peer");
                         return SyncFlow::Retry;
                     }
@@ -282,6 +287,7 @@ where
                         self.leader_updates_open = false;
                     } else if self.is_leader() {
                         tracing::info!("shared-state leadership granted");
+                        self.state.set_connected_to_leader(false);
                         return SyncFlow::RoleChanged;
                     }
                 }
@@ -292,6 +298,7 @@ where
                         let next_peer = self.select_peer();
                         if peer != next_peer {
                             tracing::debug!(?peer, ?next_peer, "sync peer selection changed");
+                            self.state.set_connected_to_leader(false);
                             return SyncFlow::Retry;
                         }
                     }
@@ -325,7 +332,11 @@ where
             return leader;
         }
 
-        candidates.iter().cloned().min_by_key(|peer| self.peer_score(*peer)).unwrap()
+        candidates
+            .iter()
+            .cloned()
+            .min_by_key(|peer| self.peer_score(*peer))
+            .unwrap()
     }
 
     fn candidate_peers(&self) -> Vec<I::Address> {

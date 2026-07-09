@@ -11,7 +11,7 @@ use message_encoding::MessageEncoding;
 use sharedstate::{
     state::{deterministic_state::DeterministicState, recoverable_state::RecoverableState},
     transport::traits::{SyncConnection, SyncIO, SyncIOListener},
-    SharedState, SharedStateConfig, SharedStateSettings,
+    DebugInfo, SharedState, SharedStateConfig, SharedStateSettings,
 };
 use tokio::{
     net::{
@@ -181,6 +181,10 @@ impl TestCluster {
 
     pub(crate) fn is_leader(&self, index: usize) -> bool {
         self.nodes[index].is_leader()
+    }
+
+    pub(crate) fn debug_info(&self, index: usize) -> DebugInfo<u16> {
+        self.nodes[index].debug_info()
     }
 
     pub(crate) fn elect(&self, index: usize) {
