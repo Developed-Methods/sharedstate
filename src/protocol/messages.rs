@@ -16,7 +16,7 @@ pub enum SyncRequest<D: DeterministicState> {
     ProtocolVersion(u64),
     Subscribe(RecoverableStateDetails),
     Action(D::Action),
-    Ping,
+    Ping(u64),
 }
 
 impl<D: DeterministicState> Debug for SyncRequest<D> {
@@ -25,7 +25,7 @@ impl<D: DeterministicState> Debug for SyncRequest<D> {
             Self::ProtocolVersion(v) => write!(f, "ProtocolVersion({v})"),
             Self::Subscribe(details) => write!(f, "Subscribe({details:?})"),
             Self::Action(..) => write!(f, "Action"),
-            Self::Ping => write!(f, "Ping"),
+            Self::Ping(id) => write!(f, "Ping({id})"),
         }
     }
 }
@@ -33,7 +33,7 @@ impl<D: DeterministicState> Debug for SyncRequest<D> {
 pub enum SyncResponse<D: DeterministicState> {
     Ok,
     NotConnected,
-    Pong,
+    Pong(u64),
     FreshState(RecoverableState<D>),
     Action {
         seq: u64,
@@ -46,7 +46,7 @@ impl<D: DeterministicState> SyncResponse<D> {
         match self {
             SyncResponse::Ok => "Ok",
             SyncResponse::NotConnected => "NotConnected",
-            SyncResponse::Pong => "Pong",
+            SyncResponse::Pong(_) => "Pong",
             SyncResponse::FreshState(_) => "FreshState",
             SyncResponse::Action { .. } => "Action",
         }
@@ -72,7 +72,10 @@ where
                 sum += 2u16.write_to(out)?;
                 action.write_to(out)?
             }
-            Self::Ping => 3u16.write_to(out)?,
+            Self::Ping(id) => {
+                sum += 3u16.write_to(out)?;
+                id.write_to(out)?
+            }
         };
 
         Ok(sum)
@@ -83,7 +86,7 @@ where
             0 => Self::ProtocolVersion(MessageEncoding::read_from(read)?),
             1 => Self::Subscribe(MessageEncoding::read_from(read)?),
             2 => Self::Action(MessageEncoding::read_from(read)?),
-            3 => Self::Ping,
+            3 => Self::Ping(MessageEncoding::read_from(read)?),
             other => return Err(unknown_id_err(other, "SyncRequest")),
         })
     }
@@ -99,7 +102,10 @@ where
         sum += match self {
             Self::Ok => 0u16.write_to(out)?,
             Self::NotConnected => 1u16.write_to(out)?,
-            Self::Pong => 4u16.write_to(out)?,
+            Self::Pong(id) => {
+                sum += 4u16.write_to(out)?;
+                id.write_to(out)?
+            }
             Self::FreshState(state) => {
                 sum += 2u16.write_to(out)?;
                 state.write_to(out)?
@@ -123,7 +129,7 @@ where
                 seq: MessageEncoding::read_from(read)?,
                 action: MessageEncoding::read_from(read)?,
             },
-            4 => Self::Pong,
+            4 => Self::Pong(MessageEncoding::read_from(read)?),
             other => return Err(unknown_id_err(other, "SyncResponse")),
         })
     }

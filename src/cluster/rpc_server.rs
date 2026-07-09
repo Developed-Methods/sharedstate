@@ -74,8 +74,8 @@ where
                 return;
             };
             match request {
-                SyncRequest::Ping => {
-                    if write.send(SyncResponse::Pong).await.is_err() {
+                SyncRequest::Ping(id) => {
+                    if write.send(SyncResponse::Pong(id)).await.is_err() {
                         return;
                     }
                 }
@@ -109,7 +109,7 @@ where
                 let _ = write.send(SyncResponse::Ok).await;
                 return;
             }
-            SyncRequest::Ping => unreachable!("ping requests are handled before subscription dispatch"),
+            SyncRequest::Ping(_) => unreachable!("ping requests are handled before subscription dispatch"),
         };
 
         if let Some(state) = fresh_state {
@@ -144,8 +144,8 @@ where
                 },
                 request = read.recv() => match request {
                     Some(SyncRequest::Action(action)) => self.handle_action(action).await,
-                    Some(SyncRequest::Ping) => {
-                        if write.send(SyncResponse::Pong).await.is_err() {
+                    Some(SyncRequest::Ping(id)) => {
+                        if write.send(SyncResponse::Pong(id)).await.is_err() {
                             break;
                         }
                     }

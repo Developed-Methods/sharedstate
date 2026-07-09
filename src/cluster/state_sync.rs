@@ -5,7 +5,7 @@ use std::{
     io::{Error, ErrorKind},
     iter,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use message_encoding::MessageEncoding;
@@ -383,13 +383,27 @@ where
         write: &Sender<SyncRequest<D>>,
         read: &mut Receiver<SyncResponse<D>>,
     ) -> std::io::Result<Duration> {
-        let start = tokio::time::Instant::now();
-        send(write, SyncRequest::Ping).await?;
+        let id = epoch_millis();
+        send(write, SyncRequest::Ping(id)).await?;
         match recv(read, self.settings.message_timeout).await? {
-            SyncResponse::Pong => Ok(start.elapsed()),
+            SyncResponse::Pong(pong_id) if pong_id == id => {
+                Ok(Duration::from_millis(epoch_millis().saturating_sub(pong_id)))
+            }
+            SyncResponse::Pong(pong_id) => {
+                Err(Error::new(ErrorKind::InvalidData, format!("expected Pong({id}), got Pong({pong_id})")))
+            }
             response => Err(unexpected("Pong", &response)),
         }
     }
+}
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 async fn send<D: DeterministicState>(write: &Sender<SyncRequest<D>>, request: SyncRequest<D>) -> std::io::Result<()> {

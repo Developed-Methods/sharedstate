@@ -233,10 +233,10 @@ async fn ping_rpc_returns_pong_after_handshake() {
     .unwrap();
     assert!(matches!(read_response(&mut stream).await, SyncResponse::Ok));
 
-    send_message(&mut buffer, &SyncRequest::<TestState>::Ping, &mut stream, PROCESS_TIMEOUT)
+    send_message(&mut buffer, &SyncRequest::<TestState>::Ping(42), &mut stream, PROCESS_TIMEOUT)
         .await
         .unwrap();
-    assert!(matches!(read_response(&mut stream).await, SyncResponse::Pong));
+    assert!(matches!(read_response(&mut stream).await, SyncResponse::Pong(42)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
