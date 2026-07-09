@@ -113,6 +113,7 @@ fn test_settings() -> SharedStateSettings {
         },
         sync_timing: sharedstate::cluster::state_sync::StateSyncTiming {
             retry_delay: Duration::from_millis(50),
+            ..Default::default()
         },
         ..SharedStateSettings::default()
     }
@@ -127,10 +128,12 @@ where
     I: SyncIOListener,
     I::Address: Into<u64>,
 {
+    let (_, available_peers) = watch::channel(vec![*leader_address.borrow()]);
     SharedState::start(SharedStateConfig {
         io,
         my_address,
         leader_address,
+        available_peers,
         initial_state: RecoverableState::new(my_address.into(), CounterState::default()),
         settings: test_settings(),
     })

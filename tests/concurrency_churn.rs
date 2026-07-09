@@ -131,6 +131,7 @@ impl ExactCluster {
 
         let initial_leader = ios[0].address;
         let (leader_tx, leader_rx) = watch::channel(initial_leader);
+        let (_, available_peers_rx) = watch::channel(ios.iter().map(|io| io.address).collect::<Vec<_>>());
         let mut nodes = Vec::with_capacity(size);
 
         for io in ios {
@@ -140,6 +141,7 @@ impl ExactCluster {
                     io: Arc::new(io),
                     my_address,
                     leader_address: leader_rx.clone(),
+                    available_peers: available_peers_rx.clone(),
                     initial_state: RecoverableState::new(my_address as u64, ExactKvState::default()),
                     settings: SharedStateSettings::default(),
                 })

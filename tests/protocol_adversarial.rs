@@ -139,6 +139,7 @@ fn test_settings() -> SharedStateSettings {
         },
         sync_timing: sharedstate::cluster::state_sync::StateSyncTiming {
             retry_delay: Duration::from_millis(50),
+            ..Default::default()
         },
         ..SharedStateSettings::default()
     }
@@ -148,10 +149,12 @@ async fn start_tcp_leader() -> (SharedState<LocalhostTcpIo, TestState>, u16) {
     let io = LocalhostTcpIo::bind_ephemeral().await.unwrap();
     let address = io.address;
     let (_leader_tx, leader_rx) = watch::channel(address);
+    let (_available_peers_tx, available_peers_rx) = watch::channel(vec![address]);
     let node = SharedState::start(SharedStateConfig {
         io: Arc::new(io),
         my_address: address,
         leader_address: leader_rx,
+        available_peers: available_peers_rx,
         initial_state: RecoverableState::new(address as u64, TestState::default()),
         settings: test_settings(),
     })
@@ -184,6 +187,18 @@ async fn assert_rejected(response: Option<SyncResponse<TestState>>) {
     }
 }
 
+async fn read_response(stream: &mut TcpStream) -> SyncResponse<TestState> {
+    let mut buffer = Vec::new();
+    match read_message_opt::<SyncResponse<TestState>, _>(&mut buffer, stream, PROCESS_TIMEOUT, Some(ASSERT_TIMEOUT))
+        .await
+        .unwrap()
+    {
+        ReadMessageResult::Message(response) => response,
+        ReadMessageResult::Close => panic!("server closed before response"),
+        ReadMessageResult::KeepAlive => panic!("server sent keepalive instead of response"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn handshake_rejects_wrong_protocol_version() {
     let (_node, address) = start_tcp_leader().await;
@@ -200,6 +215,28 @@ async fn handshake_rejects_wrong_protocol_version() {
     .unwrap();
 
     assert_rejected(read_handshake_rejection(&mut stream).await).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ping_rpc_returns_pong_after_handshake() {
+    let (_node, address) = start_tcp_leader().await;
+    let mut stream = TcpStream::connect(("127.0.0.1", address)).await.unwrap();
+    let mut buffer = Vec::new();
+
+    send_message(
+        &mut buffer,
+        &SyncRequest::<TestState>::ProtocolVersion(PROTOCOL_VERSION),
+        &mut stream,
+        PROCESS_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(read_response(&mut stream).await, SyncResponse::Ok));
+
+    send_message(&mut buffer, &SyncRequest::<TestState>::Ping, &mut stream, PROCESS_TIMEOUT)
+        .await
+        .unwrap();
+    assert!(matches!(read_response(&mut stream).await, SyncResponse::Pong));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -310,10 +347,12 @@ async fn follower_retries_and_does_not_apply_out_of_sequence_leader_stream() {
         connects: connects.clone(),
     });
     let (_leader_tx, leader_rx) = watch::channel(20);
+    let (_available_peers_tx, available_peers_rx) = watch::channel(vec![20]);
     let follower = SharedState::start(SharedStateConfig {
         io,
         my_address: 10,
         leader_address: leader_rx,
+        available_peers: available_peers_rx,
         initial_state: RecoverableState::new(10, TestState::default()),
         settings: test_settings(),
     })

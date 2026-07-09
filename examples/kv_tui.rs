@@ -391,10 +391,12 @@ async fn main() -> io::Result<()> {
 
     let leader_address = args.leader.unwrap_or(local_address);
     let (_leader_tx, leader_rx) = tokio::sync::watch::channel(leader_address);
+    let (_available_peers_tx, available_peers_rx) = tokio::sync::watch::channel(vec![leader_address]);
     let shared = SharedState::start(SharedStateConfig {
         io,
         my_address: local_address,
         leader_address: leader_rx,
+        available_peers: available_peers_rx,
         initial_state: RecoverableState::new(local_address as u64, KvStore::new()),
         settings: SharedStateSettings::default(),
     })

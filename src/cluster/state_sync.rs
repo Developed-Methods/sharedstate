@@ -1,6 +1,7 @@
 //! Drives the local deterministic state from the current leader address.
 
 use std::{
+    collections::{BTreeSet, HashMap},
     io::{Error, ErrorKind},
     iter,
     sync::Arc,
@@ -28,14 +29,22 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct StateSyncTiming {
     pub retry_delay: Duration,
+    pub peer_failure_threshold: u32,
 }
 
 impl Default for StateSyncTiming {
     fn default() -> Self {
         Self {
             retry_delay: Duration::from_millis(500),
+            peer_failure_threshold: 3,
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct PeerHealth {
+    consecutive_failures: u32,
+    latency: Option<Duration>,
 }
 
 pub struct StateSyncTask<I: SyncIO, D: DeterministicState> {
@@ -45,7 +54,10 @@ pub struct StateSyncTask<I: SyncIO, D: DeterministicState> {
     actions_rx: Receiver<D::Action>,
     handle: StateHandle<D>,
     leader_address: watch::Receiver<I::Address>,
+    available_peers: watch::Receiver<Vec<I::Address>>,
     leader_updates_open: bool,
+    peer_updates_open: bool,
+    peer_health: HashMap<I::Address, PeerHealth>,
     timing: StateSyncTiming,
 }
 
@@ -71,6 +83,7 @@ where
     ) -> Self {
         let handle = state.state.create_handle();
         let leader_address = state.leader_address.clone();
+        let available_peers = state.available_peers.clone();
         Self {
             state,
             io,
@@ -78,7 +91,10 @@ where
             actions_rx,
             handle,
             leader_address,
+            available_peers,
             leader_updates_open: true,
+            peer_updates_open: true,
+            peer_health: HashMap::new(),
             timing,
         }
     }
@@ -96,12 +112,17 @@ where
             match self.follow().await {
                 SyncFlow::RoleChanged => continue,
                 SyncFlow::Retry => {
-                    if self.leader_updates_open {
+                    if self.leader_updates_open || self.peer_updates_open {
                         tokio::select! {
                             _ = tokio::time::sleep(self.timing.retry_delay) => {}
-                            changed = self.leader_address.changed() => {
+                            changed = self.leader_address.changed(), if self.leader_updates_open => {
                                 if changed.is_err() {
                                     self.leader_updates_open = false;
+                                }
+                            }
+                            changed = self.available_peers.changed(), if self.peer_updates_open => {
+                                if changed.is_err() {
+                                    self.peer_updates_open = false;
                                 }
                             }
                         }
@@ -148,22 +169,25 @@ where
     }
 
     async fn follow(&mut self) -> SyncFlow {
+        let peer = self.select_peer();
         let leader = self.current_leader();
-        let connect = tokio::time::timeout(self.settings.message_timeout, self.io.connect(&leader));
+        let connect = tokio::time::timeout(self.settings.message_timeout, self.io.connect(&peer));
         let connection = if self.leader_updates_open {
             tokio::select! {
                 result = connect => match result {
                     Ok(Ok(connection)) => connection,
                     Ok(Err(error)) => {
-                        tracing::debug!(?leader, ?error, "failed to connect to leader");
+                        self.record_peer_failure(peer);
+                        tracing::debug!(?peer, ?leader, ?error, "failed to connect to sync peer");
                         return SyncFlow::Retry;
                     }
                     Err(_) => {
-                        tracing::debug!(?leader, "timed out connecting to leader");
+                        self.record_peer_failure(peer);
+                        tracing::debug!(?peer, ?leader, "timed out connecting to sync peer");
                         return SyncFlow::Retry;
                     }
                 },
-                changed = self.leader_address.changed() => {
+                changed = self.leader_address.changed(), if self.leader_updates_open => {
                     if changed.is_err() {
                         self.leader_updates_open = false;
                     } else if self.is_leader() {
@@ -177,11 +201,13 @@ where
             match connect.await {
                 Ok(Ok(connection)) => connection,
                 Ok(Err(error)) => {
-                    tracing::debug!(?leader, ?error, "failed to connect to leader");
+                    self.record_peer_failure(peer);
+                    tracing::debug!(?peer, ?leader, ?error, "failed to connect to sync peer");
                     return SyncFlow::Retry;
                 }
                 Err(_) => {
-                    tracing::debug!(?leader, "timed out connecting to leader");
+                    self.record_peer_failure(peer);
+                    tracing::debug!(?peer, ?leader, "timed out connecting to sync peer");
                     return SyncFlow::Retry;
                 }
             }
@@ -189,34 +215,41 @@ where
 
         let (_remote, write, mut read) = connection.client_channels::<D>(self.settings.clone());
         let details = self.state.state.settled_recovery_details().await;
-        let mut next_seq = match self.subscribe(&write, &mut read, details).await {
-            Ok(next_seq) => next_seq,
+        let mut next_seq = match self.subscribe(peer, &write, &mut read, details).await {
+            Ok((next_seq, latency)) => {
+                self.record_peer_success(peer, latency);
+                next_seq
+            }
             Err(error) => {
-                tracing::warn!(?leader, ?error, "leader subscription failed");
+                self.record_peer_failure(peer);
+                tracing::warn!(?peer, ?leader, ?error, "sync peer subscription failed");
                 return SyncFlow::Retry;
             }
         };
 
         self.state.set_connected_to_leader(true);
-        tracing::info!(?leader, next_seq, "subscribed to shared-state leader");
+        tracing::info!(?peer, ?leader, next_seq, "subscribed to shared-state peer");
 
         loop {
             tokio::select! {
                 response = read.recv() => match response {
                     Some(SyncResponse::Action { seq, action }) => {
                         if seq != next_seq {
-                            tracing::warn!(?leader, seq, next_seq, "leader action stream out of sequence");
+                            self.record_peer_failure(peer);
+                            tracing::warn!(?peer, ?leader, seq, next_seq, "sync peer action stream out of sequence");
                             return SyncFlow::Retry;
                         }
                         next_seq += 1;
                         self.state.state.update(iter::once(action)).await;
                     }
                     Some(response) => {
-                        tracing::warn!(?leader, response = response.name(), "unexpected response from leader");
+                        self.record_peer_failure(peer);
+                        tracing::warn!(?peer, ?leader, response = response.name(), "unexpected response from sync peer");
                         return SyncFlow::Retry;
                     }
                     None => {
-                        tracing::info!(?leader, "leader subscription closed");
+                        self.record_peer_failure(peer);
+                        tracing::info!(?peer, ?leader, "sync peer subscription closed");
                         return SyncFlow::Retry;
                     }
                 },
@@ -225,7 +258,8 @@ where
                         return SyncFlow::Shutdown;
                     };
                     if send(&write, SyncRequest::Action(action)).await.is_err() {
-                        tracing::warn!(?leader, "failed to forward action to leader");
+                        self.record_peer_failure(peer);
+                        tracing::warn!(?peer, ?leader, "failed to forward action to sync peer");
                         return SyncFlow::Retry;
                     }
                 }
@@ -235,6 +269,17 @@ where
                     } else if self.is_leader() {
                         tracing::info!("shared-state leadership granted");
                         return SyncFlow::RoleChanged;
+                    }
+                }
+                changed = self.available_peers.changed(), if self.peer_updates_open => {
+                    if changed.is_err() {
+                        self.peer_updates_open = false;
+                    } else {
+                        let next_peer = self.select_peer();
+                        if peer != next_peer {
+                            tracing::debug!(?peer, ?next_peer, "sync peer selection changed");
+                            return SyncFlow::Retry;
+                        }
                     }
                 }
             }
@@ -249,27 +294,100 @@ where
         self.state.my_address == self.current_leader()
     }
 
+    fn select_peer(&self) -> I::Address {
+        let leader = self.current_leader();
+        let mut candidates = self.candidate_peers();
+        if candidates.is_empty() {
+            return leader;
+        }
+
+        let leader_failures = self
+            .peer_health
+            .get(&leader)
+            .map(|health| health.consecutive_failures)
+            .unwrap_or_default();
+        if candidates.contains(&leader) && leader_failures < self.timing.peer_failure_threshold {
+            return leader;
+        }
+
+        candidates.sort_by_key(|peer| self.peer_score(*peer));
+        candidates[0]
+    }
+
+    fn candidate_peers(&self) -> Vec<I::Address> {
+        let mut peers = BTreeSet::new();
+        peers.insert(self.current_leader());
+        for peer in self.available_peers.borrow().iter().copied() {
+            peers.insert(peer);
+        }
+        peers.remove(&self.state.my_address);
+        peers.into_iter().collect()
+    }
+
+    fn peer_score(&self, peer: I::Address) -> (u32, u128, I::Address) {
+        let health = self.peer_health.get(&peer);
+        let failures = health.map(|health| health.consecutive_failures).unwrap_or_default();
+        let latency = health
+            .and_then(|health| health.latency)
+            .unwrap_or_else(|| self.settings.message_timeout / 2)
+            .as_millis();
+        (failures, latency, peer)
+    }
+
+    fn record_peer_success(&mut self, peer: I::Address, latency: Option<Duration>) {
+        let health = self.peer_health.entry(peer).or_default();
+        health.consecutive_failures = 0;
+        if let Some(latency) = latency {
+            health.latency = Some(latency);
+        }
+    }
+
+    fn record_peer_failure(&mut self, peer: I::Address) {
+        let health = self.peer_health.entry(peer).or_default();
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+    }
+
     async fn subscribe(
         &mut self,
+        peer: I::Address,
         write: &Sender<SyncRequest<D>>,
         read: &mut Receiver<SyncResponse<D>>,
         details: RecoverableStateDetails,
-    ) -> std::io::Result<u64> {
+    ) -> std::io::Result<(u64, Option<Duration>)> {
         send(write, SyncRequest::ProtocolVersion(PROTOCOL_VERSION)).await?;
         expect_ok(recv(read, self.settings.message_timeout).await?, "protocol version")?;
+
+        let latency = if peer != self.current_leader() {
+            Some(self.ping(write, read).await?)
+        } else {
+            None
+        };
 
         let local_next_seq = details.next_seq();
         send(write, SyncRequest::Subscribe(details)).await?;
 
         match recv(read, self.settings.message_timeout).await? {
-            SyncResponse::Ok => Ok(local_next_seq),
+            SyncResponse::Ok => Ok((local_next_seq, latency)),
             SyncResponse::FreshState(fresh) => {
                 let next_seq = fresh.details().next_seq();
                 self.state.state.reset(fresh).await;
-                Ok(next_seq)
+                Ok((next_seq, latency))
             }
             SyncResponse::NotConnected => Err(Error::new(ErrorKind::NotConnected, "sync source is not connected")),
             response => Err(unexpected("Ok or FreshState", &response)),
+        }
+    }
+
+    async fn ping(
+        &mut self,
+        write: &Sender<SyncRequest<D>>,
+        read: &mut Receiver<SyncResponse<D>>,
+    ) -> std::io::Result<Duration> {
+        let start = tokio::time::Instant::now();
+        send(write, SyncRequest::Ping).await?;
+        match recv(read, self.settings.message_timeout).await? {
+            SyncResponse::Pong => Ok(start.elapsed()),
+            response => Err(unexpected("Pong", &response)),
         }
     }
 }

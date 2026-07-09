@@ -69,8 +69,18 @@ where
             return;
         }
 
-        let Some(request) = read.recv().await else {
-            return;
+        let request = loop {
+            let Some(request) = read.recv().await else {
+                return;
+            };
+            match request {
+                SyncRequest::Ping => {
+                    if write.send(SyncResponse::Pong).await.is_err() {
+                        return;
+                    }
+                }
+                request => break request,
+            }
         };
 
         let (feed, fresh_state) = match request {
@@ -99,6 +109,7 @@ where
                 let _ = write.send(SyncResponse::Ok).await;
                 return;
             }
+            SyncRequest::Ping => unreachable!("ping requests are handled before subscription dispatch"),
         };
 
         if let Some(state) = fresh_state {
@@ -133,6 +144,11 @@ where
                 },
                 request = read.recv() => match request {
                     Some(SyncRequest::Action(action)) => self.handle_action(action).await,
+                    Some(SyncRequest::Ping) => {
+                        if write.send(SyncResponse::Pong).await.is_err() {
+                            break;
+                        }
+                    }
                     Some(request) => tracing::debug!(?request, "ignoring non-action request after subscription"),
                     None => break,
                 },

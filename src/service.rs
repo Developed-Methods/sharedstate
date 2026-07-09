@@ -27,6 +27,7 @@ pub struct SharedStateConfig<I: SyncIOListener, D: DeterministicState> {
     pub io: Arc<I>,
     pub my_address: I::Address,
     pub leader_address: watch::Receiver<I::Address>,
+    pub available_peers: watch::Receiver<Vec<I::Address>>,
     pub initial_state: RecoverableState<D>,
     pub settings: SharedStateSettings,
 }
@@ -59,12 +60,13 @@ where
             io,
             my_address,
             leader_address,
+            available_peers,
             initial_state,
             settings,
         } = config;
 
         let state = SubscribableState::new(initial_state, settings.broadcast.clone())?;
-        let node = Arc::new(NodeState::new(my_address, leader_address, state));
+        let node = Arc::new(NodeState::new(my_address, leader_address, available_peers, state));
 
         let (actions_tx, actions_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         let rpc_server = Arc::new(RpcServer::new(node.clone(), actions_tx.clone()));

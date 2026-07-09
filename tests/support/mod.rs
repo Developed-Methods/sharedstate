@@ -135,13 +135,14 @@ impl TestCluster {
 
         let initial_leader = ios[0].address;
         let (leader_tx, leader_rx) = watch::channel(initial_leader);
+        let (_, available_peers_rx) = watch::channel(ios.iter().map(|io| io.address).collect::<Vec<_>>());
         let mut nodes = Vec::with_capacity(size);
         let mut node_by_address = HashMap::with_capacity(size);
 
         for io in ios {
             let index = nodes.len();
             node_by_address.insert(io.address, index);
-            nodes.push(Self::start_node(io, leader_rx.clone()));
+            nodes.push(Self::start_node(io, leader_rx.clone(), available_peers_rx.clone()));
         }
 
         Self {
@@ -151,12 +152,17 @@ impl TestCluster {
         }
     }
 
-    fn start_node(io: LocalhostTcpIo, leader_address: watch::Receiver<u16>) -> SharedState<LocalhostTcpIo, KvState> {
+    fn start_node(
+        io: LocalhostTcpIo,
+        leader_address: watch::Receiver<u16>,
+        available_peers: watch::Receiver<Vec<u16>>,
+    ) -> SharedState<LocalhostTcpIo, KvState> {
         let my_address = io.address;
         SharedState::start(SharedStateConfig {
             io: Arc::new(io),
             my_address,
             leader_address,
+            available_peers,
             initial_state: RecoverableState::new(my_address as u64, KvState::default()),
             settings: SharedStateSettings::default(),
         })

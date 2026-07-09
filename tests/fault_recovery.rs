@@ -77,6 +77,7 @@ impl SimCluster {
         let net = SimulatedNet::new();
         let initial_leader = 1;
         let (leader_tx, leader_rx) = watch::channel(initial_leader);
+        let (available_peers_tx, available_peers_rx) = watch::channel((1..=size as u64).collect::<Vec<_>>());
         let mut nodes = Vec::with_capacity(size);
 
         for address in 1..=size as u64 {
@@ -86,12 +87,15 @@ impl SimCluster {
                     io,
                     my_address: address,
                     leader_address: leader_rx.clone(),
+                    available_peers: available_peers_rx.clone(),
                     initial_state: RecoverableState::new(address, KvState::default()),
                     settings: test_settings(),
                 })
                 .unwrap(),
             );
         }
+
+        drop(available_peers_tx);
 
         Self { net, leader_tx, nodes }
     }
@@ -173,6 +177,8 @@ fn test_settings() -> SharedStateSettings {
         broadcast: Default::default(),
         sync_timing: StateSyncTiming {
             retry_delay: Duration::from_millis(50),
+            peer_failure_threshold: 2,
+            ..Default::default()
         },
     }
 }
@@ -221,6 +227,21 @@ async fn blackholed_edge_times_out_retries_then_converges_after_heal() {
 
     cluster.wait_connected(1).await;
     cluster.wait_value(1, "during-blackhole", "leader-value").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn follower_uses_available_peer_when_direct_leader_connection_keeps_failing() {
+    let cluster = SimCluster::start(3).await;
+    cluster.assert_leader_address();
+    cluster.wait_connected(1).await;
+    cluster.wait_connected(2).await;
+
+    cluster.net.set_edge_blocked(1, 3, true).await;
+    cluster.submit_to_leader("via-relay", "leader-value").await;
+
+    cluster.wait_value(1, "via-relay", "leader-value").await;
+    cluster.wait_connected(2).await;
+    cluster.wait_value(2, "via-relay", "leader-value").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
