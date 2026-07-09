@@ -14,7 +14,7 @@ use tokio::{
 use crate::{
     cluster::node_state::NodeState,
     metrics::SharedStateMetrics,
-    protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{PROTOCOL_VERSION, SyncRequest, SyncResponse},
     state::{deterministic_state::DeterministicState, recoverable_state::RecoverableStateAction},
     transport::{
         channels::NetIoSettings,
@@ -83,11 +83,13 @@ where
         I: SyncIO<Address = A>,
     {
         let (transport_addr, write, mut read) = conn.server_channels::<D>(settings.clone());
+        tracing::info!(?transport_addr, "accepted shared-state rpc client");
 
         if !handshake_client(&write, &mut read, settings.message_timeout).await {
-            tracing::debug!(?transport_addr, "rpc client handshake failed");
+            tracing::info!(?transport_addr, "rpc client handshake failed");
             return;
         }
+        tracing::info!(?transport_addr, "rpc client handshake succeeded");
 
         let request = loop {
             let Some(request) = read.recv().await else {
@@ -105,16 +107,32 @@ where
 
         let (feed, fresh_state) = match request {
             SyncRequest::Subscribe(details) => {
+                tracing::info!(
+                    ?transport_addr,
+                    subscriber_next_seq = details.next_seq(),
+                    "received shared-state subscription request"
+                );
                 if !self.state.is_leader() && !self.state.is_connected_to_leader() {
+                    tracing::info!(
+                        ?transport_addr,
+                        "rejecting shared-state subscription because node is not connected"
+                    );
                     let _ = write.send(SyncResponse::NotConnected).await;
                     return;
                 }
 
                 /* note keep lock while dealing with subscribe */
                 match self.state.state.subscribe(details).await {
-                    Ok(feed) => (feed, None),
+                    Ok(feed) => {
+                        tracing::info!(?transport_addr, "accepted incremental shared-state subscription");
+                        (feed, None)
+                    }
                     Err(error) => {
-                        tracing::debug!(?error, "client recovery failed, sending fresh state");
+                        tracing::info!(
+                            ?transport_addr,
+                            ?error,
+                            "incremental client recovery failed; sending fresh shared-state snapshot"
+                        );
                         let (state, feed) = self.state.state.subscribe_fresh().await;
                         (feed, Some(state))
                     }
@@ -158,10 +176,17 @@ where
         };
 
         if let Some(state) = fresh_state {
+            tracing::info!(
+                ?transport_addr,
+                fresh_next_seq = state.details().next_seq(),
+                "sending fresh shared-state snapshot"
+            );
             if write.send(SyncResponse::FreshState(state)).await.is_err() {
+                tracing::info!(?transport_addr, "failed to send fresh shared-state snapshot");
                 return;
             }
         } else if write.send(SyncResponse::Ok).await.is_err() {
+            tracing::info!(?transport_addr, "failed to acknowledge shared-state subscription");
             return;
         }
 
@@ -181,6 +206,7 @@ where
                 action = feed.recv() => match action {
                     Ok((seq, action)) => {
                         if write.send(SyncResponse::Action { seq, action }).await.is_err() {
+                            tracing::info!("shared-state subscription client stopped accepting actions");
                             break;
                         }
                     }
