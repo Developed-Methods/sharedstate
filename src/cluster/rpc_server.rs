@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arc_metrics::helpers::ActiveGauge;
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::SequencedReceiver;
 use tokio::{
@@ -9,6 +10,7 @@ use tokio::{
 
 use crate::{
     cluster::node_state::NodeState,
+    metrics::SharedStateMetrics,
     protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{deterministic_state::DeterministicState, recoverable_state::RecoverableStateAction},
     transport::{
@@ -20,11 +22,16 @@ use crate::{
 pub struct RpcServer<A: SyncIOAddress, D: DeterministicState> {
     state: Arc<NodeState<A, D>>,
     actions_tx: Sender<D::Action>,
+    metrics: Arc<SharedStateMetrics>,
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
-    pub fn new(state: Arc<NodeState<A, D>>, actions_tx: Sender<D::Action>) -> Self {
-        Self { state, actions_tx }
+    pub fn new(state: Arc<NodeState<A, D>>, actions_tx: Sender<D::Action>, metrics: Arc<SharedStateMetrics>) -> Self {
+        Self {
+            state,
+            actions_tx,
+            metrics,
+        }
     }
 }
 
@@ -129,6 +136,8 @@ where
         mut read: Receiver<SyncRequest<D>>,
         mut feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
     ) {
+        let _active = ActiveGauge::new(&self.metrics, |metrics| &metrics.active_subscription_count);
+
         loop {
             tokio::select! {
                 action = feed.recv() => match action {
@@ -157,6 +166,7 @@ where
     }
 
     async fn handle_action(&self, action: D::Action) {
+        self.metrics.action_client_count.inc();
         if self.actions_tx.send(action).await.is_err() {
             tracing::warn!("failed to queue client action");
         }

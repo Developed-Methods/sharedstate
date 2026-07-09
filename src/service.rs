@@ -15,6 +15,7 @@ use crate::{
         rpc_server::RpcServer,
         state_sync::{StateSyncTask, StateSyncTiming},
     },
+    metrics::SharedStateMetrics,
     state::{
         deterministic_state::DeterministicState,
         recoverable_state::RecoverableState,
@@ -45,6 +46,7 @@ const ACTION_QUEUE_CAPACITY: usize = 512;
 pub struct SharedState<I: SyncIOListener, D: DeterministicState> {
     node: Arc<NodeState<I::Address, D>>,
     actions_tx: mpsc::Sender<D::Action>,
+    metrics: Arc<SharedStateMetrics>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -67,18 +69,23 @@ where
 
         let state = SubscribableState::new(initial_state, settings.broadcast.clone())?;
         let node = Arc::new(NodeState::new(my_address, leader_address, available_peers, state));
+        let metrics = Arc::new(SharedStateMetrics::default());
 
         let (actions_tx, actions_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
-        let rpc_server = Arc::new(RpcServer::new(node.clone(), actions_tx.clone()));
+        let rpc_server = Arc::new(RpcServer::new(node.clone(), actions_tx.clone(), metrics.clone()));
 
         let tasks = vec![
             rpc_server.start_listener(io.clone(), settings.net.clone()),
-            tokio::spawn(StateSyncTask::new(node.clone(), io, settings.net, actions_rx, settings.sync_timing).run()),
+            tokio::spawn(
+                StateSyncTask::new(node.clone(), io, settings.net, actions_rx, settings.sync_timing, metrics.clone())
+                    .run(),
+            ),
         ];
 
         Ok(Self {
             node,
             actions_tx,
+            metrics,
             tasks,
         })
     }
@@ -101,6 +108,10 @@ where
 
     pub fn node(&self) -> &Arc<NodeState<I::Address, D>> {
         &self.node
+    }
+
+    pub fn metrics(&self) -> &Arc<SharedStateMetrics> {
+        &self.metrics
     }
 
     pub fn state_handle(&self) -> StateHandle<D> {

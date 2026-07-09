@@ -16,6 +16,7 @@ use tokio::sync::{
 
 use crate::{
     cluster::node_state::NodeState,
+    metrics::SharedStateMetrics,
     protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         deterministic_state::DeterministicState,
@@ -59,6 +60,7 @@ pub struct StateSyncTask<I: SyncIO, D: DeterministicState> {
     peer_updates_open: bool,
     peer_health: HashMap<I::Address, PeerHealth>,
     timing: StateSyncTiming,
+    metrics: Arc<SharedStateMetrics>,
 }
 
 enum SyncFlow {
@@ -80,6 +82,7 @@ where
         settings: NetIoSettings,
         actions_rx: Receiver<D::Action>,
         timing: StateSyncTiming,
+        metrics: Arc<SharedStateMetrics>,
     ) -> Self {
         let handle = state.state.create_handle();
         let leader_address = state.leader_address.clone();
@@ -96,6 +99,7 @@ where
             peer_updates_open: true,
             peer_health: HashMap::new(),
             timing,
+            metrics,
         }
     }
 
@@ -153,6 +157,7 @@ where
                     let authority = self
                         .handle
                         .read_with(move |state| state.authority(RecoverableStateAction::StateAction { action }));
+                    self.metrics.action_leader_count.inc();
                     self.state.state.update(iter::once(authority)).await;
                 }
                 changed = self.leader_address.changed(), if self.leader_updates_open => {
@@ -178,11 +183,13 @@ where
                     Ok(Ok(connection)) => connection,
                     Ok(Err(error)) => {
                         self.record_peer_failure(peer);
+                        self.metrics.peer_connect_failure_count.inc();
                         tracing::debug!(?peer, ?leader, ?error, "failed to connect to sync peer");
                         return SyncFlow::Retry;
                     }
                     Err(_) => {
                         self.record_peer_failure(peer);
+                        self.metrics.peer_connect_timeout_count.inc();
                         tracing::debug!(?peer, ?leader, "timed out connecting to sync peer");
                         return SyncFlow::Retry;
                     }
@@ -202,26 +209,31 @@ where
                 Ok(Ok(connection)) => connection,
                 Ok(Err(error)) => {
                     self.record_peer_failure(peer);
+                    self.metrics.peer_connect_failure_count.inc();
                     tracing::debug!(?peer, ?leader, ?error, "failed to connect to sync peer");
                     return SyncFlow::Retry;
                 }
                 Err(_) => {
                     self.record_peer_failure(peer);
+                    self.metrics.peer_connect_timeout_count.inc();
                     tracing::debug!(?peer, ?leader, "timed out connecting to sync peer");
                     return SyncFlow::Retry;
                 }
             }
         };
+        self.metrics.peer_connect_success_count.inc();
 
         let (_remote, write, mut read) = connection.client_channels::<D>(self.settings.clone());
         let details = self.state.state.settled_recovery_details().await;
         let mut next_seq = match self.subscribe(peer, &write, &mut read, details).await {
             Ok((next_seq, latency)) => {
                 self.record_peer_success(peer, latency);
+                self.metrics.peer_subscription_success_count.inc();
                 next_seq
             }
             Err(error) => {
                 self.record_peer_failure(peer);
+                self.metrics.peer_subscription_failure_count.inc();
                 tracing::warn!(?peer, ?leader, ?error, "sync peer subscription failed");
                 return SyncFlow::Retry;
             }
@@ -240,6 +252,7 @@ where
                             return SyncFlow::Retry;
                         }
                         next_seq += 1;
+                        self.metrics.action_follower_count.inc();
                         self.state.state.update(iter::once(action)).await;
                     }
                     Some(response) => {
@@ -262,6 +275,7 @@ where
                         tracing::warn!(?peer, ?leader, "failed to forward action to sync peer");
                         return SyncFlow::Retry;
                     }
+                    self.metrics.action_forwarded_count.inc();
                 }
                 changed = self.leader_address.changed(), if self.leader_updates_open => {
                     if changed.is_err() {
@@ -367,10 +381,14 @@ where
         send(write, SyncRequest::Subscribe(details)).await?;
 
         match recv(read, self.settings.message_timeout).await? {
-            SyncResponse::Ok => Ok((local_next_seq, latency)),
+            SyncResponse::Ok => {
+                self.metrics.record_incremental_recovery();
+                Ok((local_next_seq, latency))
+            }
             SyncResponse::FreshState(fresh) => {
                 let next_seq = fresh.details().next_seq();
                 self.state.state.reset(fresh).await;
+                self.metrics.record_fresh_recovery();
                 Ok((next_seq, latency))
             }
             SyncResponse::NotConnected => Err(Error::new(ErrorKind::NotConnected, "sync source is not connected")),
