@@ -5,6 +5,7 @@
 
 pub mod cluster;
 pub mod metrics;
+pub mod persistence;
 pub mod protocol;
 pub mod service;
 pub mod state;
