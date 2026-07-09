@@ -1,60 +1,134 @@
-use std::{collections::HashMap, num::NonZeroU64};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 
-use tokio::sync::Mutex;
+use message_encoding::MessageEncoding;
+use tokio::sync::watch;
 
 use crate::{
-    protocol::messages::{LeaderInfo, LeaderState, SharePeerDetails},
     state::{deterministic_state::DeterministicState, subscribable_state::SubscribableState},
     transport::traits::SyncIOAddress,
-    utils::now_ms,
+    utils::unknown_id_err,
 };
 
 pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
     pub my_address: A,
-    pub can_lead: bool,
-    pub peers: Mutex<HashMap<A, PeerState<A>>>,
+    pub leader_address: watch::Receiver<A>,
+    pub available_peers: watch::Receiver<Vec<A>>,
     pub state: SubscribableState<D>,
-    pub leader_state: Mutex<LeaderState<A>>,
+    connected_to_leader: AtomicBool,
+    connected_peer: Mutex<Option<A>>,
 }
 
-#[derive(Clone)]
-pub struct PeerState<A: SyncIOAddress> {
-    pub addr: A,
-    pub can_lead: Option<bool>,
-    pub connect_status: ConnectStatus,
-    pub last_global_connectivity: Option<NonZeroU64>,
-    pub leader_info: Option<LeaderInfo<A>>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DebugInfo<A: SyncIOAddress> {
+    pub my_address: A,
+    pub leader_address: A,
+    pub available_peers: Vec<A>,
+    pub status: NodeStatus<A>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConnectStatus {
-    Connected { epoch_ms: u64 },
-    FailedToConnect { epoch_ms: u64 },
-    NotConnected,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeStatus<A: SyncIOAddress> {
+    Leader,
+    Follower(FollowerStatus<A>),
 }
 
-impl ConnectStatus {
-    pub fn is_connected(&self) -> bool {
-        matches!(self, Self::Connected { .. })
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowerStatus<A: SyncIOAddress> {
+    Disconnected,
+    SubscribedToLeader,
+    SubscribedToPeer { peer: A },
+}
+
+impl<A: SyncIOAddress> MessageEncoding for DebugInfo<A> {
+    fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
+        let mut sum = 0;
+        sum += self.my_address.write_to(out)?;
+        sum += self.leader_address.write_to(out)?;
+        sum += (self.available_peers.len() as u64).write_to(out)?;
+        for peer in &self.available_peers {
+            sum += peer.write_to(out)?;
+        }
+        sum += self.status.write_to(out)?;
+        Ok(sum)
+    }
+
+    fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
+        let my_address = MessageEncoding::read_from(read)?;
+        let leader_address = MessageEncoding::read_from(read)?;
+        let len = u64::read_from(read)? as usize;
+        let mut available_peers = Vec::with_capacity(len);
+        for _ in 0..len {
+            available_peers.push(MessageEncoding::read_from(read)?);
+        }
+        let status = MessageEncoding::read_from(read)?;
+        Ok(Self {
+            my_address,
+            leader_address,
+            available_peers,
+            status,
+        })
     }
 }
 
-impl<A: SyncIOAddress> PeerState<A> {
-    pub(crate) fn empty(addr: A) -> Self {
-        Self {
-            addr,
-            can_lead: None,
-            connect_status: ConnectStatus::NotConnected,
-            last_global_connectivity: None,
-            leader_info: None,
+impl<A: SyncIOAddress> MessageEncoding for NodeStatus<A> {
+    fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
+        match self {
+            Self::Leader => 0u16.write_to(out),
+            Self::Follower(status) => Ok(1u16.write_to(out)? + status.write_to(out)?),
         }
     }
 
-    pub(crate) fn share_details(&self) -> SharePeerDetails<A> {
-        SharePeerDetails {
-            address: self.addr,
-            can_be_leader: self.can_lead,
-            last_global_activity: self.last_global_connectivity,
+    fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
+        match u16::read_from(read)? {
+            0 => Ok(Self::Leader),
+            1 => Ok(Self::Follower(MessageEncoding::read_from(read)?)),
+            other => Err(unknown_id_err(other, "NodeStatus")),
+        }
+    }
+}
+
+impl<A: SyncIOAddress> MessageEncoding for FollowerStatus<A> {
+    fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
+        match self {
+            Self::Disconnected => 0u16.write_to(out),
+            Self::SubscribedToLeader => 1u16.write_to(out),
+            Self::SubscribedToPeer { peer } => Ok(2u16.write_to(out)? + peer.write_to(out)?),
+        }
+    }
+
+    fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
+        match u16::read_from(read)? {
+            0 => Ok(Self::Disconnected),
+            1 => Ok(Self::SubscribedToLeader),
+            2 => Ok(Self::SubscribedToPeer {
+                peer: MessageEncoding::read_from(read)?,
+            }),
+            other => Err(unknown_id_err(other, "FollowerStatus")),
+        }
+    }
+}
+
+impl<A: SyncIOAddress> DebugInfo<A> {
+    pub fn is_leader(&self) -> bool {
+        matches!(self.status, NodeStatus::Leader)
+    }
+
+    pub fn is_connected_to_leader(&self) -> bool {
+        !matches!(self.status, NodeStatus::Follower(FollowerStatus::Disconnected))
+    }
+
+    pub fn is_subscribed_to_leader(&self) -> bool {
+        matches!(self.status, NodeStatus::Follower(FollowerStatus::SubscribedToLeader))
+    }
+
+    pub fn connected_peer(&self) -> Option<A> {
+        match self.status {
+            NodeStatus::Leader | NodeStatus::Follower(FollowerStatus::Disconnected) => None,
+            NodeStatus::Follower(FollowerStatus::SubscribedToLeader) => Some(self.leader_address),
+            NodeStatus::Follower(FollowerStatus::SubscribedToPeer { peer }) => Some(peer),
         }
     }
 }
@@ -64,75 +138,74 @@ where
     A: SyncIOAddress,
     D: DeterministicState,
 {
-    pub(crate) async fn merge_peer_details(&self, shared_peers: Vec<SharePeerDetails<A>>) {
-        let mut peers = self.peers.lock().await;
-
-        for shared in shared_peers {
-            if shared.address == self.my_address {
-                continue;
-            }
-
-            let peer_state = peers
-                .entry(shared.address)
-                .or_insert_with(|| PeerState::empty(shared.address));
-
-            if let Some(can_lead) = shared.can_be_leader {
-                peer_state.can_lead = Some(can_lead);
-            }
-
-            peer_state.last_global_connectivity =
-                merge_last_activity(peer_state.last_global_connectivity, shared.last_global_activity);
+    pub fn new(
+        my_address: A,
+        leader_address: watch::Receiver<A>,
+        available_peers: watch::Receiver<Vec<A>>,
+        state: SubscribableState<D>,
+    ) -> Self {
+        let is_leader = my_address == *leader_address.borrow();
+        Self {
+            my_address,
+            leader_address,
+            available_peers,
+            state,
+            connected_to_leader: AtomicBool::new(is_leader),
+            connected_peer: Mutex::new(None),
         }
     }
 
-    pub(crate) async fn known_peer_details(&self) -> Vec<SharePeerDetails<A>> {
-        self.peers.lock().await.values().map(PeerState::share_details).collect()
+    pub fn leader_address(&self) -> A {
+        *self.leader_address.borrow()
     }
 
-    /// Records activity from a peer, registering it if this is first contact.
-    /// Returns whether the peer was already known.
-    pub(crate) async fn note_known_peer_activity(&self, peer: A) -> bool {
-        let mut peers = self.peers.lock().await;
-        let known = peers.contains_key(&peer);
-        let peer_state = peers.entry(peer).or_insert_with(|| PeerState::empty(peer));
-        peer_state.last_global_connectivity = NonZeroU64::new(now_ms());
-        known
+    pub fn available_peers(&self) -> Vec<A> {
+        self.available_peers.borrow().clone()
     }
 
-    pub(crate) async fn mark_peer_connected(&self, peer: A) {
-        self.set_peer_connect_status(peer, ConnectStatus::Connected { epoch_ms: now_ms() })
-            .await;
+    pub fn is_leader(&self) -> bool {
+        self.my_address == self.leader_address()
     }
 
-    pub(crate) async fn mark_peer_not_connected(&self, peer: A) {
-        self.set_peer_connect_status(peer, ConnectStatus::NotConnected).await;
+    pub fn is_connected_to_leader(&self) -> bool {
+        self.connected_to_leader.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn mark_peer_failed_to_connect(&self, peer: A) {
-        self.set_peer_connect_status(peer, ConnectStatus::FailedToConnect { epoch_ms: now_ms() })
-            .await;
+    pub fn set_connected_to_leader(&self, connected: bool) {
+        if !connected || self.is_leader() {
+            *self.connected_peer.lock().unwrap() = None;
+        }
+        self.connected_to_leader
+            .store(connected || self.is_leader(), Ordering::Release);
     }
 
-    async fn set_peer_connect_status(&self, peer: A, connect_status: ConnectStatus) {
-        self.peers
-            .lock()
-            .await
-            .entry(peer)
-            .and_modify(|peer_state| {
-                peer_state.connect_status = connect_status;
-            })
-            .or_insert_with(|| {
-                let mut peer_state = PeerState::empty(peer);
-                peer_state.connect_status = connect_status;
-                peer_state
-            });
+    pub fn set_connected_peer(&self, peer: Option<A>) {
+        *self.connected_peer.lock().unwrap() = peer;
     }
-}
 
-fn merge_last_activity(current: Option<NonZeroU64>, incoming: Option<NonZeroU64>) -> Option<NonZeroU64> {
-    match (current, incoming) {
-        (None, Some(activity)) | (Some(activity), None) => Some(activity),
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (None, None) => None,
+    pub fn connected_peer(&self) -> Option<A> {
+        *self.connected_peer.lock().unwrap()
+    }
+
+    pub fn debug_info(&self) -> DebugInfo<A> {
+        let leader_address = self.leader_address();
+        let is_leader = self.my_address == leader_address;
+        let is_connected_to_leader = self.is_connected_to_leader();
+        let connected_peer = self.connected_peer();
+        let status = match (is_leader, is_connected_to_leader, connected_peer) {
+            (true, _, _) => NodeStatus::Leader,
+            (false, true, Some(peer)) if peer == leader_address => {
+                NodeStatus::Follower(FollowerStatus::SubscribedToLeader)
+            }
+            (false, true, Some(peer)) => NodeStatus::Follower(FollowerStatus::SubscribedToPeer { peer }),
+            (false, _, _) => NodeStatus::Follower(FollowerStatus::Disconnected),
+        };
+
+        DebugInfo {
+            my_address: self.my_address,
+            leader_address,
+            available_peers: self.available_peers(),
+            status,
+        }
     }
 }

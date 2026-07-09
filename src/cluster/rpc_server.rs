@@ -1,19 +1,21 @@
 use std::sync::Arc;
 
+use arc_metrics::helpers::ActiveGauge;
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::SequencedReceiver;
 use tokio::{
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        mpsc::{Receiver, Sender},
+        watch,
+    },
     task::JoinHandle,
 };
 
 use crate::{
-    cluster::node_state::{NodeState, PeerState},
+    cluster::node_state::NodeState,
+    metrics::SharedStateMetrics,
     protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
-    state::{
-        deterministic_state::DeterministicState,
-        recoverable_state::{RecoverableState, RecoverableStateAction},
-    },
+    state::{deterministic_state::DeterministicState, recoverable_state::RecoverableStateAction},
     transport::{
         channels::NetIoSettings,
         traits::{SyncConnection, SyncIO, SyncIOAddress, SyncIOListener},
@@ -22,61 +24,27 @@ use crate::{
 
 pub struct RpcServer<A: SyncIOAddress, D: DeterministicState> {
     state: Arc<NodeState<A, D>>,
-    actions_tx: Sender<(A, D::Action)>,
+    actions_tx: Sender<D::Action>,
+    leader_address_tx: watch::Sender<A>,
+    available_peers_tx: watch::Sender<Vec<A>>,
+    metrics: Arc<SharedStateMetrics>,
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
-    pub fn new(state: Arc<NodeState<A, D>>, actions_tx: Sender<(A, D::Action)>) -> Self {
-        RpcServer { state, actions_tx }
-    }
-
-    pub async fn handle(&self, peer_addr: A, request: SyncRequest<A, D>) -> ResponseOrFeed<A, D> {
-        if !self.state.note_known_peer_activity(peer_addr).await {
-            tracing::debug!(?peer_addr, "learned about new peer from inbound connection");
+    pub fn new(
+        state: Arc<NodeState<A, D>>,
+        actions_tx: Sender<D::Action>,
+        leader_address_tx: watch::Sender<A>,
+        available_peers_tx: watch::Sender<Vec<A>>,
+        metrics: Arc<SharedStateMetrics>,
+    ) -> Self {
+        Self {
+            state,
+            actions_tx,
+            leader_address_tx,
+            available_peers_tx,
+            metrics,
         }
-
-        let resp = match request {
-            SyncRequest::ProtocolVersion(_) => SyncResponse::UnexpectedRequest,
-            SyncRequest::MyAddress(_) => SyncResponse::UnexpectedRequest,
-
-            SyncRequest::Action { source, action } => {
-                if self.actions_tx.send((source, action)).await.is_ok() {
-                    SyncResponse::Ok
-                } else {
-                    SyncResponse::FailedToQueueAction { source }
-                }
-            }
-            SyncRequest::LeaderInformation(info) => {
-                let mut lock = self.state.peers.lock().await;
-                let peer = lock.entry(peer_addr).or_insert_with(|| PeerState::empty(peer_addr));
-                peer.can_lead = Some(info.can_lead);
-                peer.leader_info = Some(info);
-
-                SyncResponse::Ok
-            }
-            SyncRequest::SubscribeRecovery(details) => match self.state.state.subscribe(details).await {
-                Ok(feed) => return ResponseOrFeed::Subscription { feed },
-                Err(error) => {
-                    tracing::warn!(?error, "client recovery failed");
-                    SyncResponse::RecoveryFailed
-                }
-            },
-            SyncRequest::SubscribeFresh => {
-                let (state, feed) = self.state.state.subscribe_fresh().await;
-                return ResponseOrFeed::FreshState { state, feed };
-            }
-            SyncRequest::LeaderQuery => {
-                let leader_state = self.state.leader_state.lock().await.clone();
-                SyncResponse::LeaderState(leader_state)
-            }
-            SyncRequest::SharePeers(shared_peers) => {
-                self.state.merge_peer_details(shared_peers).await;
-                let share_peer_details = self.state.known_peer_details().await;
-                SyncResponse::Peers(share_peer_details)
-            }
-        };
-
-        ResponseOrFeed::Response(resp)
     }
 }
 
@@ -115,33 +83,158 @@ where
         I: SyncIO<Address = A>,
     {
         let (transport_addr, write, mut read) = conn.server_channels::<D>(settings.clone());
-        let Some(peer_addr) = handshake_client(&write, &mut read, settings.message_timeout).await else {
+
+        if !handshake_client(&write, &mut read, settings.message_timeout).await {
             tracing::debug!(?transport_addr, "rpc client handshake failed");
             return;
+        }
+
+        let request = loop {
+            let Some(request) = read.recv().await else {
+                return;
+            };
+            match request {
+                SyncRequest::Ping(id) => {
+                    if write.send(SyncResponse::Pong(id)).await.is_err() {
+                        return;
+                    }
+                }
+                request => break request,
+            }
         };
 
-        while let Some(request) = read.recv().await {
-            match self.handle(peer_addr, request).await {
-                ResponseOrFeed::Response(response) => {
-                    if write.send(response).await.is_err() {
-                        break;
-                    }
+        let (feed, fresh_state) = match request {
+            SyncRequest::Subscribe(details) => {
+                if !self.state.is_leader() && !self.state.is_connected_to_leader() {
+                    let _ = write.send(SyncResponse::NotConnected).await;
+                    return;
                 }
-                ResponseOrFeed::FreshState { state, feed } => {
-                    if write.send(SyncResponse::FreshState(state)).await.is_err() {
-                        break;
+
+                /* note keep lock while dealing with subscribe */
+                match self.state.state.subscribe(details).await {
+                    Ok(feed) => (feed, None),
+                    Err(error) => {
+                        tracing::debug!(?error, "client recovery failed, sending fresh state");
+                        let (state, feed) = self.state.state.subscribe_fresh().await;
+                        (feed, Some(state))
                     }
-                    stream_feed(write, feed).await;
-                    break;
-                }
-                ResponseOrFeed::Subscription { feed } => {
-                    if write.send(SyncResponse::Accepted(feed.next_seq())).await.is_err() {
-                        break;
-                    }
-                    stream_feed(write, feed).await;
-                    break;
                 }
             }
+            SyncRequest::Action(action) => {
+                self.handle_action(action).await;
+                let _ = write.send(SyncResponse::Ok).await;
+                return;
+            }
+            SyncRequest::GetNodeStatus => {
+                let _ = write.send(SyncResponse::NodeStatus(self.state.debug_info())).await;
+                return;
+            }
+            SyncRequest::SetLeader(leader) => {
+                self.leader_address_tx.send_replace(leader);
+                let _ = write.send(SyncResponse::Ok).await;
+                return;
+            }
+            SyncRequest::SetAvailablePeers(peers) => {
+                self.available_peers_tx.send_replace(peers);
+                let _ = write.send(SyncResponse::Ok).await;
+                return;
+            }
+            SyncRequest::GetCurrentLeader => {
+                let _ = write
+                    .send(SyncResponse::CurrentLeader(self.state.leader_address()))
+                    .await;
+                return;
+            }
+            SyncRequest::GetCurrentStateRecoverDetails => {
+                let details = self.state.state.settled_recovery_details().await;
+                let _ = write.send(SyncResponse::CurrentStateRecoverDetails(details)).await;
+                return;
+            }
+            SyncRequest::ProtocolVersion(_) => {
+                let _ = write.send(SyncResponse::Ok).await;
+                return;
+            }
+            SyncRequest::Ping(_) => unreachable!("ping requests are handled before subscription dispatch"),
+        };
+
+        if let Some(state) = fresh_state {
+            if write.send(SyncResponse::FreshState(state)).await.is_err() {
+                return;
+            }
+        } else if write.send(SyncResponse::Ok).await.is_err() {
+            return;
+        }
+
+        self.serve_subscription(write, read, feed).await;
+    }
+
+    async fn serve_subscription(
+        &self,
+        write: Sender<SyncResponse<A, D>>,
+        mut read: Receiver<SyncRequest<A, D>>,
+        mut feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
+    ) {
+        let _active = ActiveGauge::new(&self.metrics, |metrics| &metrics.active_subscription_count);
+
+        loop {
+            tokio::select! {
+                action = feed.recv() => match action {
+                    Ok((seq, action)) => {
+                        if write.send(SyncResponse::Action { seq, action }).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(?error, "rpc subscription feed closed");
+                        break;
+                    }
+                },
+                request = read.recv() => match request {
+                    Some(SyncRequest::Action(action)) => self.handle_action(action).await,
+                    Some(SyncRequest::Ping(id)) => {
+                        if write.send(SyncResponse::Pong(id)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(SyncRequest::GetNodeStatus) => {
+                        if write.send(SyncResponse::NodeStatus(self.state.debug_info())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(SyncRequest::SetLeader(leader)) => {
+                        self.leader_address_tx.send_replace(leader);
+                        if write.send(SyncResponse::Ok).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(SyncRequest::SetAvailablePeers(peers)) => {
+                        self.available_peers_tx.send_replace(peers);
+                        if write.send(SyncResponse::Ok).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(SyncRequest::GetCurrentLeader) => {
+                        if write.send(SyncResponse::CurrentLeader(self.state.leader_address())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(SyncRequest::GetCurrentStateRecoverDetails) => {
+                        let details = self.state.state.settled_recovery_details().await;
+                        if write.send(SyncResponse::CurrentStateRecoverDetails(details)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(request) => tracing::debug!(?request, "ignoring non-action request after subscription"),
+                    None => break,
+                },
+            }
+        }
+    }
+
+    async fn handle_action(&self, action: D::Action) {
+        self.metrics.action_client_count.inc();
+        if self.actions_tx.send(action).await.is_err() {
+            tracing::warn!("failed to queue client action");
         }
     }
 }
@@ -150,65 +243,17 @@ async fn handshake_client<A, D>(
     write: &Sender<SyncResponse<A, D>>,
     read: &mut Receiver<SyncRequest<A, D>>,
     timeout: std::time::Duration,
-) -> Option<A>
+) -> bool
 where
     A: SyncIOAddress,
     D: DeterministicState,
 {
-    let version = tokio::time::timeout(timeout, read.recv()).await.ok().flatten()?;
+    let version = tokio::time::timeout(timeout, read.recv()).await.ok().flatten();
     match version {
-        SyncRequest::ProtocolVersion(PROTOCOL_VERSION) => {
-            write.send(SyncResponse::Ok).await.ok()?;
-        }
+        Some(SyncRequest::ProtocolVersion(PROTOCOL_VERSION)) => write.send(SyncResponse::Ok).await.is_ok(),
         _ => {
-            let _ = write.send(SyncResponse::UnexpectedRequest).await;
-            return None;
+            let _ = write.send(SyncResponse::NotConnected).await;
+            false
         }
     }
-
-    let address = tokio::time::timeout(timeout, read.recv()).await.ok().flatten()?;
-    match address {
-        SyncRequest::MyAddress(address) => {
-            write.send(SyncResponse::Ok).await.ok()?;
-            Some(address)
-        }
-        _ => {
-            let _ = write.send(SyncResponse::UnexpectedRequest).await;
-            None
-        }
-    }
-}
-
-async fn stream_feed<A, D>(
-    write: Sender<SyncResponse<A, D>>,
-    mut feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
-) where
-    A: SyncIOAddress,
-    D: DeterministicState,
-{
-    loop {
-        match feed.recv().await {
-            Ok((seq, action)) => {
-                if write.send(SyncResponse::AuthorityAction(seq, action)).await.is_err() {
-                    break;
-                }
-            }
-            Err(error) => {
-                tracing::debug!(?error, "rpc subscription feed closed");
-                let _ = write.send(SyncResponse::ActionStreamClosed).await;
-                break;
-            }
-        }
-    }
-}
-
-pub enum ResponseOrFeed<A: SyncIOAddress, D: DeterministicState> {
-    Response(SyncResponse<A, D>),
-    FreshState {
-        state: RecoverableState<D>,
-        feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
-    },
-    Subscription {
-        feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
-    },
 }
