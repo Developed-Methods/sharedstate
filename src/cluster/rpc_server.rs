@@ -4,7 +4,10 @@ use arc_metrics::helpers::ActiveGauge;
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::SequencedReceiver;
 use tokio::{
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        mpsc::{Receiver, Sender},
+        watch,
+    },
     task::JoinHandle,
 };
 
@@ -22,14 +25,24 @@ use crate::{
 pub struct RpcServer<A: SyncIOAddress, D: DeterministicState> {
     state: Arc<NodeState<A, D>>,
     actions_tx: Sender<D::Action>,
+    leader_address_tx: watch::Sender<A>,
+    available_peers_tx: watch::Sender<Vec<A>>,
     metrics: Arc<SharedStateMetrics>,
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
-    pub fn new(state: Arc<NodeState<A, D>>, actions_tx: Sender<D::Action>, metrics: Arc<SharedStateMetrics>) -> Self {
+    pub fn new(
+        state: Arc<NodeState<A, D>>,
+        actions_tx: Sender<D::Action>,
+        leader_address_tx: watch::Sender<A>,
+        available_peers_tx: watch::Sender<Vec<A>>,
+        metrics: Arc<SharedStateMetrics>,
+    ) -> Self {
         Self {
             state,
             actions_tx,
+            leader_address_tx,
+            available_peers_tx,
             metrics,
         }
     }
@@ -112,6 +125,31 @@ where
                 let _ = write.send(SyncResponse::Ok).await;
                 return;
             }
+            SyncRequest::GetNodeStatus => {
+                let _ = write.send(SyncResponse::NodeStatus(self.state.debug_info())).await;
+                return;
+            }
+            SyncRequest::SetLeader(leader) => {
+                self.leader_address_tx.send_replace(leader);
+                let _ = write.send(SyncResponse::Ok).await;
+                return;
+            }
+            SyncRequest::SetAvailablePeers(peers) => {
+                self.available_peers_tx.send_replace(peers);
+                let _ = write.send(SyncResponse::Ok).await;
+                return;
+            }
+            SyncRequest::GetCurrentLeader => {
+                let _ = write
+                    .send(SyncResponse::CurrentLeader(self.state.leader_address()))
+                    .await;
+                return;
+            }
+            SyncRequest::GetCurrentStateRecoverDetails => {
+                let details = self.state.state.settled_recovery_details().await;
+                let _ = write.send(SyncResponse::CurrentStateRecoverDetails(details)).await;
+                return;
+            }
             SyncRequest::ProtocolVersion(_) => {
                 let _ = write.send(SyncResponse::Ok).await;
                 return;
@@ -132,8 +170,8 @@ where
 
     async fn serve_subscription(
         &self,
-        write: Sender<SyncResponse<D>>,
-        mut read: Receiver<SyncRequest<D>>,
+        write: Sender<SyncResponse<A, D>>,
+        mut read: Receiver<SyncRequest<A, D>>,
         mut feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
     ) {
         let _active = ActiveGauge::new(&self.metrics, |metrics| &metrics.active_subscription_count);
@@ -158,6 +196,34 @@ where
                             break;
                         }
                     }
+                    Some(SyncRequest::GetNodeStatus) => {
+                        if write.send(SyncResponse::NodeStatus(self.state.debug_info())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(SyncRequest::SetLeader(leader)) => {
+                        self.leader_address_tx.send_replace(leader);
+                        if write.send(SyncResponse::Ok).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(SyncRequest::SetAvailablePeers(peers)) => {
+                        self.available_peers_tx.send_replace(peers);
+                        if write.send(SyncResponse::Ok).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(SyncRequest::GetCurrentLeader) => {
+                        if write.send(SyncResponse::CurrentLeader(self.state.leader_address())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(SyncRequest::GetCurrentStateRecoverDetails) => {
+                        let details = self.state.state.settled_recovery_details().await;
+                        if write.send(SyncResponse::CurrentStateRecoverDetails(details)).await.is_err() {
+                            break;
+                        }
+                    }
                     Some(request) => tracing::debug!(?request, "ignoring non-action request after subscription"),
                     None => break,
                 },
@@ -173,12 +239,13 @@ where
     }
 }
 
-async fn handshake_client<D>(
-    write: &Sender<SyncResponse<D>>,
-    read: &mut Receiver<SyncRequest<D>>,
+async fn handshake_client<A, D>(
+    write: &Sender<SyncResponse<A, D>>,
+    read: &mut Receiver<SyncRequest<A, D>>,
     timeout: std::time::Duration,
 ) -> bool
 where
+    A: SyncIOAddress,
     D: DeterministicState,
 {
     let version = tokio::time::timeout(timeout, read.recv()).await.ok().flatten();

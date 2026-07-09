@@ -39,6 +39,9 @@ const PROCESS_TIMEOUT: Duration = Duration::from_millis(75);
 const MESSAGE_TIMEOUT: Duration = Duration::from_millis(150);
 const ASSERT_TIMEOUT: Duration = Duration::from_secs(3);
 
+type TcpSyncRequest = SyncRequest<u16, TestState>;
+type TcpSyncResponse = SyncResponse<u16, TestState>;
+
 #[derive(Clone)]
 struct LocalhostTcpIo {
     address: u16,
@@ -161,11 +164,9 @@ async fn start_tcp_leader() -> (SharedState<LocalhostTcpIo, TestState>, u16) {
     (node, address)
 }
 
-async fn read_handshake_rejection(stream: &mut TcpStream) -> Option<SyncResponse<TestState>> {
+async fn read_handshake_rejection(stream: &mut TcpStream) -> Option<TcpSyncResponse> {
     let mut buffer = Vec::new();
-    match read_message_opt::<SyncResponse<TestState>, _>(&mut buffer, stream, PROCESS_TIMEOUT, Some(ASSERT_TIMEOUT))
-        .await
-    {
+    match read_message_opt::<TcpSyncResponse, _>(&mut buffer, stream, PROCESS_TIMEOUT, Some(ASSERT_TIMEOUT)).await {
         Ok(ReadMessageResult::Message(response)) => Some(response),
         Ok(ReadMessageResult::Close) => None,
         Ok(ReadMessageResult::KeepAlive) => panic!("server sent keepalive instead of rejecting handshake"),
@@ -174,7 +175,7 @@ async fn read_handshake_rejection(stream: &mut TcpStream) -> Option<SyncResponse
     }
 }
 
-async fn assert_rejected(response: Option<SyncResponse<TestState>>) {
+async fn assert_rejected(response: Option<TcpSyncResponse>) {
     if let Some(response) = response {
         assert!(
             matches!(response, SyncResponse::NotConnected),
@@ -184,9 +185,9 @@ async fn assert_rejected(response: Option<SyncResponse<TestState>>) {
     }
 }
 
-async fn read_response(stream: &mut TcpStream) -> SyncResponse<TestState> {
+async fn read_response(stream: &mut TcpStream) -> TcpSyncResponse {
     let mut buffer = Vec::new();
-    match read_message_opt::<SyncResponse<TestState>, _>(&mut buffer, stream, PROCESS_TIMEOUT, Some(ASSERT_TIMEOUT))
+    match read_message_opt::<TcpSyncResponse, _>(&mut buffer, stream, PROCESS_TIMEOUT, Some(ASSERT_TIMEOUT))
         .await
         .unwrap()
     {
@@ -196,20 +197,30 @@ async fn read_response(stream: &mut TcpStream) -> SyncResponse<TestState> {
     }
 }
 
+async fn request_rpc(address: u16, request: TcpSyncRequest) -> TcpSyncResponse {
+    let mut stream = TcpStream::connect(("127.0.0.1", address)).await.unwrap();
+    let mut buffer = Vec::new();
+
+    send_message(&mut buffer, &TcpSyncRequest::ProtocolVersion(PROTOCOL_VERSION), &mut stream, PROCESS_TIMEOUT)
+        .await
+        .unwrap();
+    assert!(matches!(read_response(&mut stream).await, SyncResponse::Ok));
+
+    send_message(&mut buffer, &request, &mut stream, PROCESS_TIMEOUT)
+        .await
+        .unwrap();
+    read_response(&mut stream).await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn handshake_rejects_wrong_protocol_version() {
     let (_node, address) = start_tcp_leader().await;
     let mut stream = TcpStream::connect(("127.0.0.1", address)).await.unwrap();
     let mut buffer = Vec::new();
 
-    send_message(
-        &mut buffer,
-        &SyncRequest::<TestState>::ProtocolVersion(PROTOCOL_VERSION + 1),
-        &mut stream,
-        PROCESS_TIMEOUT,
-    )
-    .await
-    .unwrap();
+    send_message(&mut buffer, &TcpSyncRequest::ProtocolVersion(PROTOCOL_VERSION + 1), &mut stream, PROCESS_TIMEOUT)
+        .await
+        .unwrap();
 
     assert_rejected(read_handshake_rejection(&mut stream).await).await;
 }
@@ -220,20 +231,62 @@ async fn ping_rpc_returns_pong_after_handshake() {
     let mut stream = TcpStream::connect(("127.0.0.1", address)).await.unwrap();
     let mut buffer = Vec::new();
 
-    send_message(
-        &mut buffer,
-        &SyncRequest::<TestState>::ProtocolVersion(PROTOCOL_VERSION),
-        &mut stream,
-        PROCESS_TIMEOUT,
-    )
-    .await
-    .unwrap();
+    send_message(&mut buffer, &TcpSyncRequest::ProtocolVersion(PROTOCOL_VERSION), &mut stream, PROCESS_TIMEOUT)
+        .await
+        .unwrap();
     assert!(matches!(read_response(&mut stream).await, SyncResponse::Ok));
 
-    send_message(&mut buffer, &SyncRequest::<TestState>::Ping(42), &mut stream, PROCESS_TIMEOUT)
+    send_message(&mut buffer, &TcpSyncRequest::Ping(42), &mut stream, PROCESS_TIMEOUT)
         .await
         .unwrap();
     assert!(matches!(read_response(&mut stream).await, SyncResponse::Pong(42)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_leader_and_recovery_details_rpcs_return_current_values() {
+    let (node, address) = start_tcp_leader().await;
+
+    match request_rpc(address, TcpSyncRequest::GetNodeStatus).await {
+        SyncResponse::NodeStatus(status) => {
+            assert_eq!(status.my_address, address);
+            assert_eq!(status.leader_address, address);
+            assert_eq!(status.available_peers, vec![address]);
+            assert!(status.is_leader());
+        }
+        response => panic!("expected node status, got {}", response.name()),
+    }
+
+    assert!(matches!(
+        request_rpc(address, TcpSyncRequest::GetCurrentLeader).await,
+        SyncResponse::CurrentLeader(current) if current == address
+    ));
+
+    let details = match request_rpc(address, TcpSyncRequest::GetCurrentStateRecoverDetails).await {
+        SyncResponse::CurrentStateRecoverDetails(details) => details,
+        response => panic!("expected recovery details, got {}", response.name()),
+    };
+    let mut handle = node.state_handle();
+    assert_eq!(details, handle.recover_details());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_leader_and_available_peers_rpcs_update_node_watches() {
+    let (node, address) = start_tcp_leader().await;
+    let next_leader = address.wrapping_add(1);
+    let next_peers = vec![address, next_leader];
+
+    assert!(matches!(
+        request_rpc(address, TcpSyncRequest::SetAvailablePeers(next_peers.clone())).await,
+        SyncResponse::Ok
+    ));
+    assert_eq!(node.debug_info().available_peers, next_peers);
+
+    assert!(matches!(request_rpc(address, TcpSyncRequest::SetLeader(next_leader)).await, SyncResponse::Ok));
+    assert_eq!(node.leader_address(), next_leader);
+    assert!(matches!(
+        request_rpc(address, TcpSyncRequest::GetCurrentLeader).await,
+        SyncResponse::CurrentLeader(current) if current == next_leader
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -252,7 +305,7 @@ async fn handshake_rejects_unexpected_initial_request() {
 
     send_message(
         &mut buffer,
-        &SyncRequest::<TestState>::Action(("before-handshake".to_owned(), "bad".to_owned())),
+        &TcpSyncRequest::Action(("before-handshake".to_owned(), "bad".to_owned())),
         &mut stream,
         PROCESS_TIMEOUT,
     )
@@ -396,10 +449,9 @@ async fn framing_rejects_invalid_encoded_body() {
     writer.write_all(&999u16.to_be_bytes()).await.unwrap();
 
     let mut buffer = Vec::new();
-    let error =
-        read_message_opt::<SyncRequest<TestState>, _>(&mut buffer, &mut reader, PROCESS_TIMEOUT, Some(PROCESS_TIMEOUT))
-            .await
-            .unwrap_err();
+    let error = read_message_opt::<TcpSyncRequest, _>(&mut buffer, &mut reader, PROCESS_TIMEOUT, Some(PROCESS_TIMEOUT))
+        .await
+        .unwrap_err();
 
     assert!(matches!(error, ReadMessageError::EncodingError(_)));
 }

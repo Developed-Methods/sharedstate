@@ -76,7 +76,13 @@ where
         let metrics = Arc::new(SharedStateMetrics::default());
 
         let (actions_tx, actions_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
-        let rpc_server = Arc::new(RpcServer::new(node.clone(), actions_tx.clone(), metrics.clone()));
+        let rpc_server = Arc::new(RpcServer::new(
+            node.clone(),
+            actions_tx.clone(),
+            leader_address_tx.clone(),
+            available_peers_tx.clone(),
+            metrics.clone(),
+        ));
 
         let tasks = vec![
             rpc_server.start_listener(io.clone(), settings.net.clone()),

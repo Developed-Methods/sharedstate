@@ -23,7 +23,10 @@ use crate::{
         recoverable_state::{RecoverableStateAction, RecoverableStateDetails},
         subscribable_state::StateHandle,
     },
-    transport::{channels::NetIoSettings, traits::SyncIO},
+    transport::{
+        channels::NetIoSettings,
+        traits::{SyncIO, SyncIOAddress},
+    },
     utils::unique_state_id,
 };
 
@@ -345,8 +348,8 @@ where
     async fn subscribe(
         &mut self,
         peer: I::Address,
-        write: &Sender<SyncRequest<D>>,
-        read: &mut Receiver<SyncResponse<D>>,
+        write: &Sender<SyncRequest<I::Address, D>>,
+        read: &mut Receiver<SyncResponse<I::Address, D>>,
         details: RecoverableStateDetails,
     ) -> std::io::Result<(u64, Option<Duration>)> {
         send(write, SyncRequest::ProtocolVersion(PROTOCOL_VERSION)).await?;
@@ -379,8 +382,8 @@ where
 
     async fn ping(
         &mut self,
-        write: &Sender<SyncRequest<D>>,
-        read: &mut Receiver<SyncResponse<D>>,
+        write: &Sender<SyncRequest<I::Address, D>>,
+        read: &mut Receiver<SyncResponse<I::Address, D>>,
     ) -> std::io::Result<Duration> {
         let id = epoch_millis();
         send(write, SyncRequest::Ping(id)).await?;
@@ -405,17 +408,20 @@ fn epoch_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-async fn send<D: DeterministicState>(write: &Sender<SyncRequest<D>>, request: SyncRequest<D>) -> std::io::Result<()> {
+async fn send<A: SyncIOAddress, D: DeterministicState>(
+    write: &Sender<SyncRequest<A, D>>,
+    request: SyncRequest<A, D>,
+) -> std::io::Result<()> {
     write
         .send(request)
         .await
         .map_err(|error| Error::new(ErrorKind::BrokenPipe, format!("failed to send {:?}", error.0)))
 }
 
-async fn recv<D: DeterministicState>(
-    read: &mut Receiver<SyncResponse<D>>,
+async fn recv<A: SyncIOAddress, D: DeterministicState>(
+    read: &mut Receiver<SyncResponse<A, D>>,
     timeout: Duration,
-) -> std::io::Result<SyncResponse<D>> {
+) -> std::io::Result<SyncResponse<A, D>> {
     match tokio::time::timeout(timeout, read.recv()).await {
         Ok(Some(response)) => Ok(response),
         Ok(None) => Err(Error::new(ErrorKind::UnexpectedEof, "connection closed")),
@@ -423,7 +429,10 @@ async fn recv<D: DeterministicState>(
     }
 }
 
-fn expect_ok<D: DeterministicState>(response: SyncResponse<D>, step: &'static str) -> std::io::Result<()> {
+fn expect_ok<A: SyncIOAddress, D: DeterministicState>(
+    response: SyncResponse<A, D>,
+    step: &'static str,
+) -> std::io::Result<()> {
     match response {
         SyncResponse::Ok => Ok(()),
         response => {
@@ -432,6 +441,6 @@ fn expect_ok<D: DeterministicState>(response: SyncResponse<D>, step: &'static st
     }
 }
 
-fn unexpected<D: DeterministicState>(expected: &str, response: &SyncResponse<D>) -> Error {
+fn unexpected<A: SyncIOAddress, D: DeterministicState>(expected: &str, response: &SyncResponse<A, D>) -> Error {
     Error::new(ErrorKind::InvalidData, format!("expected {expected}, got {}", response.name()))
 }

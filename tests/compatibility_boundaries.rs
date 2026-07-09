@@ -93,7 +93,7 @@ fn recoverable_state_details_wire_snapshot() {
 
 #[test]
 fn sync_request_subscribe_wire_snapshot() {
-    let request = SyncRequest::<CounterState>::Subscribe(sample_details());
+    let request = SyncRequest::<u64, CounterState>::Subscribe(sample_details());
 
     assert_eq!(
         encoded(&request),
@@ -113,7 +113,7 @@ fn sync_request_subscribe_wire_snapshot() {
 
 #[test]
 fn sync_response_action_wire_snapshot() {
-    let response = SyncResponse::<CounterState>::Action {
+    let response = SyncResponse::<u64, CounterState>::Action {
         seq: 0x3132_3334_3536_3738,
         action: RecoverableStateAction::BumpGeneration {
             new_id: 0x4142_4344_4546_4748,
