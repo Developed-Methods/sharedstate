@@ -121,6 +121,7 @@ impl<D: DeterministicState> SubscribableState<D> {
         let mut sender_locked = self.broadcast_sender.lock().await;
 
         let new_recover_details = new_state.details().clone();
+        tracing::info!(next_seq = new_recover_details.next_seq(), "resetting subscribable state from fresh snapshot");
 
         self.state.queue_update(HotStateAction::Reset(new_state));
         self.settle().await;
@@ -131,6 +132,7 @@ impl<D: DeterministicState> SubscribableState<D> {
         *broadcast_locked = broadcast;
         let mut old_sender = std::mem::replace(&mut *sender_locked, broadcast_sender);
         old_sender.close();
+        tracing::info!(next_seq = new_recover_details.next_seq(), "subscribable state reset complete");
     }
 
     pub async fn subscribe(
@@ -147,11 +149,32 @@ impl<D: DeterministicState> SubscribableState<D> {
         };
 
         if !leader_details.can_recover_follower(&recover) {
+            tracing::info!(
+                leader_next_seq = leader_details.next_seq(),
+                subscriber_next_seq = recover.next_seq(),
+                "state subscriber cannot recover incrementally"
+            );
             return Err(StateSubscribeError::CannotRecoverSubscriber);
         }
 
         let res = broadcast_locked.subscribe_from(recover.next_seq()).await;
-        res.map_err(StateSubscribeError::SubError)
+        match res {
+            Ok(sub) => {
+                tracing::info!(
+                    subscriber_next_seq = recover.next_seq(),
+                    "state subscriber registered for incremental updates"
+                );
+                Ok(sub)
+            }
+            Err(error) => {
+                tracing::info!(
+                    subscriber_next_seq = recover.next_seq(),
+                    ?error,
+                    "state subscriber failed to register for incremental updates"
+                );
+                Err(StateSubscribeError::SubError(error))
+            }
+        }
     }
 
     pub async fn subscribe_fresh(
@@ -168,7 +191,13 @@ impl<D: DeterministicState> SubscribableState<D> {
             };
 
             let sub = match broadcast_locked.subscribe_from(state.accept_seq()).await {
-                Ok(v) => v,
+                Ok(v) => {
+                    tracing::info!(
+                        next_seq = state.accept_seq(),
+                        "state subscriber registered for fresh snapshot updates"
+                    );
+                    v
+                }
                 Err(error) => {
                     tracing::error!(?error, "failed to subscribe to state");
                     tokio::task::yield_now().await;

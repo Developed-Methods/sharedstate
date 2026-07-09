@@ -17,7 +17,7 @@ use tokio::sync::{
 use crate::{
     cluster::node_state::NodeState,
     metrics::SharedStateMetrics,
-    protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{PROTOCOL_VERSION, SyncRequest, SyncResponse},
     state::{
         deterministic_state::DeterministicState,
         recoverable_state::{RecoverableStateAction, RecoverableStateDetails},
@@ -172,20 +172,24 @@ where
     async fn follow(&mut self) -> SyncFlow {
         let peer = self.select_peer();
         let leader = self.current_leader();
+        tracing::info!(?peer, ?leader, "connecting to shared-state sync peer");
         let connect = tokio::time::timeout(self.settings.message_timeout, self.io.connect(&peer));
         let connection = tokio::select! {
             result = connect => match result {
-                Ok(Ok(connection)) => connection,
+                Ok(Ok(connection)) => {
+                    tracing::info!(?peer, ?leader, "connected to shared-state sync peer");
+                    connection
+                }
                 Ok(Err(error)) => {
                     self.record_peer_failure(peer);
                     self.metrics.peer_connect_failure_count.inc();
-                    tracing::debug!(?peer, ?leader, ?error, "failed to connect to sync peer");
+                    tracing::info!(?peer, ?leader, ?error, "failed to connect to sync peer");
                     return SyncFlow::Retry;
                 }
                 Err(_) => {
                     self.record_peer_failure(peer);
                     self.metrics.peer_connect_timeout_count.inc();
-                    tracing::debug!(?peer, ?leader, "timed out connecting to sync peer");
+                    tracing::info!(?peer, ?leader, timeout = ?self.settings.message_timeout, "timed out connecting to sync peer");
                     return SyncFlow::Retry;
                 }
             },
@@ -202,16 +206,18 @@ where
 
         let (_remote, write, mut read) = connection.client_channels::<D>(self.settings.clone());
         let details = self.state.state.settled_recovery_details().await;
+        tracing::info!(?peer, ?leader, local_next_seq = details.next_seq(), "starting shared-state peer subscription");
         let mut next_seq = match self.subscribe(peer, &write, &mut read, details).await {
             Ok((next_seq, latency)) => {
                 self.record_peer_success(peer, latency);
                 self.metrics.peer_subscription_success_count.inc();
+                tracing::info!(?peer, ?leader, next_seq, latency = ?latency, "shared-state peer subscription succeeded");
                 next_seq
             }
             Err(error) => {
                 self.record_peer_failure(peer);
                 self.metrics.peer_subscription_failure_count.inc();
-                tracing::warn!(?peer, ?leader, ?error, "sync peer subscription failed");
+                tracing::info!(?peer, ?leader, ?error, "sync peer subscription failed");
                 return SyncFlow::Retry;
             }
         };
@@ -352,8 +358,10 @@ where
         read: &mut Receiver<SyncResponse<I::Address, D>>,
         details: RecoverableStateDetails,
     ) -> std::io::Result<(u64, Option<Duration>)> {
+        tracing::info!(?peer, "starting sync peer protocol handshake");
         send(write, SyncRequest::ProtocolVersion(PROTOCOL_VERSION)).await?;
         expect_ok(recv(read, self.settings.message_timeout).await?, "protocol version")?;
+        tracing::info!(?peer, "sync peer protocol handshake succeeded");
 
         let latency = if peer != self.current_leader() {
             Some(self.ping(write, read).await?)
@@ -362,20 +370,31 @@ where
         };
 
         let local_next_seq = details.next_seq();
+        tracing::info!(?peer, local_next_seq, "requesting shared-state peer subscription");
         send(write, SyncRequest::Subscribe(details)).await?;
 
         match recv(read, self.settings.message_timeout).await? {
             SyncResponse::Ok => {
                 self.metrics.record_incremental_recovery();
+                tracing::info!(?peer, next_seq = local_next_seq, "shared-state peer accepted incremental subscription");
                 Ok((local_next_seq, latency))
             }
             SyncResponse::FreshState(fresh) => {
                 let next_seq = fresh.details().next_seq();
+                tracing::info!(
+                    ?peer,
+                    local_next_seq,
+                    fresh_next_seq = next_seq,
+                    "sync peer sent fresh state; resetting local state"
+                );
                 self.state.state.reset(fresh).await;
                 self.metrics.record_fresh_recovery();
                 Ok((next_seq, latency))
             }
-            SyncResponse::NotConnected => Err(Error::new(ErrorKind::NotConnected, "sync source is not connected")),
+            SyncResponse::NotConnected => {
+                tracing::info!(?peer, "sync peer rejected subscription because it is not connected");
+                Err(Error::new(ErrorKind::NotConnected, "sync source is not connected"))
+            }
             response => Err(unexpected("Ok or FreshState", &response)),
         }
     }
