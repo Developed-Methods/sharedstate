@@ -194,7 +194,7 @@ where
         if let Some(worker) = self.worker.take() {
             match worker.join() {
                 Ok(result) => result,
-                Err(_) => Err(io::Error::new(io::ErrorKind::Other, "recoverable state snapshot worker panicked")),
+                Err(_) => Err(io::Error::other("recoverable state snapshot worker panicked")),
             }
         } else {
             Ok(())
