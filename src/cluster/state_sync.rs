@@ -1,26 +1,28 @@
-//! Drives the local deterministic state from the current leader address.
+//! Drives the local deterministic state based on the node's leader state.
+//!
+//! When leading, client actions are made authoritative, applied to the state,
+//! and pushed into the sequenced broadcast for subscribers. When following,
+//! the task subscribes to the leader's action feed (recovering the existing
+//! state when possible, resetting from a fresh snapshot otherwise) and
+//! forwards client actions to the leader. If the leader cannot be reached
+//! directly, the task relays through another peer after confirming over RPC
+//! that the peer follows the same leader.
 
 use std::{
-    collections::{BTreeSet, HashMap},
     io::{Error, ErrorKind},
     iter,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use message_encoding::MessageEncoding;
-use tokio::sync::{
-    mpsc::{Receiver, Sender},
-    watch,
-};
+use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
-    cluster::node_state::NodeState,
-    metrics::SharedStateMetrics,
-    protocol::messages::{PROTOCOL_VERSION, SyncRequest, SyncResponse},
+    cluster::{node_state::NodeState, peer_connections::PeerConnections},
+    protocol::messages::{ElectionTerm, LeaderMode, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
-        deterministic_state::DeterministicState,
-        recoverable_state::{RecoverableStateAction, RecoverableStateDetails},
+        deterministic_state::DeterministicState, recoverable_state::RecoverableStateAction,
         subscribable_state::StateHandle,
     },
     transport::{
@@ -32,43 +34,43 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub struct StateSyncTiming {
+    /// How often the task re-checks the node's leader state while working.
+    pub leader_poll_interval: Duration,
+    /// How long to wait before retrying when no sync source is available.
     pub retry_delay: Duration,
-    pub peer_failure_threshold: u32,
 }
 
 impl Default for StateSyncTiming {
     fn default() -> Self {
         Self {
+            leader_poll_interval: Duration::from_millis(100),
             retry_delay: Duration::from_millis(500),
-            peer_failure_threshold: 3,
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct PeerHealth {
-    consecutive_failures: u32,
-    latency: Option<Duration>,
-}
-
 pub struct StateSyncTask<I: SyncIO, D: DeterministicState> {
     state: Arc<NodeState<I::Address, D>>,
+    peer_connections: Arc<PeerConnections<I, D>>,
     io: Arc<I>,
     settings: NetIoSettings,
-    actions_rx: Receiver<D::Action>,
+    actions_rx: Receiver<(I::Address, D::Action)>,
     handle: StateHandle<D>,
-    leader_address: watch::Receiver<I::Address>,
-    available_peers: watch::Receiver<Vec<I::Address>>,
-    _leader_address_tx: watch::Sender<I::Address>,
-    _available_peers_tx: watch::Sender<Vec<I::Address>>,
-    peer_health: HashMap<I::Address, PeerHealth>,
     timing: StateSyncTiming,
-    metrics: Arc<SharedStateMetrics>,
 }
 
-enum SyncFlow {
-    Retry,
-    RoleChanged,
+enum Flow {
+    Continue,
+    Shutdown,
+}
+
+enum SyncAttempt {
+    /// Could not establish a subscription with the target.
+    Unreachable,
+    /// A subscription ran and ended; the leader state should be re-checked.
+    Finished { applied_actions: bool },
+    /// The leader changed while streaming; re-check immediately.
+    LeaderChanged,
     Shutdown,
 }
 
@@ -81,350 +83,316 @@ where
 {
     pub fn new(
         state: Arc<NodeState<I::Address, D>>,
+        peer_connections: Arc<PeerConnections<I, D>>,
         io: Arc<I>,
         settings: NetIoSettings,
-        actions_rx: Receiver<D::Action>,
-        leader_address_tx: watch::Sender<I::Address>,
-        available_peers_tx: watch::Sender<Vec<I::Address>>,
+        actions_rx: Receiver<(I::Address, D::Action)>,
         timing: StateSyncTiming,
-        metrics: Arc<SharedStateMetrics>,
     ) -> Self {
         let handle = state.state.create_handle();
-        let leader_address = state.leader_address.clone();
-        let available_peers = state.available_peers.clone();
         Self {
             state,
+            peer_connections,
             io,
             settings,
             actions_rx,
             handle,
-            leader_address,
-            available_peers,
-            _leader_address_tx: leader_address_tx,
-            _available_peers_tx: available_peers_tx,
-            peer_health: HashMap::new(),
             timing,
-            metrics,
         }
     }
 
     pub async fn run(mut self) {
         loop {
-            if self.is_leader() {
-                match self.lead().await {
-                    SyncFlow::RoleChanged | SyncFlow::Retry => continue,
-                    SyncFlow::Shutdown => return,
-                }
-            }
+            let leader_state = self.state.leader_state.lock().await.clone();
+            let flow = match leader_state.mode {
+                LeaderMode::Leading => self.lead(leader_state.term).await,
+                LeaderMode::Following { leader } => self.follow(leader).await,
+                LeaderMode::NoLeader | LeaderMode::Electing { .. } => self.wait_for_leader().await,
+            };
 
-            self.state.set_connected_to_leader(false);
-            match self.follow().await {
-                SyncFlow::RoleChanged => continue,
-                SyncFlow::Retry => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(self.timing.retry_delay) => {}
-                        changed = self.leader_address.changed() => {
-                            changed.expect("leader address sender should be retained");
-                        }
-                        changed = self.available_peers.changed() => {
-                            changed.expect("available peers sender should be retained");
-                        }
-                    }
-                }
-                SyncFlow::Shutdown => return,
+            if matches!(flow, Flow::Shutdown) {
+                tracing::info!("action channel closed, stopping state sync task");
+                return;
             }
         }
     }
 
-    async fn lead(&mut self) -> SyncFlow {
+    /// Waits for a leader to emerge. Queued actions stay in the channel so
+    /// they can be processed once a sync source is available.
+    async fn wait_for_leader(&mut self) -> Flow {
+        tokio::time::sleep(self.timing.leader_poll_interval).await;
+        Flow::Continue
+    }
+
+    async fn lead(&mut self, term: ElectionTerm) -> Flow {
+        /* bump the recovery generation so followers of the previous leader
+         * can recover from us without a full state transfer */
         let new_id = unique_state_id(&self.state.my_address);
         self.state
             .state
             .update(iter::once(RecoverableStateAction::BumpGeneration { new_id }))
             .await;
-        self.state.set_connected_to_leader(true);
-        tracing::info!("running as shared-state leader");
+        tracing::info!(%term, "leading, taking authority over shared state");
 
         loop {
             tokio::select! {
                 action = self.actions_rx.recv() => {
-                    let Some(action) = action else {
-                        return SyncFlow::Shutdown;
+                    let Some((source, action)) = action else {
+                        return Flow::Shutdown;
                     };
+
+                    let current = self.state.leader_state.lock().await.mode.clone();
+                    if let LeaderMode::Following { leader } = current {
+                        tracing::info!(?leader, "no longer leading, forwarding queued action to new leader");
+                        self.forward_action(leader, source, action).await;
+                        return Flow::Continue;
+                    }
+                    if !matches!(current, LeaderMode::Leading) {
+                        tracing::info!("no longer leading, releasing authority before applying queued action");
+                        return Flow::Continue;
+                    }
+
                     let authority = self
                         .handle
                         .read_with(move |state| state.authority(RecoverableStateAction::StateAction { action }));
-                    self.metrics.action_leader_count.inc();
                     self.state.state.update(iter::once(authority)).await;
+                    tracing::debug!(?source, "applied action with local authority");
                 }
-                changed = self.leader_address.changed() => {
-                    changed.expect("leader address sender should be retained");
-                    if !self.is_leader() {
-                        tracing::info!(leader = ?self.current_leader(), "shared-state leadership revoked");
-                        self.state.set_connected_to_leader(false);
-                        return SyncFlow::RoleChanged;
+                _ = tokio::time::sleep(self.timing.leader_poll_interval) => {
+                    if !matches!(self.state.leader_state.lock().await.mode, LeaderMode::Leading) {
+                        tracing::info!(%term, "no longer leading, releasing authority");
+                        return Flow::Continue;
                     }
                 }
             }
         }
     }
 
-    async fn follow(&mut self) -> SyncFlow {
-        let peer = self.select_peer();
-        let leader = self.current_leader();
-        tracing::info!(?peer, ?leader, "connecting to shared-state sync peer");
-        let connect = tokio::time::timeout(self.settings.message_timeout, self.io.connect(&peer));
-        let connection = tokio::select! {
-            result = connect => match result {
-                Ok(Ok(connection)) => {
-                    tracing::info!(?peer, ?leader, "connected to shared-state sync peer");
-                    connection
+    async fn follow(&mut self, leader: I::Address) -> Flow {
+        /* the election logic should never point a follower at itself, but if
+         * it ever does, subscribing to our own feed would idle forever (and
+         * bounce forwarded actions back into our own queue) */
+        if leader == self.state.my_address {
+            tracing::warn!("leader state points at our own address, waiting for the election to settle");
+            return self.wait_for_leader().await;
+        }
+
+        match self.sync_from(leader, leader).await {
+            SyncAttempt::Finished { applied_actions } => return self.pace_resubscribe(applied_actions).await,
+            SyncAttempt::LeaderChanged => return Flow::Continue,
+            SyncAttempt::Shutdown => return Flow::Shutdown,
+            SyncAttempt::Unreachable => {}
+        }
+
+        tracing::warn!(?leader, "cannot subscribe to leader directly, looking for a relay peer");
+
+        for relay in self.relay_candidates(leader).await {
+            match self.peer_connections.query_leader(relay).await {
+                Ok(state) if matches!(&state.mode, LeaderMode::Following { leader: relayed } if *relayed == leader) => {}
+                Ok(state) => {
+                    tracing::debug!(?relay, ?state, "relay candidate does not follow our leader, skipping");
+                    continue;
                 }
-                Ok(Err(error)) => {
-                    self.record_peer_failure(peer);
-                    self.metrics.peer_connect_failure_count.inc();
-                    tracing::info!(?peer, ?leader, ?error, "failed to connect to sync peer");
-                    return SyncFlow::Retry;
+                Err(error) => {
+                    tracing::debug!(?relay, ?error, "failed to query relay candidate for its leader");
+                    continue;
                 }
-                Err(_) => {
-                    self.record_peer_failure(peer);
-                    self.metrics.peer_connect_timeout_count.inc();
-                    tracing::info!(?peer, ?leader, timeout = ?self.settings.message_timeout, "timed out connecting to sync peer");
-                    return SyncFlow::Retry;
-                }
-            },
-            changed = self.leader_address.changed() => {
-                changed.expect("leader address sender should be retained");
-                if self.is_leader() {
-                    tracing::info!("shared-state leadership granted");
-                    return SyncFlow::RoleChanged;
-                }
-                return SyncFlow::Retry;
+            }
+
+            tracing::info!(?relay, ?leader, "syncing state through relay peer");
+            match self.sync_from(relay, leader).await {
+                SyncAttempt::Finished { applied_actions } => return self.pace_resubscribe(applied_actions).await,
+                SyncAttempt::LeaderChanged => return Flow::Continue,
+                SyncAttempt::Shutdown => return Flow::Shutdown,
+                SyncAttempt::Unreachable => continue,
+            }
+        }
+
+        tracing::warn!(?leader, "no reachable sync source, retrying");
+        tokio::time::sleep(self.timing.retry_delay).await;
+        Flow::Continue
+    }
+
+    /// A subscription that ended without delivering a single action is likely
+    /// failing repeatedly (e.g. a sync source that keeps resetting), so pace
+    /// the reconnect to avoid a hot loop of handshakes and state transfers.
+    async fn pace_resubscribe(&self, applied_actions: bool) -> Flow {
+        if !applied_actions {
+            tokio::time::sleep(self.timing.retry_delay).await;
+        }
+        Flow::Continue
+    }
+
+    /// Peers that could relay the leader's feed, most recently connected first.
+    async fn relay_candidates(&self, leader: I::Address) -> Vec<I::Address> {
+        let peers = self.state.peers.lock().await;
+        let mut candidates = peers
+            .values()
+            .filter(|peer| peer.addr != leader && peer.addr != self.state.my_address)
+            .map(|peer| (peer.connect_status.is_connected(), peer.addr))
+            .collect::<Vec<_>>();
+        drop(peers);
+
+        candidates.sort_by_key(|(connected, addr)| (std::cmp::Reverse(*connected), *addr));
+        candidates.into_iter().map(|(_, addr)| addr).collect()
+    }
+
+    async fn sync_from(&mut self, target: I::Address, leader: I::Address) -> SyncAttempt {
+        /* connect gives no timing guarantee, and an unbounded wait here would
+         * also stop the task from noticing leader changes */
+        let connection = match tokio::time::timeout(self.settings.message_timeout, self.io.connect(&target)).await {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => {
+                tracing::debug!(?target, ?error, "failed to connect for state sync");
+                return SyncAttempt::Unreachable;
+            }
+            Err(_) => {
+                tracing::debug!(?target, "timed out connecting for state sync");
+                return SyncAttempt::Unreachable;
             }
         };
-        self.metrics.peer_connect_success_count.inc();
 
+        /* write must stay alive for the duration of the stream or the
+         * connection closes */
         let (_remote, write, mut read) = connection.client_channels::<D>(self.settings.clone());
-        let details = self.state.state.settled_recovery_details().await;
-        tracing::info!(?peer, ?leader, local_next_seq = details.next_seq(), "starting shared-state peer subscription");
-        let mut next_seq = match self.subscribe(peer, &write, &mut read, details).await {
-            Ok((next_seq, latency)) => {
-                self.record_peer_success(peer, latency);
-                self.metrics.peer_subscription_success_count.inc();
-                tracing::info!(?peer, ?leader, next_seq, latency = ?latency, "shared-state peer subscription succeeded");
-                next_seq
-            }
+
+        let next_seq = match self.subscribe(&write, &mut read, target).await {
+            Ok(next_seq) => next_seq,
             Err(error) => {
-                self.record_peer_failure(peer);
-                self.metrics.peer_subscription_failure_count.inc();
-                tracing::info!(?peer, ?leader, ?error, "sync peer subscription failed");
-                return SyncFlow::Retry;
+                tracing::warn!(?target, ?error, "state subscription failed");
+                return SyncAttempt::Unreachable;
             }
         };
 
-        self.state.set_connected_peer(Some(peer));
-        self.state.set_connected_to_leader(true);
-        tracing::info!(?peer, ?leader, next_seq, "subscribed to shared-state peer");
+        self.stream(target, leader, next_seq, &mut read).await
+    }
+
+    /// Handshakes and subscribes, recovering the local state when the target
+    /// can serve our position and resetting from a fresh snapshot otherwise.
+    /// Returns the sequence the action feed will start at.
+    async fn subscribe(
+        &mut self,
+        write: &Sender<SyncRequest<I::Address, D>>,
+        read: &mut Receiver<SyncResponse<I::Address, D>>,
+        target: I::Address,
+    ) -> std::io::Result<u64> {
+        let timeout = self.settings.message_timeout;
+
+        tracing::info!(?target, "sync trace: handshake start");
+        send(write, SyncRequest::ProtocolVersion(PROTOCOL_VERSION)).await?;
+        expect_ok(recv(read, timeout).await?, "protocol version")?;
+
+        send(write, SyncRequest::MyAddress(self.state.my_address)).await?;
+        expect_ok(recv(read, timeout).await?, "my address")?;
+
+        tracing::info!(?target, "sync trace: handshake done, settling recovery details");
+        let details = self.state.state.settled_recovery_details().await;
+        let local_next_seq = details.next_seq();
+        tracing::info!(?target, local_next_seq, "sync trace: requesting recovery");
+        send(write, SyncRequest::SubscribeRecovery(details)).await?;
+
+        match recv(read, timeout).await? {
+            SyncResponse::Accepted(next_seq) => {
+                if next_seq != local_next_seq {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("recovery accepted at seq {next_seq} but local state expects {local_next_seq}"),
+                    ));
+                }
+                tracing::info!(?target, next_seq, "recovered existing state through subscription");
+                Ok(next_seq)
+            }
+            SyncResponse::RecoveryFailed => {
+                tracing::info!(?target, "state recovery not possible, subscribing fresh");
+                send(write, SyncRequest::SubscribeFresh).await?;
+
+                match recv(read, timeout).await? {
+                    SyncResponse::FreshState(fresh) => {
+                        let next_seq = fresh.details().next_seq();
+                        self.state.state.reset(fresh).await;
+                        tracing::info!(?target, next_seq, "reset local state from fresh snapshot");
+                        Ok(next_seq)
+                    }
+                    response => Err(unexpected("FreshState", &response)),
+                }
+            }
+            response => Err(unexpected("Accepted or RecoveryFailed", &response)),
+        }
+    }
+
+    /// Applies the authority action feed to the local state until the stream
+    /// closes or the leader changes. Client actions received while streaming
+    /// are forwarded to the sync target.
+    async fn stream(
+        &mut self,
+        target: I::Address,
+        leader: I::Address,
+        mut expected_seq: u64,
+        read: &mut Receiver<SyncResponse<I::Address, D>>,
+    ) -> SyncAttempt {
+        let mut applied_actions = false;
 
         loop {
             tokio::select! {
                 response = read.recv() => match response {
-                    Some(SyncResponse::Action { seq, action }) => {
-                        if seq != next_seq {
-                            self.record_peer_failure(peer);
-                            self.state.set_connected_to_leader(false);
-                            tracing::warn!(?peer, ?leader, seq, next_seq, "sync peer action stream out of sequence");
-                            return SyncFlow::Retry;
+                    Some(SyncResponse::AuthorityAction(seq, action)) => {
+                        if seq != expected_seq {
+                            tracing::warn!(?target, seq, expected_seq, "action feed out of sequence, dropping subscription");
+                            return SyncAttempt::Finished { applied_actions };
                         }
-                        next_seq += 1;
-                        self.metrics.action_follower_count.inc();
+                        expected_seq += 1;
                         self.state.state.update(iter::once(action)).await;
+                        applied_actions = true;
+                    }
+                    Some(SyncResponse::ActionStreamClosed) | None => {
+                        tracing::info!(?target, "state subscription closed");
+                        return SyncAttempt::Finished { applied_actions };
                     }
                     Some(response) => {
-                        self.record_peer_failure(peer);
-                        self.state.set_connected_to_leader(false);
-                        tracing::warn!(?peer, ?leader, response = response.name(), "unexpected response from sync peer");
-                        return SyncFlow::Retry;
-                    }
-                    None => {
-                        self.record_peer_failure(peer);
-                        self.state.set_connected_to_leader(false);
-                        tracing::info!(?peer, ?leader, "sync peer subscription closed");
-                        return SyncFlow::Retry;
+                        tracing::warn!(?target, response = response.name(), "unexpected message on subscription stream");
+                        return SyncAttempt::Finished { applied_actions };
                     }
                 },
                 action = self.actions_rx.recv() => {
-                    let Some(action) = action else {
-                        return SyncFlow::Shutdown;
+                    let Some((source, action)) = action else {
+                        return SyncAttempt::Shutdown;
                     };
-                    if send(&write, SyncRequest::Action(action)).await.is_err() {
-                        self.record_peer_failure(peer);
-                        self.state.set_connected_to_leader(false);
-                        tracing::warn!(?peer, ?leader, "failed to forward action to sync peer");
-                        return SyncFlow::Retry;
+                    let current = self.state.leader_state.lock().await.mode.clone();
+                    if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
+                        tracing::info!(?leader, "leader changed before forwarding action, dropping subscription");
+                        self.drop_queued_actions();
+                        return SyncAttempt::LeaderChanged;
                     }
-                    self.metrics.action_forwarded_count.inc();
+                    self.forward_action(target, source, action).await;
                 }
-                changed = self.leader_address.changed() => {
-                    changed.expect("leader address sender should be retained");
-                    if self.is_leader() {
-                        tracing::info!("shared-state leadership granted");
-                        self.state.set_connected_to_leader(false);
-                        return SyncFlow::RoleChanged;
-                    }
-                }
-                changed = self.available_peers.changed() => {
-                    changed.expect("available peers sender should be retained");
-                    let next_peer = self.select_peer();
-                    if peer != next_peer {
-                        tracing::debug!(?peer, ?next_peer, "sync peer selection changed");
-                        self.state.set_connected_to_leader(false);
-                        return SyncFlow::Retry;
+                _ = tokio::time::sleep(self.timing.leader_poll_interval) => {
+                    let current = self.state.leader_state.lock().await.mode.clone();
+                    if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
+                        tracing::info!(?leader, "leader changed, dropping subscription");
+                        self.drop_queued_actions();
+                        return SyncAttempt::LeaderChanged;
                     }
                 }
             }
         }
     }
 
-    fn current_leader(&self) -> I::Address {
-        *self.leader_address.borrow()
+    fn drop_queued_actions(&mut self) {
+        while self.actions_rx.try_recv().is_ok() {}
     }
 
-    fn is_leader(&self) -> bool {
-        self.state.my_address == self.current_leader()
-    }
-
-    fn select_peer(&self) -> I::Address {
-        let leader = self.current_leader();
-        let candidates = self.candidate_peers();
-        if candidates.is_empty() {
-            return leader;
-        }
-
-        let leader_failures = self
-            .peer_health
-            .get(&leader)
-            .map(|health| health.consecutive_failures)
-            .unwrap_or_default();
-
-        if candidates.contains(&leader) && leader_failures < self.timing.peer_failure_threshold {
-            return leader;
-        }
-
-        candidates
-            .iter()
-            .cloned()
-            .min_by_key(|peer| self.peer_score(*peer))
-            .unwrap()
-    }
-
-    fn candidate_peers(&self) -> Vec<I::Address> {
-        let mut peers = BTreeSet::new();
-        peers.insert(self.current_leader());
-        for peer in self.available_peers.borrow().iter().copied() {
-            peers.insert(peer);
-        }
-        peers.remove(&self.state.my_address);
-        peers.into_iter().collect()
-    }
-
-    fn peer_score(&self, peer: I::Address) -> (u32, u128, I::Address) {
-        let health = self.peer_health.get(&peer);
-        let failures = health.map(|health| health.consecutive_failures).unwrap_or_default();
-        let latency = health
-            .and_then(|health| health.latency)
-            .unwrap_or_else(|| self.settings.message_timeout / 2)
-            .as_millis();
-        (failures, latency, peer)
-    }
-
-    fn record_peer_success(&mut self, peer: I::Address, latency: Option<Duration>) {
-        let health = self.peer_health.entry(peer).or_default();
-        health.consecutive_failures = 0;
-        if let Some(latency) = latency {
-            health.latency = Some(latency);
-        }
-    }
-
-    fn record_peer_failure(&mut self, peer: I::Address) {
-        let health = self.peer_health.entry(peer).or_default();
-        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
-    }
-
-    async fn subscribe(
-        &mut self,
-        peer: I::Address,
-        write: &Sender<SyncRequest<I::Address, D>>,
-        read: &mut Receiver<SyncResponse<I::Address, D>>,
-        details: RecoverableStateDetails,
-    ) -> std::io::Result<(u64, Option<Duration>)> {
-        tracing::info!(?peer, "starting sync peer protocol handshake");
-        send(write, SyncRequest::ProtocolVersion(PROTOCOL_VERSION)).await?;
-        expect_ok(recv(read, self.settings.message_timeout).await?, "protocol version")?;
-        tracing::info!(?peer, "sync peer protocol handshake succeeded");
-
-        let latency = if peer != self.current_leader() {
-            Some(self.ping(write, read).await?)
-        } else {
-            None
-        };
-
-        let local_next_seq = details.next_seq();
-        tracing::info!(?peer, local_next_seq, "requesting shared-state peer subscription");
-        send(write, SyncRequest::Subscribe(details)).await?;
-
-        match recv(read, self.settings.message_timeout).await? {
-            SyncResponse::Ok => {
-                self.metrics.record_incremental_recovery();
-                tracing::info!(?peer, next_seq = local_next_seq, "shared-state peer accepted incremental subscription");
-                Ok((local_next_seq, latency))
+    async fn forward_action(&self, target: I::Address, source: I::Address, action: D::Action) {
+        match self
+            .peer_connections
+            .enqueue_forwarded_action(target, source, action)
+            .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::warn!(?target, ?source, ?error, "failed to forward action to sync target");
             }
-            SyncResponse::FreshState(fresh) => {
-                let next_seq = fresh.details().next_seq();
-                tracing::info!(
-                    ?peer,
-                    local_next_seq,
-                    fresh_next_seq = next_seq,
-                    "sync peer sent fresh state; resetting local state"
-                );
-                self.state.state.reset(fresh).await;
-                self.metrics.record_fresh_recovery();
-                Ok((next_seq, latency))
-            }
-            SyncResponse::NotConnected => {
-                tracing::info!(?peer, "sync peer rejected subscription because it is not connected");
-                Err(Error::new(ErrorKind::NotConnected, "sync source is not connected"))
-            }
-            response => Err(unexpected("Ok or FreshState", &response)),
         }
     }
-
-    async fn ping(
-        &mut self,
-        write: &Sender<SyncRequest<I::Address, D>>,
-        read: &mut Receiver<SyncResponse<I::Address, D>>,
-    ) -> std::io::Result<Duration> {
-        let id = epoch_millis();
-        send(write, SyncRequest::Ping(id)).await?;
-        match recv(read, self.settings.message_timeout).await? {
-            SyncResponse::Pong(pong_id) if pong_id == id => {
-                Ok(Duration::from_millis(epoch_millis().saturating_sub(pong_id)))
-            }
-            SyncResponse::Pong(pong_id) => {
-                Err(Error::new(ErrorKind::InvalidData, format!("expected Pong({id}), got Pong({pong_id})")))
-            }
-            response => Err(unexpected("Pong", &response)),
-        }
-    }
-}
-
-fn epoch_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 async fn send<A: SyncIOAddress, D: DeterministicState>(
@@ -454,12 +422,292 @@ fn expect_ok<A: SyncIOAddress, D: DeterministicState>(
 ) -> std::io::Result<()> {
     match response {
         SyncResponse::Ok => Ok(()),
-        response => {
-            Err(Error::new(ErrorKind::InvalidData, format!("expected Ok during {step}, got {}", response.name())))
-        }
+        response => Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("expected Ok during {step}, got {}", response.name()),
+        )),
     }
 }
 
 fn unexpected<A: SyncIOAddress, D: DeterministicState>(expected: &str, response: &SyncResponse<A, D>) -> Error {
     Error::new(ErrorKind::InvalidData, format!("expected {expected}, got {}", response.name()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicU32, Ordering},
+            Mutex as StdMutex,
+        },
+    };
+
+    use sequenced_broadcast::SequencedBroadcastSettings;
+    use tokio::{
+        io::{duplex, split, DuplexStream, ReadHalf, WriteHalf},
+        sync::{mpsc, Mutex, Notify},
+    };
+
+    use super::*;
+    use crate::{
+        protocol::messages::LeaderState,
+        state::{recoverable_state::RecoverableState, subscribable_state::SubscribableState},
+        transport::traits::SyncConnection,
+    };
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TestState(u64);
+
+    impl DeterministicState for TestState {
+        type Action = u64;
+        type AuthorityAction = u64;
+
+        fn accept_seq(&self) -> u64 {
+            self.0
+        }
+
+        fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
+            action
+        }
+
+        fn update(&mut self, _action: &Self::AuthorityAction) {
+            self.0 += 1;
+        }
+    }
+
+    impl MessageEncoding for TestState {
+        fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
+            self.0.write_to(out)
+        }
+
+        fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
+            Ok(Self(MessageEncoding::read_from(read)?))
+        }
+    }
+
+    fn test_settings() -> NetIoSettings {
+        NetIoSettings {
+            process_timeout: Duration::from_millis(100),
+            message_timeout: Duration::from_millis(250),
+        }
+    }
+
+    fn test_timing() -> StateSyncTiming {
+        StateSyncTiming {
+            leader_poll_interval: Duration::from_millis(20),
+            retry_delay: Duration::from_millis(50),
+        }
+    }
+
+    fn node_state(addr: u64, mode: LeaderMode<u64>) -> Arc<NodeState<u64, TestState>> {
+        Arc::new(NodeState {
+            my_address: addr,
+            can_lead: true,
+            peers: Mutex::new(HashMap::new()),
+            state: SubscribableState::new(
+                RecoverableState::new(addr, TestState(0)),
+                SequencedBroadcastSettings::default(),
+            )
+            .unwrap(),
+            leader_state: Mutex::new(LeaderState {
+                term: ElectionTerm::from_term(0),
+                mode,
+            }),
+        })
+    }
+
+    fn start_task<I: SyncIO<Address = u64>>(
+        state: &Arc<NodeState<u64, TestState>>,
+        io: &Arc<I>,
+    ) -> mpsc::Sender<(u64, u64)> {
+        let connections = Arc::new(PeerConnections::new(io.clone(), test_settings(), state.clone()));
+        let (actions_tx, actions_rx) = mpsc::channel(16);
+        tokio::spawn(
+            StateSyncTask::new(state.clone(), connections, io.clone(), test_settings(), actions_rx, test_timing())
+                .run(),
+        );
+        actions_tx
+    }
+
+    async fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if check() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Counts connect attempts and never completes them, like a transport
+    /// whose remote silently drops SYNs.
+    #[derive(Default)]
+    struct HangingIo {
+        connects: AtomicU32,
+    }
+
+    impl SyncIO for HangingIo {
+        type Address = u64;
+        type Read = ReadHalf<DuplexStream>;
+        type Write = WriteHalf<DuplexStream>;
+
+        async fn connect(&self, _remote: &u64) -> std::io::Result<SyncConnection<Self>> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hanging_connect_does_not_block_leader_takeover() {
+        let state = node_state(1, LeaderMode::Following { leader: 2 });
+        let io = Arc::new(HangingIo::default());
+        let actions_tx = start_task(&state, &io);
+
+        /* park the sync task inside the hanging connect */
+        wait_until("a connect attempt", || 1 <= io.connects.load(Ordering::SeqCst)).await;
+
+        /* we win an election; the task must escape the connect and lead */
+        *state.leader_state.lock().await = LeaderState {
+            term: ElectionTerm::from_term(1),
+            mode: LeaderMode::Leading,
+        };
+
+        let mut handle = state.state.create_handle();
+        let initial_seq = handle.read_with(|state| state.details().next_seq());
+        wait_until("the generation bump after taking leadership", || {
+            initial_seq < handle.read_with(|state| state.details().next_seq())
+        })
+        .await;
+
+        /* and it must apply queued actions with local authority */
+        actions_tx.send((1, 42)).await.unwrap();
+        wait_until("an action applied with local authority", || {
+            handle.read_with(|state| state.state().0) == 1
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn following_own_address_waits_without_self_subscribing() {
+        let state = node_state(1, LeaderMode::Following { leader: 1 });
+        let io = Arc::new(HangingIo::default());
+        let _actions_tx = start_task(&state, &io);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            io.connects.load(Ordering::SeqCst),
+            0,
+            "the sync task must not subscribe to its own address"
+        );
+
+        /* the task must still be responsive to leader changes */
+        *state.leader_state.lock().await = LeaderState {
+            term: ElectionTerm::from_term(1),
+            mode: LeaderMode::Leading,
+        };
+
+        let mut handle = state.state.create_handle();
+        wait_until("the generation bump after taking leadership", || {
+            0 < handle.read_with(|state| state.details().next_seq())
+        })
+        .await;
+    }
+
+    /// Completes the sync handshake, accepts the recovery subscription, then
+    /// immediately closes the connection without streaming a single action.
+    struct ClosingSubscriptionIo {
+        settings: NetIoSettings,
+        connects: StdMutex<Vec<tokio::time::Instant>>,
+        connected: Notify,
+    }
+
+    impl ClosingSubscriptionIo {
+        fn new(settings: NetIoSettings) -> Self {
+            Self {
+                settings,
+                connects: StdMutex::new(Vec::new()),
+                connected: Notify::new(),
+            }
+        }
+
+        fn connect_times(&self) -> Vec<tokio::time::Instant> {
+            self.connects.lock().unwrap().clone()
+        }
+    }
+
+    impl SyncIO for ClosingSubscriptionIo {
+        type Address = u64;
+        type Read = ReadHalf<DuplexStream>;
+        type Write = WriteHalf<DuplexStream>;
+
+        async fn connect(&self, remote: &u64) -> std::io::Result<SyncConnection<Self>> {
+            self.connects.lock().unwrap().push(tokio::time::Instant::now());
+            self.connected.notify_waiters();
+
+            let (client, server) = duplex(64 * 1024);
+            let (client_read, client_write) = split(client);
+            let (server_read, server_write) = split(server);
+
+            let (_, write, read) = SyncConnection::<Self> {
+                remote: *remote,
+                read: server_read,
+                write: server_write,
+            }
+            .server_channels::<TestState>(self.settings.clone());
+            tokio::spawn(accept_subscription_then_close(write, read));
+
+            Ok(SyncConnection {
+                remote: *remote,
+                read: client_read,
+                write: client_write,
+            })
+        }
+    }
+
+    async fn accept_subscription_then_close(
+        write: Sender<SyncResponse<u64, TestState>>,
+        mut read: Receiver<SyncRequest<u64, TestState>>,
+    ) {
+        while let Some(request) = read.recv().await {
+            let response = match request {
+                SyncRequest::ProtocolVersion(_) | SyncRequest::MyAddress(_) => SyncResponse::Ok,
+                SyncRequest::SubscribeRecovery(details) => {
+                    /* accept, then drop the connection without streaming */
+                    let _ = write.send(SyncResponse::Accepted(details.next_seq())).await;
+                    return;
+                }
+                _ => SyncResponse::UnexpectedRequest,
+            };
+            if write.send(response).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resubscribing_is_paced_when_subscription_delivers_nothing() {
+        let state = node_state(1, LeaderMode::Following { leader: 2 });
+        let io = Arc::new(ClosingSubscriptionIo::new(test_settings()));
+        let _actions_tx = start_task(&state, &io);
+
+        const ATTEMPTS: usize = 6;
+        loop {
+            let connected = io.connected.notified();
+            if ATTEMPTS <= io.connect_times().len() {
+                break;
+            }
+            connected.await;
+        }
+
+        /* each reconnect after a no-progress subscription must be delayed;
+         * allow slack for the first attempt landing mid-interval */
+        let times = io.connect_times();
+        let elapsed = times[ATTEMPTS - 1] - times[0];
+        let minimum = test_timing().retry_delay * (ATTEMPTS as u32 - 2);
+        assert!(
+            minimum <= elapsed,
+            "{ATTEMPTS} subscription attempts within {elapsed:?} are not paced (expected at least {minimum:?})"
+        );
+    }
 }

@@ -102,7 +102,8 @@ impl<D: DeterministicState> SubscribableState<D> {
 
             if yields == YIELD_LIMIT {
                 last_warned = Some(tokio::time::Instant::now());
-            } else if last_warned.is_none_or(|at| WARN_INTERVAL <= at.elapsed()) {
+            }
+            else if last_warned.is_none_or(|at| WARN_INTERVAL <= at.elapsed()) {
                 tracing::warn!(
                     blocked_by_workers = maintenance.blocked_by_workers,
                     elapsed = ?started.elapsed(),
@@ -121,7 +122,6 @@ impl<D: DeterministicState> SubscribableState<D> {
         let mut sender_locked = self.broadcast_sender.lock().await;
 
         let new_recover_details = new_state.details().clone();
-        tracing::info!(next_seq = new_recover_details.next_seq(), "resetting subscribable state from fresh snapshot");
 
         self.state.queue_update(HotStateAction::Reset(new_state));
         self.settle().await;
@@ -132,13 +132,12 @@ impl<D: DeterministicState> SubscribableState<D> {
         *broadcast_locked = broadcast;
         let mut old_sender = std::mem::replace(&mut *sender_locked, broadcast_sender);
         old_sender.close();
-        tracing::info!(next_seq = new_recover_details.next_seq(), "subscribable state reset complete");
     }
 
     pub async fn subscribe(
         &self,
         recover: RecoverableStateDetails,
-    ) -> Result<StateSubscription<D>, StateSubscribeError> {
+    ) -> Result<SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>, StateSubscribeError> {
         let broadcast_locked = self.broadcast.lock().await;
 
         let leader_details = {
@@ -149,38 +148,11 @@ impl<D: DeterministicState> SubscribableState<D> {
         };
 
         if !leader_details.can_recover_follower(&recover) {
-            tracing::info!(
-                leader_next_seq = leader_details.next_seq(),
-                subscriber_next_seq = recover.next_seq(),
-                "state subscriber cannot recover incrementally"
-            );
             return Err(StateSubscribeError::CannotRecoverSubscriber);
         }
 
         let res = broadcast_locked.subscribe_from(recover.next_seq()).await;
-        match res {
-            Ok(feed) => {
-                tracing::info!(
-                    leader_next_seq = leader_details.next_seq(),
-                    subscriber_next_seq = recover.next_seq(),
-                    "state subscriber registered for incremental updates"
-                );
-                Ok(StateSubscription {
-                    feed,
-                    leader_next_seq: leader_details.next_seq(),
-                    subscriber_next_seq: recover.next_seq(),
-                })
-            }
-            Err(error) => {
-                tracing::info!(
-                    leader_next_seq = leader_details.next_seq(),
-                    subscriber_next_seq = recover.next_seq(),
-                    ?error,
-                    "state subscriber failed to register for incremental updates"
-                );
-                Err(StateSubscribeError::SubError(error))
-            }
-        }
+        res.map_err(StateSubscribeError::SubError)
     }
 
     pub async fn subscribe_fresh(
@@ -197,13 +169,7 @@ impl<D: DeterministicState> SubscribableState<D> {
             };
 
             let sub = match broadcast_locked.subscribe_from(state.accept_seq()).await {
-                Ok(v) => {
-                    tracing::info!(
-                        next_seq = state.accept_seq(),
-                        "state subscriber registered for fresh snapshot updates"
-                    );
-                    v
-                }
+                Ok(v) => v,
                 Err(error) => {
                     tracing::error!(?error, "failed to subscribe to state");
                     tokio::task::yield_now().await;
@@ -231,12 +197,6 @@ impl<D: DeterministicState> SubscribableState<D> {
 
         self.settle().await;
     }
-}
-
-pub struct StateSubscription<D: DeterministicState> {
-    pub feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
-    pub leader_next_seq: u64,
-    pub subscriber_next_seq: u64,
 }
 
 pub struct StateHandle<D: DeterministicState> {
@@ -321,8 +281,11 @@ mod tests {
 
     fn new_state() -> Arc<SubscribableState<Counter>> {
         Arc::new(
-            SubscribableState::new(RecoverableState::new(1, Counter(0)), SequencedBroadcastSettings::default())
-                .unwrap(),
+            SubscribableState::new(
+                RecoverableState::new(1, Counter(0)),
+                SequencedBroadcastSettings::default(),
+            )
+            .unwrap(),
         )
     }
 
@@ -350,7 +313,10 @@ mod tests {
         };
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!updates.is_finished(), "updates must not settle while a read handle is pinned");
+        assert!(
+            !updates.is_finished(),
+            "updates must not settle while a read handle is pinned"
+        );
 
         handle.quiescent();
         tokio::time::timeout(std::time::Duration::from_secs(5), updates)

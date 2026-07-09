@@ -2,5 +2,4 @@
 
 pub mod channels;
 pub mod simulated;
-pub mod tcp;
 pub mod traits;

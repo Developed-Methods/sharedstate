@@ -4,8 +4,6 @@
 //! framing, transport adapters, and cluster coordination.
 
 pub mod cluster;
-pub mod metrics;
-pub mod persistence;
 pub mod protocol;
 pub mod service;
 pub mod state;
@@ -13,5 +11,4 @@ pub mod transport;
 
 mod utils;
 
-pub use cluster::node_state::{DebugInfo, FollowerStatus, NodeStatus};
-pub use service::{SharedState, SharedStateConfig, SharedStateSettings};
+pub use service::{SharedState, SharedStateConfig, SharedStateRecoverableConfig, SharedStateSettings};
