@@ -12,7 +12,7 @@ use crate::{
     utils::unknown_id_err,
 };
 
-pub const PROTOCOL_VERSION: u64 = 1;
+pub const PROTOCOL_VERSION: u64 = 2;
 
 pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
     ProtocolVersion(u64),

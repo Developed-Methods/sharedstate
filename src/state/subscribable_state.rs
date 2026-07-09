@@ -138,7 +138,7 @@ impl<D: DeterministicState> SubscribableState<D> {
     pub async fn subscribe(
         &self,
         recover: RecoverableStateDetails,
-    ) -> Result<SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>, StateSubscribeError> {
+    ) -> Result<StateSubscription<D>, StateSubscribeError> {
         let broadcast_locked = self.broadcast.lock().await;
 
         let leader_details = {
@@ -159,15 +159,21 @@ impl<D: DeterministicState> SubscribableState<D> {
 
         let res = broadcast_locked.subscribe_from(recover.next_seq()).await;
         match res {
-            Ok(sub) => {
+            Ok(feed) => {
                 tracing::info!(
+                    leader_next_seq = leader_details.next_seq(),
                     subscriber_next_seq = recover.next_seq(),
                     "state subscriber registered for incremental updates"
                 );
-                Ok(sub)
+                Ok(StateSubscription {
+                    feed,
+                    leader_next_seq: leader_details.next_seq(),
+                    subscriber_next_seq: recover.next_seq(),
+                })
             }
             Err(error) => {
                 tracing::info!(
+                    leader_next_seq = leader_details.next_seq(),
                     subscriber_next_seq = recover.next_seq(),
                     ?error,
                     "state subscriber failed to register for incremental updates"
@@ -225,6 +231,12 @@ impl<D: DeterministicState> SubscribableState<D> {
 
         self.settle().await;
     }
+}
+
+pub struct StateSubscription<D: DeterministicState> {
+    pub feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
+    pub leader_next_seq: u64,
+    pub subscriber_next_seq: u64,
 }
 
 pub struct StateHandle<D: DeterministicState> {

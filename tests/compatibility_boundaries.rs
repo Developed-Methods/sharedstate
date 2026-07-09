@@ -2,7 +2,7 @@ use std::io;
 
 use message_encoding::MessageEncoding;
 use sharedstate::{
-    protocol::messages::{SyncRequest, SyncResponse},
+    protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         deterministic_state::DeterministicState,
         recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
@@ -70,6 +70,11 @@ fn generation_history_retains_exactly_2048_boundaries() {
 
     assert!(leader.details().can_recover_follower(&oldest_retained));
     assert!(!leader.details().can_recover_follower(&just_beyond_retention));
+}
+
+#[test]
+fn protocol_version_marks_current_wire_format() {
+    assert_eq!(PROTOCOL_VERSION, 2);
 }
 
 #[test]

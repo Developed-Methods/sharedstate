@@ -83,7 +83,14 @@ where
         I: SyncIO<Address = A>,
     {
         let (transport_addr, write, mut read) = conn.server_channels::<D>(settings.clone());
-        tracing::info!(?transport_addr, "accepted shared-state rpc client");
+        tracing::info!(
+            ?transport_addr,
+            local_address = ?self.state.my_address,
+            leader = ?self.state.leader_address(),
+            is_leader = self.state.is_leader(),
+            connected_to_leader = self.state.is_connected_to_leader(),
+            "accepted shared-state rpc client"
+        );
 
         if !handshake_client(&write, &mut read, settings.message_timeout).await {
             tracing::info!(?transport_addr, "rpc client handshake failed");
@@ -107,9 +114,10 @@ where
 
         let (feed, fresh_state) = match request {
             SyncRequest::Subscribe(details) => {
+                let subscriber_next_seq = details.next_seq();
                 tracing::info!(
                     ?transport_addr,
-                    subscriber_next_seq = details.next_seq(),
+                    subscriber_next_seq,
                     "received shared-state subscription request"
                 );
                 if !self.state.is_leader() && !self.state.is_connected_to_leader() {
@@ -123,14 +131,20 @@ where
 
                 /* note keep lock while dealing with subscribe */
                 match self.state.state.subscribe(details).await {
-                    Ok(feed) => {
-                        tracing::info!(?transport_addr, "accepted incremental shared-state subscription");
-                        (feed, None)
+                    Ok(subscription) => {
+                        tracing::info!(
+                            ?transport_addr,
+                            leader_next_seq = subscription.leader_next_seq,
+                            subscriber_next_seq = subscription.subscriber_next_seq,
+                            "accepted incremental shared-state subscription"
+                        );
+                        (subscription.feed, None)
                     }
                     Err(error) => {
                         tracing::info!(
                             ?transport_addr,
                             ?error,
+                            subscriber_next_seq,
                             "incremental client recovery failed; sending fresh shared-state snapshot"
                         );
                         let (state, feed) = self.state.state.subscribe_fresh().await;
@@ -179,7 +193,7 @@ where
             tracing::info!(
                 ?transport_addr,
                 fresh_next_seq = state.details().next_seq(),
-                "sending fresh shared-state snapshot"
+                "accepted fresh shared-state subscription; sending snapshot"
             );
             if write.send(SyncResponse::FreshState(state)).await.is_err() {
                 tracing::info!(?transport_addr, "failed to send fresh shared-state snapshot");
