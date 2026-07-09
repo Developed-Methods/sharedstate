@@ -56,8 +56,8 @@ pub struct StateSyncTask<I: SyncIO, D: DeterministicState> {
     handle: StateHandle<D>,
     leader_address: watch::Receiver<I::Address>,
     available_peers: watch::Receiver<Vec<I::Address>>,
-    leader_updates_open: bool,
-    peer_updates_open: bool,
+    _leader_address_tx: watch::Sender<I::Address>,
+    _available_peers_tx: watch::Sender<Vec<I::Address>>,
     peer_health: HashMap<I::Address, PeerHealth>,
     timing: StateSyncTiming,
     metrics: Arc<SharedStateMetrics>,
@@ -81,6 +81,8 @@ where
         io: Arc<I>,
         settings: NetIoSettings,
         actions_rx: Receiver<D::Action>,
+        leader_address_tx: watch::Sender<I::Address>,
+        available_peers_tx: watch::Sender<Vec<I::Address>>,
         timing: StateSyncTiming,
         metrics: Arc<SharedStateMetrics>,
     ) -> Self {
@@ -95,8 +97,8 @@ where
             handle,
             leader_address,
             available_peers,
-            leader_updates_open: true,
-            peer_updates_open: true,
+            _leader_address_tx: leader_address_tx,
+            _available_peers_tx: available_peers_tx,
             peer_health: HashMap::new(),
             timing,
             metrics,
@@ -116,22 +118,14 @@ where
             match self.follow().await {
                 SyncFlow::RoleChanged => continue,
                 SyncFlow::Retry => {
-                    if self.leader_updates_open || self.peer_updates_open {
-                        tokio::select! {
-                            _ = tokio::time::sleep(self.timing.retry_delay) => {}
-                            changed = self.leader_address.changed(), if self.leader_updates_open => {
-                                if changed.is_err() {
-                                    self.leader_updates_open = false;
-                                }
-                            }
-                            changed = self.available_peers.changed(), if self.peer_updates_open => {
-                                if changed.is_err() {
-                                    self.peer_updates_open = false;
-                                }
-                            }
+                    tokio::select! {
+                        _ = tokio::time::sleep(self.timing.retry_delay) => {}
+                        changed = self.leader_address.changed() => {
+                            changed.expect("leader address sender should be retained");
                         }
-                    } else {
-                        tokio::time::sleep(self.timing.retry_delay).await;
+                        changed = self.available_peers.changed() => {
+                            changed.expect("available peers sender should be retained");
+                        }
                     }
                 }
                 SyncFlow::Shutdown => return,
@@ -160,10 +154,9 @@ where
                     self.metrics.action_leader_count.inc();
                     self.state.state.update(iter::once(authority)).await;
                 }
-                changed = self.leader_address.changed(), if self.leader_updates_open => {
-                    if changed.is_err() {
-                        self.leader_updates_open = false;
-                    } else if !self.is_leader() {
+                changed = self.leader_address.changed() => {
+                    changed.expect("leader address sender should be retained");
+                    if !self.is_leader() {
                         tracing::info!(leader = ?self.current_leader(), "shared-state leadership revoked");
                         self.state.set_connected_to_leader(false);
                         return SyncFlow::RoleChanged;
@@ -177,35 +170,8 @@ where
         let peer = self.select_peer();
         let leader = self.current_leader();
         let connect = tokio::time::timeout(self.settings.message_timeout, self.io.connect(&peer));
-        let connection = if self.leader_updates_open {
-            tokio::select! {
-                result = connect => match result {
-                    Ok(Ok(connection)) => connection,
-                    Ok(Err(error)) => {
-                        self.record_peer_failure(peer);
-                        self.metrics.peer_connect_failure_count.inc();
-                        tracing::debug!(?peer, ?leader, ?error, "failed to connect to sync peer");
-                        return SyncFlow::Retry;
-                    }
-                    Err(_) => {
-                        self.record_peer_failure(peer);
-                        self.metrics.peer_connect_timeout_count.inc();
-                        tracing::debug!(?peer, ?leader, "timed out connecting to sync peer");
-                        return SyncFlow::Retry;
-                    }
-                },
-                changed = self.leader_address.changed(), if self.leader_updates_open => {
-                    if changed.is_err() {
-                        self.leader_updates_open = false;
-                    } else if self.is_leader() {
-                        tracing::info!("shared-state leadership granted");
-                        return SyncFlow::RoleChanged;
-                    }
-                    return SyncFlow::Retry;
-                }
-            }
-        } else {
-            match connect.await {
+        let connection = tokio::select! {
+            result = connect => match result {
                 Ok(Ok(connection)) => connection,
                 Ok(Err(error)) => {
                     self.record_peer_failure(peer);
@@ -219,6 +185,14 @@ where
                     tracing::debug!(?peer, ?leader, "timed out connecting to sync peer");
                     return SyncFlow::Retry;
                 }
+            },
+            changed = self.leader_address.changed() => {
+                changed.expect("leader address sender should be retained");
+                if self.is_leader() {
+                    tracing::info!("shared-state leadership granted");
+                    return SyncFlow::RoleChanged;
+                }
+                return SyncFlow::Retry;
             }
         };
         self.metrics.peer_connect_success_count.inc();
@@ -282,25 +256,21 @@ where
                     }
                     self.metrics.action_forwarded_count.inc();
                 }
-                changed = self.leader_address.changed(), if self.leader_updates_open => {
-                    if changed.is_err() {
-                        self.leader_updates_open = false;
-                    } else if self.is_leader() {
+                changed = self.leader_address.changed() => {
+                    changed.expect("leader address sender should be retained");
+                    if self.is_leader() {
                         tracing::info!("shared-state leadership granted");
                         self.state.set_connected_to_leader(false);
                         return SyncFlow::RoleChanged;
                     }
                 }
-                changed = self.available_peers.changed(), if self.peer_updates_open => {
-                    if changed.is_err() {
-                        self.peer_updates_open = false;
-                    } else {
-                        let next_peer = self.select_peer();
-                        if peer != next_peer {
-                            tracing::debug!(?peer, ?next_peer, "sync peer selection changed");
-                            self.state.set_connected_to_leader(false);
-                            return SyncFlow::Retry;
-                        }
+                changed = self.available_peers.changed() => {
+                    changed.expect("available peers sender should be retained");
+                    let next_peer = self.select_peer();
+                    if peer != next_peer {
+                        tracing::debug!(?peer, ?next_peer, "sync peer selection changed");
+                        self.state.set_connected_to_leader(false);
+                        return SyncFlow::Retry;
                     }
                 }
             }

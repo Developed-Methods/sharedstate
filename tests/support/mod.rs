@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -13,12 +13,9 @@ use sharedstate::{
     transport::traits::{SyncConnection, SyncIO, SyncIOListener},
     DebugInfo, SharedState, SharedStateConfig, SharedStateSettings,
 };
-use tokio::{
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpListener, TcpStream,
-    },
-    sync::watch,
+use tokio::net::{
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+    TcpListener, TcpStream,
 };
 
 #[derive(Clone)]
@@ -119,7 +116,7 @@ pub(crate) fn init_tracing() {
 }
 
 pub(crate) struct TestCluster {
-    leader_tx: watch::Sender<u16>,
+    leader_address: Mutex<u16>,
     nodes: Vec<SharedState<LocalhostTcpIo, KvState>>,
     node_by_address: HashMap<u16, usize>,
 }
@@ -134,19 +131,18 @@ impl TestCluster {
         }
 
         let initial_leader = ios[0].address;
-        let (leader_tx, leader_rx) = watch::channel(initial_leader);
-        let (_, available_peers_rx) = watch::channel(ios.iter().map(|io| io.address).collect::<Vec<_>>());
+        let available_peers = ios.iter().map(|io| io.address).collect::<Vec<_>>();
         let mut nodes = Vec::with_capacity(size);
         let mut node_by_address = HashMap::with_capacity(size);
 
         for io in ios {
             let index = nodes.len();
             node_by_address.insert(io.address, index);
-            nodes.push(Self::start_node(io, leader_rx.clone(), available_peers_rx.clone()));
+            nodes.push(Self::start_node(io, initial_leader, available_peers.clone()));
         }
 
         Self {
-            leader_tx,
+            leader_address: Mutex::new(initial_leader),
             nodes,
             node_by_address,
         }
@@ -154,8 +150,8 @@ impl TestCluster {
 
     fn start_node(
         io: LocalhostTcpIo,
-        leader_address: watch::Receiver<u16>,
-        available_peers: watch::Receiver<Vec<u16>>,
+        leader_address: u16,
+        available_peers: Vec<u16>,
     ) -> SharedState<LocalhostTcpIo, KvState> {
         let my_address = io.address;
         SharedState::start(SharedStateConfig {
@@ -174,7 +170,7 @@ impl TestCluster {
     }
 
     pub(crate) fn leader_address(&self) -> u16 {
-        let leader_address = *self.leader_tx.borrow();
+        let leader_address = *self.leader_address.lock().unwrap();
         assert!(self.node_by_address.contains_key(&leader_address), "leader should be a known test node");
         leader_address
     }
@@ -188,7 +184,11 @@ impl TestCluster {
     }
 
     pub(crate) fn elect(&self, index: usize) {
-        self.leader_tx.send(self.address(index)).unwrap();
+        let leader_address = self.address(index);
+        *self.leader_address.lock().unwrap() = leader_address;
+        for node in &self.nodes {
+            node.set_leader_address(leader_address);
+        }
     }
 
     pub(crate) async fn submit(&self, index: usize, key: &str, value: &str) {

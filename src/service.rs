@@ -27,8 +27,8 @@ use crate::{
 pub struct SharedStateConfig<I: SyncIOListener, D: DeterministicState> {
     pub io: Arc<I>,
     pub my_address: I::Address,
-    pub leader_address: watch::Receiver<I::Address>,
-    pub available_peers: watch::Receiver<Vec<I::Address>>,
+    pub leader_address: I::Address,
+    pub available_peers: Vec<I::Address>,
     pub initial_state: RecoverableState<D>,
     pub settings: SharedStateSettings,
 }
@@ -45,6 +45,8 @@ const ACTION_QUEUE_CAPACITY: usize = 512;
 /// A running shared-state node. Dropping it stops the background tasks.
 pub struct SharedState<I: SyncIOListener, D: DeterministicState> {
     node: Arc<NodeState<I::Address, D>>,
+    leader_address_tx: watch::Sender<I::Address>,
+    available_peers_tx: watch::Sender<Vec<I::Address>>,
     actions_tx: mpsc::Sender<D::Action>,
     metrics: Arc<SharedStateMetrics>,
     tasks: Vec<JoinHandle<()>>,
@@ -68,6 +70,8 @@ where
         } = config;
 
         let state = SubscribableState::new(initial_state, settings.broadcast.clone())?;
+        let (leader_address_tx, leader_address) = watch::channel(leader_address);
+        let (available_peers_tx, available_peers) = watch::channel(available_peers);
         let node = Arc::new(NodeState::new(my_address, leader_address, available_peers, state));
         let metrics = Arc::new(SharedStateMetrics::default());
 
@@ -77,13 +81,24 @@ where
         let tasks = vec![
             rpc_server.start_listener(io.clone(), settings.net.clone()),
             tokio::spawn(
-                StateSyncTask::new(node.clone(), io, settings.net, actions_rx, settings.sync_timing, metrics.clone())
-                    .run(),
+                StateSyncTask::new(
+                    node.clone(),
+                    io,
+                    settings.net,
+                    actions_rx,
+                    leader_address_tx.clone(),
+                    available_peers_tx.clone(),
+                    settings.sync_timing,
+                    metrics.clone(),
+                )
+                .run(),
             ),
         ];
 
         Ok(Self {
             node,
+            leader_address_tx,
+            available_peers_tx,
             actions_tx,
             metrics,
             tasks,
@@ -96,6 +111,22 @@ where
 
     pub fn leader_address(&self) -> I::Address {
         self.node.leader_address()
+    }
+
+    pub fn set_leader_address(&self, leader_address: I::Address) {
+        self.leader_address_tx.send_replace(leader_address);
+    }
+
+    pub fn set_available_peers(&self, available_peers: Vec<I::Address>) {
+        self.available_peers_tx.send_replace(available_peers);
+    }
+
+    pub fn leader_address_sender(&self) -> watch::Sender<I::Address> {
+        self.leader_address_tx.clone()
+    }
+
+    pub fn available_peers_sender(&self) -> watch::Sender<Vec<I::Address>> {
+        self.available_peers_tx.clone()
     }
 
     pub fn is_leader(&self) -> bool {

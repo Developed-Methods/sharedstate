@@ -16,12 +16,9 @@ use sharedstate::{
     },
     SharedState, SharedStateConfig, SharedStateSettings,
 };
-use tokio::{
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpListener, TcpStream,
-    },
-    sync::watch,
+use tokio::net::{
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+    TcpListener, TcpStream,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -119,21 +116,16 @@ fn test_settings() -> SharedStateSettings {
     }
 }
 
-fn start_node<I>(
-    io: Arc<I>,
-    my_address: I::Address,
-    leader_address: watch::Receiver<I::Address>,
-) -> SharedState<I, CounterState>
+fn start_node<I>(io: Arc<I>, my_address: I::Address, leader_address: I::Address) -> SharedState<I, CounterState>
 where
     I: SyncIOListener,
     I::Address: Into<u64>,
 {
-    let (_, available_peers) = watch::channel(vec![*leader_address.borrow()]);
     SharedState::start(SharedStateConfig {
         io,
         my_address,
         leader_address,
-        available_peers,
+        available_peers: vec![leader_address],
         initial_state: RecoverableState::new(my_address.into(), CounterState::default()),
         settings: test_settings(),
     })
@@ -143,7 +135,7 @@ where
 async fn start_sim_node(
     net: &SimulatedNet,
     address: u64,
-    leader_address: watch::Receiver<u64>,
+    leader_address: u64,
 ) -> SharedState<SimulatedIo, CounterState> {
     start_node(net.start_io(address).await, address, leader_address)
 }
@@ -178,10 +170,9 @@ async fn dropping_tcp_node_stops_new_traffic_or_marks_follower_disconnected() {
     let follower_io = LocalhostTcpIo::bind_ephemeral().await.unwrap();
     let leader_address = leader_io.address;
     let follower_address = follower_io.address;
-    let (_leader_tx, leader_rx) = watch::channel(leader_address);
 
-    let leader = start_node(Arc::new(leader_io), leader_address, leader_rx.clone());
-    let follower = start_node(Arc::new(follower_io), follower_address, leader_rx);
+    let leader = start_node(Arc::new(leader_io), leader_address, leader_address);
+    let follower = start_node(Arc::new(follower_io), follower_address, leader_address);
 
     wait_until(|| follower.is_connected_to_leader(), "follower never connected before leader drop").await;
 
@@ -209,9 +200,8 @@ async fn dropping_tcp_node_stops_new_traffic_or_marks_follower_disconnected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn dropped_leader_no_longer_propagates_follower_actions() {
     let net = SimulatedNet::new();
-    let (_leader_tx, leader_rx) = watch::channel(1);
-    let leader = start_sim_node(&net, 1, leader_rx.clone()).await;
-    let follower = start_sim_node(&net, 2, leader_rx).await;
+    let leader = start_sim_node(&net, 1, 1).await;
+    let follower = start_sim_node(&net, 2, 1).await;
 
     wait_until(|| follower.is_connected_to_leader(), "follower never connected before leader drop").await;
 
@@ -241,9 +231,8 @@ async fn dropped_leader_no_longer_propagates_follower_actions() {
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_node_closes_its_action_queue() {
     let net = SimulatedNet::new();
-    let (_leader_tx, leader_rx) = watch::channel(1);
-    let leader = start_sim_node(&net, 1, leader_rx.clone()).await;
-    let follower = start_sim_node(&net, 2, leader_rx).await;
+    let leader = start_sim_node(&net, 1, 1).await;
+    let follower = start_sim_node(&net, 2, 1).await;
 
     wait_until(|| follower.is_connected_to_leader(), "follower never connected before queue close check").await;
 

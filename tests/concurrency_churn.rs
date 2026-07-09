@@ -18,7 +18,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::{watch, Mutex},
+    sync::Mutex,
     task::JoinSet,
 };
 
@@ -116,7 +116,6 @@ impl MessageEncoding for ExactKvState {
 }
 
 struct ExactCluster {
-    leader_tx: watch::Sender<u16>,
     nodes: Vec<SharedState<LocalhostTcpIo, ExactKvState>>,
 }
 
@@ -130,8 +129,7 @@ impl ExactCluster {
         }
 
         let initial_leader = ios[0].address;
-        let (leader_tx, leader_rx) = watch::channel(initial_leader);
-        let (_, available_peers_rx) = watch::channel(ios.iter().map(|io| io.address).collect::<Vec<_>>());
+        let available_peers = ios.iter().map(|io| io.address).collect::<Vec<_>>();
         let mut nodes = Vec::with_capacity(size);
 
         for io in ios {
@@ -140,8 +138,8 @@ impl ExactCluster {
                 SharedState::start(SharedStateConfig {
                     io: Arc::new(io),
                     my_address,
-                    leader_address: leader_rx.clone(),
-                    available_peers: available_peers_rx.clone(),
+                    leader_address: initial_leader,
+                    available_peers: available_peers.clone(),
                     initial_state: RecoverableState::new(my_address as u64, ExactKvState::default()),
                     settings: SharedStateSettings::default(),
                 })
@@ -149,11 +147,14 @@ impl ExactCluster {
             );
         }
 
-        Self { leader_tx, nodes }
+        Self { nodes }
     }
 
     fn elect(&self, index: usize) {
-        self.leader_tx.send(self.nodes[index].my_address()).unwrap();
+        let leader_address = self.nodes[index].my_address();
+        for node in &self.nodes {
+            node.set_leader_address(leader_address);
+        }
     }
 
     fn is_leader(&self, index: usize) -> bool {

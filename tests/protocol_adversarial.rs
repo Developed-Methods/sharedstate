@@ -33,7 +33,6 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
-    sync::watch,
 };
 
 const PROCESS_TIMEOUT: Duration = Duration::from_millis(75);
@@ -148,13 +147,11 @@ fn test_settings() -> SharedStateSettings {
 async fn start_tcp_leader() -> (SharedState<LocalhostTcpIo, TestState>, u16) {
     let io = LocalhostTcpIo::bind_ephemeral().await.unwrap();
     let address = io.address;
-    let (_leader_tx, leader_rx) = watch::channel(address);
-    let (_available_peers_tx, available_peers_rx) = watch::channel(vec![address]);
     let node = SharedState::start(SharedStateConfig {
         io: Arc::new(io),
         my_address: address,
-        leader_address: leader_rx,
-        available_peers: available_peers_rx,
+        leader_address: address,
+        available_peers: vec![address],
         initial_state: RecoverableState::new(address as u64, TestState::default()),
         settings: test_settings(),
     })
@@ -346,13 +343,11 @@ async fn follower_retries_and_does_not_apply_out_of_sequence_leader_stream() {
         leader: 20,
         connects: connects.clone(),
     });
-    let (_leader_tx, leader_rx) = watch::channel(20);
-    let (_available_peers_tx, available_peers_rx) = watch::channel(vec![20]);
     let follower = SharedState::start(SharedStateConfig {
         io,
         my_address: 10,
-        leader_address: leader_rx,
-        available_peers: available_peers_rx,
+        leader_address: 20,
+        available_peers: vec![20],
         initial_state: RecoverableState::new(10, TestState::default()),
         settings: test_settings(),
     })

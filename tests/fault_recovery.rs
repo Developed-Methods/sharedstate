@@ -16,7 +16,6 @@ use sharedstate::{
     transport::{channels::NetIoSettings, simulated::SimulatedNet},
     SharedState, SharedStateConfig, SharedStateSettings,
 };
-use tokio::sync::watch;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct KvState {
@@ -66,7 +65,7 @@ impl MessageEncoding for KvState {
 
 struct SimCluster {
     net: SimulatedNet,
-    leader_tx: watch::Sender<u64>,
+    leader_address: u64,
     nodes: Vec<SharedState<sharedstate::transport::simulated::SimulatedIo, KvState>>,
 }
 
@@ -76,8 +75,7 @@ impl SimCluster {
 
         let net = SimulatedNet::new();
         let initial_leader = 1;
-        let (leader_tx, leader_rx) = watch::channel(initial_leader);
-        let (available_peers_tx, available_peers_rx) = watch::channel((1..=size as u64).collect::<Vec<_>>());
+        let available_peers = (1..=size as u64).collect::<Vec<_>>();
         let mut nodes = Vec::with_capacity(size);
 
         for address in 1..=size as u64 {
@@ -86,8 +84,8 @@ impl SimCluster {
                 SharedState::start(SharedStateConfig {
                     io,
                     my_address: address,
-                    leader_address: leader_rx.clone(),
-                    available_peers: available_peers_rx.clone(),
+                    leader_address: initial_leader,
+                    available_peers: available_peers.clone(),
                     initial_state: RecoverableState::new(address, KvState::default()),
                     settings: test_settings(),
                 })
@@ -95,9 +93,11 @@ impl SimCluster {
             );
         }
 
-        drop(available_peers_tx);
-
-        Self { net, leader_tx, nodes }
+        Self {
+            net,
+            leader_address: initial_leader,
+            nodes,
+        }
     }
 
     fn leader(&self) -> &SharedState<sharedstate::transport::simulated::SimulatedIo, KvState> {
@@ -105,7 +105,7 @@ impl SimCluster {
     }
 
     fn assert_leader_address(&self) {
-        assert_eq!(*self.leader_tx.borrow(), 1);
+        assert_eq!(self.leader_address, 1);
     }
 
     async fn submit_to_leader(&self, key: &str, value: &str) {
