@@ -1,6 +1,7 @@
 use std::{
     cmp::Reverse,
-    collections::{HashMap, HashSet},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
+    hash::Hasher,
     sync::Arc,
     time::Duration,
 };
@@ -78,8 +79,7 @@ where
             let peer_views = peers
                 .values()
                 .map(|peer| {
-                    let reported_reachable =
-                        report_threshold < reach_table.get(&peer.addr).copied().unwrap_or(0);
+                    let reported_reachable = report_threshold < reach_table.get(&peer.addr).copied().unwrap_or(0);
                     PeerView::new(peer, reported_reachable)
                 })
                 .collect::<Vec<_>>();
@@ -87,7 +87,6 @@ where
             let me = PeerView {
                 addr: self.state.my_address,
                 is_voter: self.state.can_lead,
-                connected: true,
                 unreachable: false,
                 leader_state: None,
                 recovery: Some(my_recovery),
@@ -123,7 +122,6 @@ where
 struct PeerView<A: SyncIOAddress> {
     addr: A,
     is_voter: bool,
-    connected: bool,
     unreachable: bool,
     leader_state: Option<LeaderState<A>>,
     recovery: Option<RecoverableStateDetails>,
@@ -134,11 +132,8 @@ impl<A: SyncIOAddress> PeerView<A> {
     fn new(peer: &PeerState<A>, reported_reachable: bool) -> Self {
         /* a peer only counts as unreachable when our own dial failed and the
          * rest of the cluster doesn't vouch for it either */
-        let unreachable =
-            matches!(peer.connect_status, ConnectStatus::FailedToConnect { .. }) && !reported_reachable;
-        let known_can_lead = peer
-            .can_lead
-            .or(peer.leader_info.as_ref().map(|info| info.can_lead));
+        let unreachable = matches!(peer.connect_status, ConnectStatus::FailedToConnect { .. }) && !reported_reachable;
+        let known_can_lead = peer.can_lead.or(peer.leader_info.as_ref().map(|info| info.can_lead));
 
         Self {
             addr: peer.addr,
@@ -146,7 +141,6 @@ impl<A: SyncIOAddress> PeerView<A> {
              * claim leadership before discovery settles; unreachable peers
              * with unknown status are excluded so they can't block elections */
             is_voter: known_can_lead.unwrap_or(!unreachable),
-            connected: peer.connect_status.is_connected(),
             unreachable,
             leader_state: peer.leader_info.as_ref().map(|info| info.leader_state.clone()),
             recovery: peer.leader_info.as_ref().map(|info| info.recovery_details.clone()),
@@ -189,13 +183,11 @@ fn next_voter_state<A: SyncIOAddress>(
     current: &LeaderState<A>,
     peers: &[PeerView<A>],
 ) -> LeaderState<A> {
+    let term_salt = address_salt(me.addr);
     let voters = || peers.iter().filter(|peer| peer.is_voter);
     let seen_terms = || voters().filter_map(|peer| peer.leader_state.as_ref().map(|state| state.term));
 
-    let term = seen_terms()
-        .chain(std::iter::once(current.term))
-        .max()
-        .unwrap();
+    let term = seen_terms().chain(std::iter::once(current.term)).max().unwrap();
 
     /* our term number was also reached by a different root (same number,
      * different nonce); if we hold a leadership claim it must not be merged
@@ -209,7 +201,7 @@ fn next_voter_state<A: SyncIOAddress>(
             "a different election root reached our term number, starting a new election"
         );
         return LeaderState {
-            term: term.bump(),
+            term: term.bump_with_salt(term_salt),
             mode: LeaderMode::Electing { vote: None },
         };
     }
@@ -228,7 +220,7 @@ fn next_voter_state<A: SyncIOAddress>(
     /* a Leading claim at the current term is authoritative (it required a
      * majority); if partitions merge with two claims, the lowest address wins */
     let peer_claim = voters()
-        .filter(|peer| peer.connected)
+        .filter(|peer| !peer.unreachable)
         .filter(|peer| matches!(peer.mode_at_term(term), Some(LeaderMode::Leading)))
         .map(|peer| peer.addr)
         .min();
@@ -244,7 +236,7 @@ fn next_voter_state<A: SyncIOAddress>(
                     "lost contact with voter majority, stepping down"
                 );
                 return LeaderState {
-                    term: term.bump(),
+                    term: term.bump_with_salt(term_salt),
                     mode: LeaderMode::Electing { vote: None },
                 };
             }
@@ -276,7 +268,7 @@ fn next_voter_state<A: SyncIOAddress>(
             if leader_view.map(|peer| peer.unreachable).unwrap_or(true) {
                 tracing::warn!(?leader, %term, "leader is unreachable, starting a new election");
                 return LeaderState {
-                    term: term.bump(),
+                    term: term.bump_with_salt(term_salt),
                     mode: LeaderMode::Electing { vote: None },
                 };
             }
@@ -316,10 +308,7 @@ fn next_voter_state<A: SyncIOAddress>(
                 .chain([me])
                 .filter_map(|peer| peer.recovery.as_ref())
                 .collect::<Vec<_>>();
-            let voter_addrs = voters()
-                .map(|peer| peer.addr)
-                .chain([me.addr])
-                .collect::<HashSet<_>>();
+            let voter_addrs = voters().map(|peer| peer.addr).chain([me.addr]).collect::<HashSet<_>>();
 
             let score = |candidate: &PeerView<A>| {
                 let recoverable = candidate
@@ -341,7 +330,7 @@ fn next_voter_state<A: SyncIOAddress>(
             };
 
             let vote = voters()
-                .filter(|peer| peer.connected)
+                .filter(|peer| !peer.unreachable)
                 .chain([me])
                 .max_by_key(|candidate| (score(candidate), Reverse(candidate.addr)))
                 .map(|candidate| candidate.addr)
@@ -349,7 +338,7 @@ fn next_voter_state<A: SyncIOAddress>(
 
             if vote == me.addr {
                 let support = 1 + voters()
-                    .filter(|peer| peer.connected)
+                    .filter(|peer| !peer.unreachable)
                     .filter(|peer| match peer.mode_at_term(term) {
                         Some(LeaderMode::Electing { vote: Some(vote) }) => *vote == me.addr,
                         Some(LeaderMode::Following { leader }) => *leader == me.addr,
@@ -374,13 +363,20 @@ fn next_voter_state<A: SyncIOAddress>(
     }
 }
 
+fn address_salt<A: SyncIOAddress>(addr: A) -> u32 {
+    let mut hasher = DefaultHasher::new();
+    addr.hash(&mut hasher);
+    let hash = hasher.finish();
+    (hash as u32) ^ ((hash >> 32) as u32)
+}
+
 /// Decides the next leader state for a node that cannot lead. Observers never
-/// vote; they mirror what the connected voters report, preferring a direct
+/// vote; they mirror what the reachable voters report, preferring a direct
 /// Leading claim and falling back to the most-followed address.
 fn next_observer_state<A: SyncIOAddress>(current: &LeaderState<A>, peers: &[PeerView<A>]) -> LeaderState<A> {
     let voter_states = peers
         .iter()
-        .filter(|peer| peer.is_voter && peer.connected)
+        .filter(|peer| peer.is_voter && !peer.unreachable)
         .filter_map(|peer| peer.leader_state.as_ref().map(|state| (peer.addr, state)))
         .collect::<Vec<_>>();
 
@@ -422,11 +418,17 @@ mod tests {
     use super::*;
 
     fn ls(term: u64, mode: LeaderMode<u16>) -> LeaderState<u16> {
-        LeaderState { term: ElectionTerm::from_term(term), mode }
+        LeaderState {
+            term: ElectionTerm::from_term(term),
+            mode,
+        }
     }
 
     fn ls_root(term: u64, nonce: u32, mode: LeaderMode<u16>) -> LeaderState<u16> {
-        LeaderState { term: ElectionTerm::from_parts(term, nonce), mode }
+        LeaderState {
+            term: ElectionTerm::from_parts(term, nonce),
+            mode,
+        }
     }
 
     /* all test voters share the same recoverable state by default so scores
@@ -439,7 +441,6 @@ mod tests {
         PeerView {
             addr,
             is_voter: true,
-            connected: true,
             unreachable: false,
             leader_state: state,
             recovery: Some(shared_recovery()),
@@ -452,7 +453,6 @@ mod tests {
     }
 
     fn unreachable(mut peer: PeerView<u16>) -> PeerView<u16> {
-        peer.connected = false;
         peer.unreachable = true;
         peer
     }
@@ -481,7 +481,6 @@ mod tests {
         let peers = [PeerView {
             addr: 2,
             is_voter: true,
-            connected: false,
             unreachable: false,
             leader_state: None,
             recovery: None,
@@ -614,10 +613,7 @@ mod tests {
         /* the peers voted for us, but in a same-numbered term from a
          * different root (lower nonce); those votes must not produce a
          * majority in our election */
-        let peers = [
-            voter(2, Some(ls(4, electing(1)))),
-            voter(3, Some(ls(4, following(1)))),
-        ];
+        let peers = [voter(2, Some(ls(4, electing(1)))), voter(3, Some(ls(4, following(1))))];
         let next = next_voter_state(&me(1), &ls_root(4, 9, electing(1)), &peers);
         assert_eq!(next, ls_root(4, 9, electing(1)));
 
@@ -628,7 +624,10 @@ mod tests {
 
     #[test]
     fn adopts_highest_term_and_follows_its_claim() {
-        let peers = [voter(2, Some(ls(7, LeaderMode::Leading))), voter(3, Some(ls(6, following(3))))];
+        let peers = [
+            voter(2, Some(ls(7, LeaderMode::Leading))),
+            voter(3, Some(ls(6, following(3)))),
+        ];
         let next = next_voter_state(&me(1), &ls(2, LeaderMode::Leading), &peers);
         assert_eq!(next, ls(7, following(2)));
     }
@@ -735,7 +734,10 @@ mod tests {
 
     #[test]
     fn observer_follows_claimed_leader() {
-        let peers = [voter(1, Some(ls(4, LeaderMode::Leading))), voter(2, Some(ls(4, following(1))))];
+        let peers = [
+            voter(1, Some(ls(4, LeaderMode::Leading))),
+            voter(2, Some(ls(4, following(1)))),
+        ];
         let next = next_observer_state(&ls(0, LeaderMode::NoLeader), &peers);
         assert_eq!(next, ls(4, following(1)));
     }
@@ -804,7 +806,6 @@ mod tests {
                     .map(|(addr, can_lead, state, recovery)| PeerView {
                         addr: *addr,
                         is_voter: *can_lead,
-                        connected: !down.contains(addr),
                         unreachable: down.contains(addr),
                         leader_state: Some(state.clone()),
                         recovery: Some(recovery.clone()),
@@ -815,7 +816,6 @@ mod tests {
                 let myself = PeerView {
                     addr: node.addr,
                     is_voter: node.can_lead,
-                    connected: true,
                     unreachable: false,
                     leader_state: None,
                     recovery: Some(node.recovery.clone()),
@@ -911,7 +911,10 @@ mod tests {
 
     #[test]
     fn observer_ignores_stale_term_claims() {
-        let peers = [voter(1, Some(ls(3, LeaderMode::Leading))), voter(3, Some(ls(4, following(2))))];
+        let peers = [
+            voter(1, Some(ls(3, LeaderMode::Leading))),
+            voter(3, Some(ls(4, following(2)))),
+        ];
         let next = next_observer_state(&ls(3, following(1)), &peers);
         assert_eq!(next, ls(4, following(2)));
     }
