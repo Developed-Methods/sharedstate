@@ -12,3 +12,7 @@ pub mod transport;
 mod utils;
 
 pub use service::{SharedState, SharedStateConfig, SharedStateRecoverableConfig, SharedStateSettings};
+
+/// Experimental durable consensus API. Release gates remain tracked in docs/upgrade/workflow.md.
+#[cfg(feature = "experimental-v4")]
+pub mod v4;

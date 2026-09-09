@@ -8,8 +8,8 @@ use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedBroadcastSettings, SettingsError};
 use tokio::{
     sync::{
-        mpsc::{self, error::SendError},
         Mutex,
+        mpsc::{self, error::SendError},
     },
     task::JoinHandle,
 };
@@ -356,10 +356,11 @@ mod tests {
                 observed_leader.get_or_insert(leader);
             }
 
-            if let Some(leader) = observed_leader {
-                if unsettled.is_empty() && leader_is_leading {
-                    return leader;
-                }
+            if let Some(leader) = observed_leader
+                && unsettled.is_empty()
+                && leader_is_leading
+            {
+                return leader;
             }
 
             assert!(

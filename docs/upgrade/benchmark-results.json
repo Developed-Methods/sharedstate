@@ -1,0 +1,104 @@
+[
+  {
+    "phase": "development-before-final-lease-and-voter-resume-changes",
+    "run": "20-batched",
+    "result": {
+      "commit_max_us": 568178,
+      "commit_p50_us": 183946,
+      "commit_p95_us": 346092,
+      "join_mode": "sequential",
+      "readers": 20,
+      "snapshot_catch_up_ms": [
+        9438,
+        9492,
+        9822,
+        9680,
+        11574,
+        9715,
+        9730,
+        9659,
+        9537,
+        10366,
+        9785,
+        9731,
+        9718,
+        9891,
+        10297,
+        9764,
+        11677,
+        12408,
+        9673,
+        9877
+      ],
+      "state_mib": 60,
+      "transport": "same-process SimulatedNet, no injected latency",
+      "voters": 3,
+      "writes": 1000,
+      "writes_per_second": 5.637782289966034
+    }
+  },
+  {
+    "phase": "development-before-final-lease-and-voter-resume-changes",
+    "run": "chunks",
+    "result": {
+      "commit_max_us": 28422,
+      "commit_p50_us": 938,
+      "commit_p95_us": 4142,
+      "join_mode": "sequential",
+      "readers": 1,
+      "snapshot_catch_up_ms": [
+        4123
+      ],
+      "state_mib": 60,
+      "transport": "same-process SimulatedNet, no injected latency",
+      "voters": 3,
+      "writes": 1000,
+      "writes_per_second": 627.3803646233922
+    }
+  },
+  {
+    "phase": "five-voter-workload-after-voter-resume-before-final-checkpoint-ordering-fix",
+    "concurrent_activity": "local validation and compilation on the same shared host",
+    "result": {
+      "commit_max_us": 1131860,
+      "commit_p50_us": 259934,
+      "commit_p95_us": 563602,
+      "join_mode": "sequential",
+      "readers": 20,
+      "snapshot_catch_up_ms": [
+        4745,
+        5035,
+        5025,
+        5644,
+        8584,
+        5180,
+        4873,
+        4957,
+        5063,
+        5481,
+        4755,
+        5038,
+        4389,
+        4406,
+        4412,
+        4351,
+        4360,
+        4026,
+        3902,
+        3617
+      ],
+      "state_mib": 60,
+      "transport": "same-process SimulatedNet, no injected latency",
+      "voters": 5,
+      "writes": 1000,
+      "writes_per_second": 3.5753270185881574
+    },
+    "resources": {
+      "exit_code": 0,
+      "elapsed_seconds": 388.6006243079901,
+      "max_rss_kib": 4163808,
+      "user_seconds": 256.207745,
+      "system_seconds": 628.772381
+    }
+  }
+]

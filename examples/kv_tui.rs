@@ -466,10 +466,10 @@ async fn run_tui(
             last_render = Instant::now();
         }
 
-        if event::poll(Duration::from_millis(20))? {
-            if let Event::Key(key) = event::read()? {
-                handle_key(key, &mut app, shared, state_handle).await;
-            }
+        if event::poll(Duration::from_millis(20))?
+            && let Event::Key(key) = event::read()?
+        {
+            handle_key(key, &mut app, shared, state_handle).await;
         }
 
         if app.should_quit {
@@ -664,10 +664,8 @@ async fn handle_key(key: KeyEvent, app: &mut App, shared: &KvShared, state_handl
                 run_command(command, app, shared, state_handle).await;
             }
         }
-        KeyCode::Char(ch) => {
-            if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
-                app.insert_char(ch);
-            }
+        KeyCode::Char(ch) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            app.insert_char(ch);
         }
         _ => {}
     }

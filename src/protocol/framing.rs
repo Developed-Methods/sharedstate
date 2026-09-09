@@ -4,6 +4,7 @@ use message_encoding::MessageEncoding;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub type MessageSizeHeader = u32;
+pub const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 const MESSAGE_HEADER_SIZE: usize = std::mem::size_of::<MessageSizeHeader>();
 const KEEPALIVE_FRAME_SIZE: MessageSizeHeader = 0;
 const CLOSE_FRAME_SIZE: MessageSizeHeader = MessageSizeHeader::MAX;
@@ -38,6 +39,12 @@ pub async fn read_message_opt<M: MessageEncoding, R: AsyncRead + Unpin>(
 
     let mut reader = &buffer[..];
     let msg = M::read_from(&mut reader).map_err(ReadMessageError::EncodingError)?;
+    if !reader.is_empty() {
+        return Err(ReadMessageError::EncodingError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trailing message bytes",
+        )));
+    }
     Ok(ReadMessageResult::Message(msg))
 }
 
@@ -68,7 +75,16 @@ pub async fn read_message_to_vec<R: AsyncRead + Unpin>(
     }
 
     let msg_len = msg_len as usize;
+    if msg_len > MAX_FRAME_BYTES {
+        return Err(ReadMessageError::EncodingError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame limit exceeded",
+        )));
+    }
     buffer.clear();
+    buffer
+        .try_reserve(msg_len)
+        .map_err(|e| ReadMessageError::EncodingError(std::io::Error::other(e)))?;
     buffer.resize(msg_len, 0u8);
 
     let mut bytes_read = 0;
@@ -151,31 +167,39 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
     buffer.clear();
 
     if let Some(max_size) = M::MAX_SIZE {
-        buffer.reserve(MESSAGE_HEADER_SIZE + max_size);
+        buffer.reserve(MESSAGE_HEADER_SIZE + max_size.min(2048));
         debug_assert!(max_size < (MessageSizeHeader::MAX as usize));
     }
 
     buffer.extend((0 as MessageSizeHeader).to_be_bytes());
     debug_assert_eq!(buffer.len(), MESSAGE_HEADER_SIZE);
 
-    let bytes_written = message.write_to(buffer)?;
-    debug_assert_eq!(
-        bytes_written + MESSAGE_HEADER_SIZE,
-        buffer.len(),
-        "M::write_to returned incorrect number of bytes"
-    );
-    if bytes_written >= CLOSE_FRAME_SIZE as usize {
+    struct BoundedFrame<'a>(&'a mut Vec<u8>);
+    impl std::io::Write for BoundedFrame<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > (MAX_FRAME_BYTES + MESSAGE_HEADER_SIZE).saturating_sub(self.0.len()) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame limit exceeded"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let reported = message.write_to(&mut BoundedFrame(buffer))?;
+    let bytes_written = buffer.len() - MESSAGE_HEADER_SIZE;
+    if reported != bytes_written {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "encoder reported an incorrect size"));
+    }
+    if bytes_written == 0 || bytes_written > MAX_FRAME_BYTES || bytes_written >= CLOSE_FRAME_SIZE as usize {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "message too large for framing protocol"));
     }
 
-    /* if static size is known, we've already written size with MAX_SIZE var */
     if let Some(size) = M::STATIC_SIZE {
         debug_assert_eq!(size, bytes_written, "M::STATIC_SIZE does not match M::write_to");
     }
-    /* write size to start of buffer */
-    else {
-        buffer[..MESSAGE_HEADER_SIZE].copy_from_slice(&(bytes_written as MessageSizeHeader).to_be_bytes());
-    }
+    buffer[..MESSAGE_HEADER_SIZE].copy_from_slice(&(bytes_written as MessageSizeHeader).to_be_bytes());
 
     /* note: send in batches with timeout to ensure connection isn't hanging and we also can
      * support sending really large messages */
@@ -193,7 +217,9 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
         }
     }
 
-    out.flush().await
+    tokio::time::timeout(progress_timeout, out.flush())
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout flushing message"))?
 }
 
 #[cfg(test)]
@@ -204,7 +230,7 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, duplex};
 
     use super::*;
 

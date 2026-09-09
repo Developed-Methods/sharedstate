@@ -1,4 +1,7 @@
-use std::{fmt::{Debug, Display}, num::NonZeroU64};
+use std::{
+    fmt::{Debug, Display},
+    num::NonZeroU64,
+};
 
 use message_encoding::MessageEncoding;
 
@@ -393,7 +396,12 @@ where
     }
 }
 
+const MAX_PEERS_PER_MESSAGE: usize = 4096;
+
 fn write_vec<T: MessageEncoding, W: std::io::Write>(v: &[T], out: &mut W) -> std::io::Result<usize> {
+    if v.len() > MAX_PEERS_PER_MESSAGE {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "peer list limit exceeded"));
+    }
     let mut sum = (v.len() as u64).write_to(out)?;
     for i in v {
         sum += i.write_to(out)?;
@@ -402,7 +410,11 @@ fn write_vec<T: MessageEncoding, W: std::io::Write>(v: &[T], out: &mut W) -> std
 }
 
 fn read_vec<T: MessageEncoding, R: std::io::Read>(read: &mut R) -> std::io::Result<Vec<T>> {
-    let count = u64::read_from(read)? as usize;
+    let count = u64::read_from(read)?;
+    if count > MAX_PEERS_PER_MESSAGE as u64 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "peer list limit exceeded"));
+    }
+    let count = count as usize;
     let mut vec = Vec::with_capacity(count);
     for _ in 0..count {
         vec.push(MessageEncoding::read_from(read)?);
@@ -412,6 +424,15 @@ fn read_vec<T: MessageEncoding, R: std::io::Read>(read: &mut R) -> std::io::Resu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn peer_list_lengths_are_bounded_before_allocation() {
+        let bytes = u64::MAX.to_be_bytes();
+        assert!(super::read_vec::<u64, _>(&mut &bytes[..]).is_err());
+        let mut output = Vec::new();
+        assert!(super::write_vec(&vec![0u64; super::MAX_PEERS_PER_MESSAGE + 1], &mut output).is_err());
+        assert!(output.is_empty());
+    }
+
     use std::io::Result;
 
     use super::*;

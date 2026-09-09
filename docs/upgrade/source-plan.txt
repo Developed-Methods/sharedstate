@@ -1,0 +1,734 @@
+Sharedstate implementation plan
+Sharedstate: implementation and refactoring plan
+9 September 2026 · proposed v4 architecture · baseline
+5fc00db95bb96e36b5598425fa8cdd04b3f9931f
+Plan only. No implementation changes were made. Timings and capacities below are proposed starting values.
+Design decision
+Guarantees
+Architecture
+Runtime behavior
+Write delivery
+Storage and snapshots
+Traceability
+Implementation sequence
+Issue mapping
+Test plan
+Rollout
+Recommended direction: durable consensus for writers, committed replication for readers, and explicit ownership of every background task.
+Keep fast local reads and support for many replicas. Replace the custom voter election and authority stream with a durable, majority-committed log.
+Make leader changes, retries, operation outcomes, and recovery positions visible through typed state and structured events. Remove shared mutable authority from the public API.
+1. Design decision and scope
+The review found failures in election liveness, delivery, recovery deadlines, reader isolation, shutdown, and framing. Timer fixes alone cannot establish quorum safety.
+Use Openraft as the proposed consensus engine. Validate and pin a compatible release during PR02 before building the adapters. Keep its types behind a small internal boundary.
+Openraft documents separate log-storage and state-machine interfaces. Its getting-started guide includes learner addition and membership management. These fit the proposed integration boundaries.
+Openraft integration guide
+.
+This plan deliberately strengthens successful-write semantics. A disconnected minority may serve stale reads, but it cannot acknowledge committed writes. Durable state introduces disk and majority-network costs.
+If partition-local writes must remain successful, this architecture needs a different conflict-resolution contract. Arbitrary deterministic actions cannot be merged safely without application-specific rules.
+Working assumption
+Planned behavior
+Deployment
+Start with three or five durable voters. Add many non-voting read replicas through committed distribution feeds.
+Failures
+Handle crash/restart, lost connections, delays, partitions, repeated messages, and recoverable disk errors. Peers are trusted; Byzantine consensus is outside scope.
+Read policy
+Default reads remain local and may be stale. Expose revision and freshness metadata with every snapshot.
+Write policy
+A successful write means consensus commitment and leader application. Waiting for a particular read replica is a separate operation.
+Compatibility
+Ship protocol v2 and a major crate version. Keep a small legacy state adapter where its semantics are compatible.
+One-minute objective
+Measure recovery after a stable majority and adequate resource capacity become available. Include live replicas that have a functioning route.
+Persistence
+Provide a supported durable voter backend. Limit memory-only storage to explicit tests or disposable development clusters.
+2. Guarantees and invariants
+Record these invariants in
+docs/architecture/invariants.md
+. Use their IDs in tests, transition code, and review descriptions.
+ID
+Invariant
+Observable evidence
+I01
+Only the consensus engine determines voting, term transitions, membership, and commitment. Discovery never changes the electorate.
+Committed membership revision and engine status
+I02
+Every public state snapshot is a committed log prefix. No uncommitted branch reaches readers or downstream replicas.
+Snapshot revision plus committed-log position
+I03
+An acknowledged operation survives failover while the required durable quorum remains recoverable.
+Operation receipt, durable log entry, replay result
+I04
+Retrying an operation ID never applies its effect twice within the documented client-session contract.
+Replicated client sequence and cached response
+I05
+A follower installs only a complete verified snapshot and an ordered compatible log suffix.
+Snapshot manifest, digest, predecessor log identity
+I06
+Leader/session changes invalidate obsolete in-flight work before it mutates replica state.
+Generation-tagged events and rejected stale completion counters
+I07
+Every network wait and queue admission has cancellation, an end-to-end deadline, and a typed outcome.
+Deadline metrics and reason-coded results
+I08
+Slow readers and subscribers cannot block consensus application or other replicas.
+Retained-snapshot test and per-subscriber byte budgets
+I09
+Every task belongs to a supervised lifecycle. Failed critical tasks make readiness false.
+Task registry, health transitions, completed shutdown
+I10
+Under the supported fault envelope, leader agreement and replica catch-up complete within the recovery budget.
+Fault scenario ID, elapsed times, matching barrier digest
+Do not assert that every disconnected process immediately stops reporting itself as leader. Assert that conflicting writes cannot both commit. After healing, require agreement on the same engine leader identity.
+Do not reject historical committed entries merely because their entry term is older than the current leader term. Validate the source session and log-prefix relationship separately.
+3. Module boundaries and ownership
+Use one owner for each mutable state domain. Exchange typed messages and read-only watches between owners. Keep locks short and free of network waits.
+Proposed ownership and replication architecture
+Client admission
+IDs / receipts / routing
+Consensus adapter
+term / quorum / log
+State owner
+committed apply
+Durable storage
+log / vote / snapshot
+Read publication
+immutable snapshots
+Replica distribution
+feeds / relays
+Supervisor, deadlines, transport, and tracing cover every component
+Proposed files
+Owns
+Replaces or extracts
+src/service.rs
+,
+src/config.rs
+Construction, validated configuration, public handles, async shutdown
+Current service orchestration and public mutable NodeState access
+src/consensus/{mod,openraft,network,membership}.rs
+One adapter around the engine; leadership watch; explicit admin membership commands
+cluster/leader.rs
+and custom ElectionTerm voting rules
+src/peers/{directory,health,discovery}.rs
+Stable NodeId-to-address mapping, local health evidence, bounded discovery
+Peer map and discovery portions of NodeState
+src/operations/{admission,router,session}.rs
+Operation identity, bounded admission, retry state, receipts
+Action queues and forwarding logic inside state_sync
+src/replication/{session,feed,relay,snapshot}.rs
+Committed read-replica sessions, resumable catch-up, optional relay fanout
+cluster/state_sync.rs
+and subscription portions of rpc_server
+src/state/{machine,publisher,revision}.rs
+Serial deterministic application, immutable publication, checked revisions
+SubscribableState, hotread publication, recovery generation bookkeeping
+src/storage/{mod,sqlite,recovery}.rs
+Engine storage contract, ordered I/O, snapshot manifest lifecycle
+New durable boundary; replaces volatile-only authority history
+src/protocol/{handshake,control,replication,codec}.rs
+Typed v2 messages, size limits, capability checks
+Monolithic request/response sum plus ad hoc framing assumptions
+src/runtime/{supervisor,deadline,status}.rs
+Task ownership, cancellation, readiness, deadlines
+Detached spawning throughout transport and cluster code
+tests/{scenarios,model,support}/
+Reusable topology fixtures, deterministic fault schedules, invariant checkers
+Repeated state fixtures and polling helpers across modules
+Keep modules only where ownership or protocol boundaries justify them. Small related enums can remain together. Avoid generic actor frameworks and one-line forwarding wrappers.
+Expose
+NodeStatus
+,
+PeerStatus
+, and leadership watches instead of
+Arc<NodeState>
+. Keep mutation behind internal owners and typed commands.
+Consensus voters and read replicas
+Use engine-managed learners for nodes being promoted to voters. Keep ordinary high-fanout read replicas outside voting membership.
+Only voters determine commitment. Ordinary replicas consume committed prefixes from voters or trusted relays. Their connection counts and health reports never affect elections.
+A relay must publish a contiguous committed prefix it has applied. Include origin cluster identity, log identity, and stream generation. Never infer authority from “follows the same address.”
+4. Election, health, routing, and cancellation
+Leadership and membership
+Persist a random stable
+NodeId
+independently from network addresses. Persist a
+ClusterId
+at explicit bootstrap.
+Allow bootstrap only against empty storage with an explicit initial voter set. Reject automatic self-bootstrap when seeds cannot be reached.
+Delegate elections, vote persistence, log freshness, and membership transitions to the engine. Do not layer custom address tie-breaks onto its decisions.
+Add replacements as learners, catch them up, then promote through committed membership changes. Remove retired members explicitly after the transition.
+Change addresses without inventing voter identities. Refuse duplicate active NodeIds and mismatched ClusterIds.
+Use the engine’s leadership metrics to publish a watch value. Treat it as routing information, not permission to bypass consensus commitment.
+Application-level health
+Replace Connected/NotConnected as the failure model with
+Unknown
+,
+Healthy
+,
+Suspect
+, and
+Unreachable
+. Keep socket state separate.
+Record successful protocol round trips using monotonic time. Include handshake failures, response timeouts, and stalled reads in failure evidence.
+Use peer-health evidence for retry and diagnostics. Let the consensus engine own election timeouts and quorum decisions.
+Expire indirect reachability reports. Never extend local health merely because another node repeats an old report.
+Run consensus RPCs independently from discovery, client writes, snapshots, and read-replica feeds. Reserve concurrency and byte budgets for consensus control traffic.
+Use capped jittered retries for seeds and voters. Bound stale directory entries and discovery payloads without removing voters from committed membership.
+Replication session reducer
+Model each read replica as a pure transition function:
+(state, event) → (next_state, effects)
+. Execute I/O effects outside the reducer.
+State
+Input
+Next state / effect
+Idle
+Leader discovered or retry due
+Connecting; create a new SessionId and cancellation child
+Connecting
+Connection and typed handshake complete
+Negotiating; send cluster, source, and revision information
+Negotiating
+Compatible retained prefix
+Replaying; request a bounded committed batch
+Negotiating
+Required prefix was compacted
+DownloadingSnapshot; request manifest and missing chunks
+DownloadingSnapshot
+Digest verified and manifest compatible
+Installing; atomically replace base and publication
+Replaying
+Applied source commit barrier
+Streaming; accept ordered committed batches and progress reports
+Any active state
+Route generation changed or source became stale
+Cancel old session; ignore its late events; preserve pending operations
+Any active state
+Recoverable error
+Backoff with deadline and reason; try another eligible source
+Any active state
+Corrupt state or deterministic-apply panic
+Unhealthy; stop publication and admission; require supervised recovery
+Include SessionId on every completion. Check it at the state owner before mutation. Cancelled network reads can still complete, so cancellation alone is insufficient.
+Retain timer futures outside select loops, or use watches and persistent intervals. Bound per-batch work so a continuous feed cannot starve control events.
+Allow one forwarding hop for client writes to the known leader. Return a redirect when routing is stale. Relay state feeds, rather than forwarding writes recursively.
+Preserve the currently installed snapshot while downloading. If a new leader still recognizes that snapshot’s committed base, resume verified bytes under a new session.
+Anti-entropy and progress checks
+Exchange committed and applied positions every five seconds initially. Socket keepalives alone cannot show that application state is advancing.
+Expose a canonical state digest at explicit committed barriers or retained checkpoints. Compare digests only at the same LogId and schema version.
+Require canonical snapshot encoding or a deterministic digest hook from applications. Cache checkpoint digests to avoid hashing an entire large state on every heartbeat.
+On mismatch, mark the replica unready and request a verified snapshot from a healthy voter. Quarantine a source after repeated verification failures.
+A digest mismatch among voting state machines is a critical invariant failure. Stop normal recovery claims and investigate determinism or corruption.
+5. Write API, retry semantics, and deterministic application
+Make outcomes explicit in a major-version API. Keep naming provisional until the compatibility spike, but preserve these semantics.
+submit(Operation { client_id, sequence, command }, deadline)
+    -> CommitReceipt { operation_id, revision, result }
+    | NotAdmitted { reason }
+    | OutcomeUnknown { operation_id }
+
+operation_status(operation_id) -> Committed | PendingOrUnknown | Retired
+wait_for_revision(revision, deadline) -> Applied | DeadlineExceeded
+read_snapshot() -> SnapshotHandle { revision, freshness, state }
+A receipt means the engine committed the operation and the leader applied it. It does not mean every replica has caught up.
+Return NotAdmitted only when the operation never entered an uncertain send or log path. Return OutcomeUnknown after ambiguous timeouts or connection loss.
+Retry OutcomeUnknown with the same ID. Never create a new ID silently. Cancelling a future stops waiting; it does not revoke a possibly committed operation.
+Deduplication contract
+Persist the client identity and monotonically increasing sequence at the client. Limit each client session to one outstanding operation initially.
+Replicate the highest applied sequence and last response with application state. Include a payload hash to reject ID reuse with different content.
+Return the cached result for a duplicate. Reject gaps and older sequences with explicit session errors. Scale throughput with multiple sessions.
+Include deduplication state in snapshots and recovery. Apply the command and advance its session state together in deterministic execution.
+Bound session count through admission and explicit retirement. Define a retry-retention contract before adding eviction. Never evict silently and reapply an old operation.
+Keep ingress queues bounded by count and bytes. Remove silent draining on leadership change. Pending callers receive a receipt or an explicit uncertain outcome.
+State-machine API
+Introduce a deterministic
+ReplicatedState::apply(command) → result
+contract. Apply committed commands in order through one state owner.
+Capture timestamps, generated IDs, and other nondeterministic choices in the proposed command. Do not perform network calls or external side effects during apply.
+Let the library own log revisions. Keep application-specific sequence fields inside application state only when they have domain meaning.
+Provide an adapter for the existing stateless authority conversion and deterministic update contract. Require migration for implementations that depend on stale read snapshots.
+Business rejection is a deterministic logged result. An unexpected panic is a node health failure. Do not skip a panicking entry and continue.
+Do not promise exactly-once external effects. Applications requiring them need a transactional outbox or an equivalent explicit integration.
+6. Durable recovery, snapshots, and read isolation
+Storage baseline
+Start with one supported SQLite-backed log store using local storage and an ordered I/O worker. Evaluate throughput and crash behavior in PR02.
+Use WAL mode and FULL synchronization for the durable profile. Verify pragmas after opening. SQLite documents additional WAL synchronization for FULL commits.
+SQLite synchronization settings
+.
+Keep storage local to each node. SQLite WAL relies on same-host shared memory and is unsuitable for this plan’s storage on network filesystems.
+SQLite WAL constraints
+.
+The backend choice is a proposed default, subject to the spike’s measured durability and throughput gates. Do not implement a new custom WAL format.
+Persist votes, ordered log entries, committed position, snapshot metadata, and format versions. Validate cluster identity before serving requests.
+Serialize vote and log writes. Complete durability callbacks only after durable commit. Surface disk-full and fsync errors as critical storage failures.
+Use the chosen engine’s complete storage test suite. Openraft requires consecutive log entries and serialized write I/O.
+Openraft storage contract
+.
+Recover from a durable snapshot plus the retained committed log suffix. Block readiness until replay reaches the durable committed position.
+Follow the engine contract for persisted committed positions when application state remains in memory. Verify recovery ordering before acknowledging writes.
+Checkpoint state, applied position, membership, and deduplication as one logical snapshot. Do not independently persist an applied index ahead of its state.
+Keep snapshot creation and disk I/O outside consensus runtime threads. Use bounded workers and cooperative cancellation between chunks.
+Snapshot protocol
+Element
+Required contents or rule
+Manifest
+ClusterId, SnapshotId, format/schema version, included LogId, membership revision, total bytes, chunk size, full digest
+Chunk
+SnapshotId, offset, length, bounded bytes, chunk digest; default proposed chunk size: 256 KiB
+Resume
+Receiver persists or reports verified ranges. Sender rejects a resume against a different manifest or expired snapshot.
+Flow control
+Bound in-flight bytes, spool quota, and concurrent transfers. Separate snapshot progress timeout from total recovery budget.
+Install
+Validate all bytes and metadata first. Persist the completed snapshot, then atomically switch its manifest and state owner base.
+Durability
+Fsync the completed file and required directory metadata before publishing the durable manifest. Delete orphaned temporary files safely on restart.
+Compaction
+Retain required suffixes within a byte budget. If a receiver falls behind retained history, restart from a newer snapshot with an explicit reason.
+Catch-up
+Apply contiguous committed entries after the snapshot base. Release transfer leases after completion, cancellation, or expiry.
+Use native engine snapshot metadata and installation semantics for voters and learners. Keep the read-replica transfer adapter aligned with that metadata.
+Prove resumability in the selected transport adapter. Do not assume a library’s snapshot API automatically resumes interrupted transfers.
+Immutable read publication
+Replace manual quiescent handles with immutable snapshots held by Arc. Use a very short lock to clone or swap the Arc initially.
+Clone application state into a new publication version outside the pointer lock. Publish committed batches on a configurable maximum-age schedule.
+Old readers keep old versions without blocking writers. Slow readers can retain memory; expose retained-version age and memory diagnostics.
+Do not use Arc::make_mut as an unmeasured per-operation full-state clone. Benchmark publication frequency, state cloning cost, and structurally shared application states.
+Feed subscribers from retained committed history. A slow subscriber receives a catch-up or snapshot-required outcome. Never await its queue from the apply path.
+7. Protocol and transport cleanup
+Always write the actual serialized frame length, including static-size messages. Reserve explicit frame tags for keepalive and close.
+Check outer frame length before allocation. Check every nested collection against count and byte budgets. Reject trailing payload bytes.
+Use distinct limits for control RPCs, commands, replication batches, and snapshot chunks. Start with 64 KiB control and 1 MiB batch limits.
+Make command size and maximum snapshot size explicit configuration fields. Reject impossible configurations at startup.
+Handshake with protocol version, ClusterId, NodeId, role, and capabilities. Reject incompatible wire or state schemas before decoding bulk state.
+Bind claimed NodeId to the configured transport identity. Keep authentication responsibilities explicit in SyncIO for trusted deployments.
+Give RPCs request IDs, typed responses, and absolute local deadlines. A late response cannot satisfy a different request.
+Propagate remaining time budgets across network hops. Never serialize a process-local monotonic Instant as a cross-node deadline.
+Cancel reads, writes, queue waits, connect attempts, and handshakes when their owning task stops. Reconnect after partial frame cancellation.
+Use separate transport lanes for consensus, client admission, and bulk state. If multiplexed, enforce priorities at byte scheduling.
+Replace generic UnexpectedRequest handling with structured protocol errors. Limit repeated error logs and close invalid sessions.
+Remove the two-second whole-snapshot write timeout. Preserve bounded no-progress detection and a separate transfer deadline with resumable recovery.
+Use monotonic clocks for timeouts and retry ages. Reserve wall-clock timestamps for human diagnostics. Use persisted random identities instead of millisecond hashes.
+8. Traceability and lifecycle
+Stable identities and event schema
+Carry ClusterId, NodeId, engine leader identity, LogId, OperationId, SessionId, and SnapshotId through their relevant paths.
+Emit one structured event at each state transition. Include previous state, next state, cause, attempt, elapsed time, and affected revision.
+Event
+Essential fields
+Purpose
+leadership_changed
+previous/new leader identity, engine reason, membership revision
+Explain routing and write-availability changes
+peer_health_changed
+peer, from/to health, failure kind, last protocol success age
+Distinguish socket reachability from useful service
+operation_outcome
+operation ID, admitted/committed/unknown/rejected, revision, latency
+Trace a write across retries without logging its payload
+replication_transition
+session ID, source, previous/new state, reason, local/source positions
+Reconstruct follower recovery
+snapshot_progress
+snapshot ID, verified/total bytes, resume offset, progress age
+Identify slow transfer and restart loops
+task_failed
+task role, error category, panic flag, readiness impact
+Prevent silent partial service failures
+Use reason enums shared by transitions and tests, such as HandshakeTimeout, LeaderChanged, Compacted, Backpressure, and StorageUnavailable.
+Log transition summaries at info, detailed batches at debug, and repeated failures with rate limits. Keep operation IDs out of metric labels.
+Metrics and inspection API
+Expose election duration, leader changes, commit latency, replay throughput, and local applied/committed positions.
+Expose RPC deadline failures by stage, retry delay, queue bytes, rejected admissions, and stale-session event counts.
+Expose snapshot throughput, restarts, resumptions, digest failures, and publication age.
+Expose active tasks by role, child cancellations, shutdown duration, and critical task failures.
+Return a coherent NodeStatus containing readiness, leadership, membership revision, publication revision, health reason, and replication state.
+Generate a bounded diagnostic event buffer for the last transitions. Export it with failing test seeds and state digests.
+Supervision
+Own all child tasks in a supervisor with cancellation tokens and join handles. Accepted sockets and transport workers belong to the same tree.
+On shutdown, reject new admissions, notify uncertain waiters, cancel transfers, close sockets, flush required storage, and await owned tasks.
+Bound graceful shutdown and report tasks that exceed it. Drop triggers best-effort cancellation; only async shutdown promises completed cleanup.
+On a critical task panic or storage failure, mark the node unhealthy and stop successful admissions. Rejoin through durable recovery rather than restarting blindly.
+Arbitrary blocking application code cannot be forcibly cancelled safely inside Tokio. Document bounded apply behavior and use process isolation if applications need stronger containment.
+9. Recovery budget and starting configuration
+Measure recovery from the end of the last injected fault, once the supported majority and routes are stable. Do not restart the stopwatch for retries.
+Phase
+Budget
+Proposed starting setting
+Failure detection
+10 s
+Consensus heartbeat 500 ms; randomized election timeout 3–5 s, validated against storage latency
+Leader agreement
+10 s
+Engine election and majority contact; independent control transport
+Route / handshake
+5 s
+2 s connect; 2 s handshake; bounded source selection
+Snapshot / replay
+25 s
+5 s no-progress timeout; resumable chunks; retained suffix
+Convergence verification
+5 s
+Committed barrier plus matching snapshot digest at that barrier
+Margin
+5 s
+Scheduling, decode, publication, and bounded retry variation
+Start voter/seed retries at 250 ms, with jitter and a five-second cap. Do not include that cap inside a new unlimited retry deadline.
+Set follower publication maximum age initially to 100 ms. Validate this against state size and cloning cost before making it a default.
+Specify a supported deployment envelope: voter count, replica count, state size, command rate, RTT, durable-write latency, and available transfer bandwidth.
+Use 100 MiB snapshots as an initial benchmark case. The 25-second transfer budget needs more than 4 MiB/s after allowing for overhead.
+Benchmark catch-up while writes continue. Required replay throughput must exceed incoming write throughput. Reject overload explicitly when that condition fails.
+Retain ordinary RPC and write deadlines separately from the recovery SLO. User-request timeouts should not silently extend until cluster recovery finishes.
+10. Implementation sequence
+Use these as reviewable pull-request boundaries. Dependencies describe implementation order, not authorization to deploy.
+Introduce telemetry alongside each feature. PR10 standardizes it; it should not be the first time failures become observable.
+Keep the prototype and incomplete v4 service outside the production entry point until the durable integration gates pass.
+PR01
+Capture failures and state the contract
+Depends on: None
+Deliverable:
+Baseline regression suite; invariants and API decision notes
+Move the four review probes into reusable test fixtures. Invert assertions so they specify the corrected behavior.
+Add fixtures for handshake-only stalls, continuous old feeds, dropped acknowledgements, and pinned readers.
+Unify KvState, fake clocks, wait helpers, and operation-history recording. Use deterministic seeds and avoid wall-clock polling in simulated tests.
+Document the durable-write assumption, stale-read policy, retry contract, and performance envelope in short architecture decisions.
+Exit gate:
+Demonstrate that new defect regressions fail against the baseline. Keep them explicitly tracked until their owning change passes.
+Primary files:
+tests/support, tests/scenarios; docs/architecture/{invariants,decisions}.md
+PR02
+Validate the consensus and persistence boundary
+Depends on: PR01
+Deliverable:
+Small three-voter prototype; dependency and storage decision
+Pin Openraft and verify required features, toolchain compatibility, serialized types, and storage interfaces.
+Implement a minimal adapter over SimulatedIo and a SQLite durable log prototype. Keep it outside the default service path.
+Run upstream storage tests plus full-cluster process restart, voter replacement, vote persistence, and disk failure probes.
+Measure durable-write latency, state replay, and snapshot cloning on a representative dataset.
+Confirm native snapshot integration and identify the adapter work needed for resume. Write a concrete protocol and storage compatibility note.
+Exit gate:
+A three-voter prototype retains committed counters after complete restart. Any backend substitution must pass the same gates before later integration.
+Primary files:
+Cargo.toml; src/consensus; src/storage; tests/storage_contract
+PR03
+Fix codecs and introduce protocol v2 types
+Depends on: PR01, PR02 protocol decision
+Deliverable:
+Checked framing; versioned typed messages
+Fix static-size frame headers and add full round trips for every current message family.
+Enforce frame and nested allocation limits before memory allocation. Validate recovery metadata and reject trailing bytes.
+Define ClusterId, NodeId, LogId wrappers, SessionId, SnapshotId, request IDs, and schema versions.
+Separate control, client, committed-feed, and chunk-transfer messages. Add explicit incompatibility errors.
+Keep compatibility checks at the handshake boundary. Do not let v1 election traffic enter a v2 cluster.
+Exit gate:
+Fuzzed invalid frames fail within bounded memory. Static and dynamic encodings round-trip. Mixed versions fail visibly before state mutation.
+Primary files:
+src/protocol; src/transport/channels.rs; codec tests
+PR04
+Own task lifetimes and isolate control transport
+Depends on: PR03
+Deliverable:
+Supervisor and bounded RPC executor
+Introduce task groups, cancellation tokens, typed task exits, and readiness transitions.
+Attach listener children, connection workers, readers, writers, and snapshot workers to the supervisor.
+Carry one deadline through connect, handshake, queue admission, request write, and response wait.
+Separate consensus traffic from bulk and client traffic. Use bounded byte queues and explicit admission failures.
+Add connection generation IDs so an old worker cannot overwrite a replacement connection’s health.
+Implement async shutdown and critical-task failure propagation. Avoid awaiting task termination under connection-map locks.
+Exit gate:
+Shutdown closes idle subscribers and every child socket. Full client/bulk queues do not delay consensus heartbeats. Handshake stalls expire.
+Primary files:
+src/runtime; src/transport; peer_connections extraction
+PR05
+Separate directory discovery from durable membership
+Depends on: PR02, PR04
+Deliverable:
+Stable identity and explicit membership administration
+Persist NodeId and ClusterId. Introduce explicit bootstrap and join commands.
+Make the peer directory contain addresses and health only. Remove its ability to determine voting membership.
+Use monotonic successful-protocol ages, expiring indirect reports, and bounded jittered seed retries.
+Add learner promotion and voter removal through the engine adapter. Serialize membership changes.
+Expose membership revision and replacement progress in NodeStatus. Reject accidental bootstrap against nonempty storage.
+Exit gate:
+Disconnected seeds never create independent clusters accidentally. Repeated address replacement leaves exactly the intended voter set.
+Primary files:
+src/peers; src/consensus/membership.rs; config validation
+PR06
+Integrate committed application and immutable reads
+Depends on: PR02, PR05
+Deliverable:
+Durable voter service using the new state owner
+Replace custom LeaderTask and voter authority feeds with the engine adapter.
+Apply only committed commands through one state owner. Persist the recovery position using the engine storage contract.
+Introduce ReplicatedState and a restricted legacy adapter. Remove authority decisions based on published read snapshots.
+Publish immutable Arc snapshots with revision metadata. Batch publication and benchmark clone cost.
+Expose read-only status and watches. Remove public mutable NodeState access from the v4 API.
+Exit gate:
+Isolated leaders cannot acknowledge conflicting commits. All voters recover acknowledged operations after restart. Pinned readers do not block apply.
+Primary files:
+src/consensus; src/state; src/service.rs; legacy adapter
+PR07
+Implement write receipts and safe retries
+Depends on: PR06
+Deliverable:
+Operation state machine and replicated deduplication
+Add explicit admission, uncertain outcome, commit receipt, and wait-for-revision APIs.
+Persist client-session sequence and cached results through the replicated state machine.
+Forward once to the current leader. Retry redirects under the original deadline with the same operation ID.
+Preserve admitted operations across routing changes until a definite or uncertain outcome is delivered.
+Apply count and byte backpressure. Remove raw actions_sender from the reliable public surface.
+Test cancellation after send, leader crash after commit, lost response, duplicate payload mismatch, and client restart.
+Exit gate:
+Every receipt is represented once in final state. A duplicate ID never increments twice. Ambiguous outcomes remain queryable or safely retryable.
+Primary files:
+src/operations; public service API; command envelope
+PR08
+Build crash-safe resumable snapshots
+Depends on: PR03, PR06, PR07
+Deliverable:
+Shared snapshot manifest and transfer implementation
+Create immutable snapshots containing state, base LogId, membership, and deduplication data.
+Transfer bounded verified chunks into quota-controlled temporary storage. Resume verified ranges.
+Install only after full verification and durable manifest ordering. Preserve old state until installation completes.
+Coordinate compaction and suffix retention with transfer leases and explicit expiry.
+Integrate the same snapshot identity with engine learners and read-replica distribution.
+Inject interruption at every file/manifest transition and validate restart behavior.
+Exit gate:
+A transfer lasting more than two seconds succeeds. An interrupted transfer resumes. Partial snapshots never become public state.
+Primary files:
+src/replication/snapshot.rs; src/storage; protocol snapshot types
+PR09
+Replace follower sync with explicit committed sessions
+Depends on: PR04, PR06, PR08
+Deliverable:
+Non-voting read-replica and relay distribution
+Implement the session reducer and generation-tagged I/O effects.
+Use leadership watches and persistent timers. Validate completions at the state-owner boundary.
+Serve only committed prefixes. Validate predecessor identity, sequence, cluster identity, and source session.
+Add source progress heartbeats and canonical checkpoint digests. Detect stalled relays and divergence at the same revision.
+Prefer a direct voter; use bounded relay selection with loop avoidance. Never recurse client writes through relay chains.
+Give each subscriber an independent bounded history cursor. Send SnapshotRequired when retention is exceeded.
+Exit gate:
+Continuous obsolete feeds cannot mutate state after invalidation. Silent sources and stale relays recover within the shared deadline.
+Primary files:
+src/replication/{session,feed,relay}.rs; rpc_server extraction
+PR10
+Complete diagnostics and remove legacy authority paths
+Depends on: PR05–PR09
+Deliverable:
+Traceable production service and concise internal docs
+Standardize transition events, reason enums, metrics, status snapshots, and task inspection.
+Add invariant references at decision points. Document module owners and effect boundaries.
+Remove old quorum scoring, time-derived identities, recovery generation heuristics, quiescent APIs, and detached spawn paths.
+Update the terminal example to show committed revision, leader identity, stale-read status, and explicit submission outcomes.
+Keep performance logs free of payloads and high-cardinality metric labels. Add bounded diagnostic export.
+Exit gate:
+A failed scenario can be reconstructed from its event trace. No second authority implementation remains reachable in v4.
+Primary files:
+src/runtime/status.rs; examples/kv_tui.rs; docs; legacy deletion
+PR11
+Validate fault tolerance, resource bounds, and recovery SLO
+Depends on: PR10
+Deliverable:
+Repeatable fault matrix and supported performance envelope
+Run deterministic failure schedules against a reference committed-operation model.
+Add real-process TCP tests, process kills, disk fault injection, and default-setting timing tests.
+Run sustained write and read load during election, replay, snapshots, and membership changes.
+Measure replica scaling, immutable-publication memory, snapshot throughput, and control traffic under saturation.
+Record maximum and percentile recovery times. Store seeds, workload parameters, traces, and environment details.
+Exit gate:
+All invariants hold. Every required envelope scenario converges within 60 seconds. Document overload boundaries instead of hiding failures in averages.
+Primary files:
+tests/scenarios; tests/process; benchmarks; CI jobs
+PR12
+Ship the migration tools and release procedure
+Depends on: PR11
+Deliverable:
+Versioned export/import, release docs, and rollback checkpoints
+Export a quiesced legacy state with schema and digest metadata. Import it as a new cluster’s explicit initial snapshot.
+Provide preflight checks for voter identity, storage, capacity, and protocol compatibility.
+Exercise the complete cutover and rollback procedure against a disposable cluster.
+Document API migration, stale-read semantics, session retries, operational health, and recovery procedures.
+Release the new major version only after the default-setting fault and migration gates pass.
+Exit gate:
+Operators can reproduce cutover without silently discarding accepted work. A pre-cutover rollback preserves the old cluster unchanged.
+Primary files:
+examples or tools/migration; docs/migration; release metadata
+11. Coverage of every review finding
+Review issue
+Implementation
+Regression / invariant
+F01 — unusable leader never replaced
+PR04 health/deadlines; PR05 membership; PR06 consensus
+T01, T02; I01, I07, I10
+F02 — busy authority feed ignores leader changes
+PR09 session reducer and source validation
+T03, T04; I02, I06
+F03 — 30-minute retries and blocked gossip
+PR04 control isolation; PR05 capped retries
+T05, T06; I07, I10
+F04 — queued writes discarded
+PR07 receipts and deduplication; PR06 commitment
+T07, T08; I03, I04
+F05 — local voter maps cannot provide quorum contract
+PR02 engine; PR05 explicit membership; PR06 durable service
+T09, T10, T11; I01, I03
+F06 — large snapshots repeatedly time out
+PR08 resumable transfer and independent progress budget
+T12, T13; I05, I10
+F07 — pinned readers stop replication
+PR06 immutable publication; PR10 remove quiescent paths
+T14, T15; I08
+F08 — detached and unsupervised tasks
+PR04 supervisor; PR10 health inspection
+T16, T17; I09
+F09 — unchecked frame and history sizes
+PR03 bounded decoding; PR08 bounded snapshot buffers
+T18; I05, I07
+F10 — zero header for static-size messages
+PR03 actual encoded lengths and protocol round trips
+T19; codec integrity
+Source findings are documented in the
+original reliability review
+. The baseline already passed 63 library tests and one TCP test; those tests remain useful but insufficient.
+12. Validation strategy and acceptance cases
+Test externally meaningful guarantees instead of reproducing implementation branches. Retain pure reducer tests for causal transition coverage.
+ID
+Fault or workload
+Required result
+T01
+Blackhole both links to the leader while survivors remain connected
+Majority commits a new barrier and converges within 60 s; minority cannot return successful commits
+T02
+Connect succeeds; application handshake or RPC never completes
+Deadline expires, useful health becomes unavailable, control/election progress continues
+T03
+Continuous authority traffic from obsolete source
+Invalidated-session messages never mutate state, even when timers would otherwise be starved
+T04
+Same address returns with a new leader identity or process incarnation
+Old session completions are rejected; compatible committed history can still replay
+T05
+All seeds initially fail, then recover; repeat after 30-minute partition
+Configured peers retry promptly; no accidental independent bootstrap; catch-up meets budget
+T06
+More than eight dead directory peers plus full bulk/client queues
+Healthy voter control messages continue within their deadline
+T07
+Submit counters continuously while leader fails and responses disappear
+All successful receipts appear exactly once; ambiguous outcomes can be retried with the same ID
+T08
+Client crash, duplicate requests, ID reuse with changed payload, retired session
+No duplicate effect; invalid reuse and expired retry contract return explicit errors
+T09
+Replace each voter with a new address, one at a time
+Committed membership matches the intended live set; no accumulated ghost voters
+T10
+Restart all processes with durable storage, then restart an old replica
+Committed history and deduplication survive; old replica cannot overwrite committed state
+T11
+Asymmetric partitions, reordered control messages, and repeated election flaps
+No conflicting committed results; healed majority reaches stable leader agreement
+T12
+Large snapshot over a link needing more than two seconds
+Transfer progresses without whole-message timeout loops
+T13
+Interrupt snapshot near completion; crash before and after manifest switch
+Resume verified bytes; expose either complete old or complete new state
+T14
+Reader retains a snapshot throughout election and repeated updates
+Application and new readers advance; retained snapshot stays immutable
+T15
+Slow subscriber falls beyond bounded retained history
+Only that subscriber switches to snapshot recovery; other replicas keep progressing
+T16
+Shutdown with idle subscribers, blocked handshakes, and full queues
+All cooperative owned tasks and sockets close within shutdown deadline
+T17
+Panic a critical task; inject disk-full or durable-write failure
+Readiness becomes false; successful write acknowledgements stop
+T18
+Fuzz oversized frames, nested lengths, bad digests, and metadata
+Bounded allocations; protocol-local rejection; no partial-state publication
+T19
+Static-size and dynamic-size message round trips
+Correct length headers and exactly one decoded message
+T20
+Representative sustained writes during snapshot and publication
+Bounded memory and lag; measured replay rate exceeds admitted write rate
+T21
+Replica content differs at the same revision
+Digest mismatch is detected; replica becomes unready and resynchronizes from a trusted committed source
+Test infrastructure
+Extend SimulatedNet with directed links, per-message-class drops, delay, loss, duplication, and bounded bandwidth. Preserve failing seeds.
+Inject Clock and random-source interfaces for deterministic scheduling. Avoid SystemTime in protocol decisions.
+Record operations and their outcomes in a reference model. Compare counters and ordered effects, rather than only final key presence.
+Create a committed barrier after healing. Compare state digests at that exact revision, or pause submissions while collecting equality checks.
+Run actual process kills and local TCP tests for persistence and socket cleanup. Tokio task cancellation alone does not model process death.
+Use storage failpoints at vote commit, log flush, committed-position persistence, snapshot fsync, manifest update, and compaction.
+Run a short deterministic matrix on each PR and expanded randomized schedules nightly. Add a real-time suite using shipped defaults.
+Publish workload size, node count, RTT, bandwidth, durable-write latency, and clone cost with every performance result.
+Measure leader agreement and state catch-up separately. A single green convergence check does not establish sustained stability under load.
+Version the supported envelope with the release. Tests outside that envelope should still preserve safety and return explicit overload or unavailability.
+13. Migration, release, and rollback
+Treat this as a new wire and storage format. A rolling upgrade that mixes the old custom quorum rules with new consensus would be unsafe.
+Build the new cluster in a separate environment. Validate identity, durable storage, snapshots, and fault recovery.
+Stop admitting legacy writes. Resolve outstanding operations using application records; the old API cannot prove every queued write completed.
+Wait for the legacy cluster to agree on a chosen state. Export it with a schema version and content digest.
+Initialize the new cluster once from that snapshot and its explicit voter configuration. Treat it as the new committed base.
+Add read replicas and wait for their imported-base revision. Compare digests before sending application traffic.
+Switch clients to the receipt-based API. Monitor commit latency, replica lag, task health, and recovery events.
+Retain the legacy export and an untouched pre-cutover backup until the new service passes the observation window.
+Before accepting new v4 writes, rollback can restore the old endpoints and preserved export. After v4 accepts writes, rollback requires quiescing and exporting the new state.
+Never reopen the old snapshot for writes after new committed work without reconciliation. That would discard acknowledged operations.
+If the application has an external authoritative replay log, use it to validate the imported baseline. Do not infer historical delivery from legacy enqueue acknowledgements.
+Release gates
+All ten findings map to passing desired-behavior regressions. No temporary ignored defect test remains.
+Upstream engine storage tests and local crash-recovery tests pass against the shipped backend.
+No public reliable API returns plain success for queue admission. All uncertain results preserve operation identity.
+Fault tests using production defaults meet the 60-second envelope. Report maximum as well as percentile times.
+Pinned readers, slow subscribers, and bounded overload do not stall consensus or other replicas.
+Protocol migration, full shutdown, and pre/post-cutover rollback procedures are exercised.
+Operational documentation states the quorum-loss, storage-loss, stale-read, and retry-retention behavior precisely.
+14. Effort, tradeoffs, and decisions to validate
+This is a substantial reliability redesign, not a collection of small timeout changes. PR02 should produce the delivery estimate after integration risks are measured.
+Area
+Cost or risk
+Decision gate
+Consensus dependency
+New protocol and storage obligations; API/feature compatibility
+PR02 storage tests and restart prototype
+Durable successful writes
+Majority RTT and durable-write latency replace local enqueue latency
+PR02 baseline; PR11 representative throughput
+Read publication
+Immutable versions can increase clone CPU and retained memory
+PR06 benchmark; PR11 supported state-size envelope
+Generic deterministic state
+State-dependent legacy authority functions may require application changes
+PR01 contract audit; PR06 adapter tests
+Many read replicas
+Committed feeds and snapshots require bounded fanout and retention
+PR09 stress fixtures; PR11 scaling results
+Session deduplication
+Bounded storage requires an explicit retry/session lifetime contract
+PR07 API and retention tests
+Migration
+Mixed v1/v2 membership is unsupported; cutover needs a quiescence window
+PR12 full rehearsal
+A smaller maintenance patch could fix framing, retry pacing, polling, and shutdown. It would not establish durable quorum or delivery guarantees.
+The proposed release therefore uses those fixes as steps toward one coherent authority model. Remove the old model once migration is complete.
+Planning artifacts to create during implementation
+Keep four concise architecture decisions: commitment and reads; membership and bootstrap; persistence and snapshots; client retry semantics.
+Maintain an issue-to-PR-to-test table in the repository. Require each behavioral PR to identify its invariant IDs and validation evidence.
+Use code comments to explain invariants, ordering requirements, and failure outcomes. Keep implementation narration in design notes rather than repetitive inline comments.
+15. Source basis
+The plan is grounded in the reviewed repository and the confirmed failure probes. External references informed the proposed dependency and storage boundaries.
+Sharedstate reliability review
+: ten findings and baseline evidence.
+Openraft getting started
+: engine integration and learner/membership APIs.
+Openraft log-storage contract
+: ordered durable vote and log storage.
+Openraft state-machine contract
+: committed application and snapshot interfaces.
+SQLite synchronous configuration
+and
+WAL documentation
+: proposed backend durability settings and deployment limits.
+Dependency APIs were checked on 9 September 2026. Pin and revalidate the selected release in PR02. None of the proposed benchmarks or v4 acceptance tests has been run yet.
