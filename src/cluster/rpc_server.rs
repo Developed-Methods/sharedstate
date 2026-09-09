@@ -9,7 +9,7 @@ use tokio::{
 
 use crate::{
     cluster::node_state::{NodeState, PeerState},
-    protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{LeadershipEpoch, PROTOCOL_VERSION, SyncRequest, SyncResponse},
     state::{
         deterministic_state::DeterministicState,
         recoverable_state::{RecoverableState, RecoverableStateAction},
@@ -54,21 +54,33 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
 
                 SyncResponse::Ok
             }
-            SyncRequest::SubscribeRecovery(details) => match self.state.state.subscribe(details).await {
-                Ok(feed) => return ResponseOrFeed::Subscription { feed },
-                Err(error) => {
-                    tracing::warn!(?error, "client recovery failed");
-                    SyncResponse::RecoveryFailed
+            SyncRequest::RecoverySnapshot => {
+                self.state.state.settled_recovery_details().await;
+                let (snapshot, _) = self.state.state.subscribe_fresh().await;
+                SyncResponse::RecoverySnapshot(snapshot)
+            }
+            SyncRequest::SubscribeRecovery(details) => {
+                let Some(epoch) = self.state.replication_epoch() else {
+                    return ResponseOrFeed::Response(SyncResponse::RecoveryFailed);
+                };
+                match self.state.state.subscribe(details).await {
+                    Ok(feed) if self.state.replication_epoch() == Some(epoch) => {
+                        return ResponseOrFeed::Subscription { epoch, feed };
+                    }
+                    _ => SyncResponse::RecoveryFailed,
                 }
-            },
+            }
             SyncRequest::SubscribeFresh => {
+                let Some(epoch) = self.state.replication_epoch() else {
+                    return ResponseOrFeed::Response(SyncResponse::RecoveryFailed);
+                };
                 let (state, feed) = self.state.state.subscribe_fresh().await;
-                return ResponseOrFeed::FreshState { state, feed };
+                if self.state.replication_epoch() != Some(epoch) {
+                    return ResponseOrFeed::Response(SyncResponse::RecoveryFailed);
+                }
+                return ResponseOrFeed::FreshState { epoch, state, feed };
             }
-            SyncRequest::LeaderQuery => {
-                let leader_state = self.state.leader_state.lock().await.clone();
-                SyncResponse::LeaderState(leader_state)
-            }
+            SyncRequest::LeaderQuery => SyncResponse::LeaderState(self.state.current_leader()),
             SyncRequest::SharePeers(shared_peers) => {
                 self.state.merge_peer_details(shared_peers).await;
                 let share_peer_details = self.state.known_peer_details().await;
@@ -127,18 +139,24 @@ where
                         break;
                     }
                 }
-                ResponseOrFeed::FreshState { state, feed } => {
-                    if write.send(SyncResponse::FreshState(state)).await.is_err() {
+                ResponseOrFeed::FreshState { epoch, state, feed } => {
+                    if send_validated(&self.state, epoch, &write, SyncResponse::FreshState(epoch, state))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
-                    stream_feed(write, feed).await;
+                    stream_feed(self.state.clone(), epoch, write, feed).await;
                     break;
                 }
-                ResponseOrFeed::Subscription { feed } => {
-                    if write.send(SyncResponse::Accepted(feed.next_seq())).await.is_err() {
+                ResponseOrFeed::Subscription { epoch, feed } => {
+                    if send_validated(&self.state, epoch, &write, SyncResponse::Accepted(epoch, feed.next_seq()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
-                    stream_feed(write, feed).await;
+                    stream_feed(self.state.clone(), epoch, write, feed).await;
                     break;
                 }
             }
@@ -180,6 +198,8 @@ where
 }
 
 async fn stream_feed<A, D>(
+    state: Arc<NodeState<A, D>>,
+    epoch: LeadershipEpoch,
     write: Sender<SyncResponse<A, D>>,
     mut feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
 ) where
@@ -187,17 +207,55 @@ async fn stream_feed<A, D>(
     D: DeterministicState,
 {
     loop {
-        match feed.recv().await {
+        if state.replication_epoch() != Some(epoch) {
+            break;
+        }
+        let received = tokio::select! {
+            received = feed.recv() => received,
+            _ = state.leadership_changed.notified() => continue,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => continue,
+        };
+        match received {
             Ok((seq, action)) => {
-                if write.send(SyncResponse::AuthorityAction(seq, action)).await.is_err() {
+                if send_validated(&state, epoch, &write, SyncResponse::AuthorityAction(epoch, seq, action))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
             Err(error) => {
                 tracing::debug!(?error, "rpc subscription feed closed");
-                let _ = write.send(SyncResponse::ActionStreamClosed).await;
+                let _ = write.try_send(SyncResponse::ActionStreamClosed);
                 break;
             }
+        }
+    }
+}
+
+async fn send_validated<A: SyncIOAddress, D: DeterministicState>(
+    state: &NodeState<A, D>,
+    epoch: LeadershipEpoch,
+    write: &Sender<SyncResponse<A, D>>,
+    response: SyncResponse<A, D>,
+) -> Result<(), ()> {
+    let reserve = write.reserve();
+    tokio::pin!(reserve);
+    loop {
+        if state.replication_epoch() != Some(epoch) {
+            return Err(());
+        }
+        tokio::select! {
+            permit = &mut reserve => {
+                let permit = permit.map_err(|_| ())?;
+                if state.replication_epoch() != Some(epoch) {
+                    return Err(());
+                }
+                permit.send(response);
+                return Ok(());
+            }
+            _ = state.leadership_changed.notified() => {},
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {},
         }
     }
 }
@@ -205,10 +263,12 @@ async fn stream_feed<A, D>(
 pub enum ResponseOrFeed<A: SyncIOAddress, D: DeterministicState> {
     Response(SyncResponse<A, D>),
     FreshState {
+        epoch: LeadershipEpoch,
         state: RecoverableState<D>,
         feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
     },
     Subscription {
+        epoch: LeadershipEpoch,
         feed: SequencedReceiver<RecoverableStateAction<D::AuthorityAction>>,
     },
 }

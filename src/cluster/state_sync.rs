@@ -10,7 +10,6 @@
 
 use std::{
     io::{Error, ErrorKind},
-    iter,
     sync::Arc,
     time::Duration,
 };
@@ -20,7 +19,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
     cluster::{node_state::NodeState, peer_connections::PeerConnections},
-    protocol::messages::{ElectionTerm, LeaderMode, SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{LeaderMode, LeadershipEpoch, PROTOCOL_VERSION, SyncRequest, SyncResponse},
     state::{
         deterministic_state::DeterministicState, recoverable_state::RecoverableStateAction,
         subscribable_state::StateHandle,
@@ -29,7 +28,6 @@ use crate::{
         channels::NetIoSettings,
         traits::{SyncIO, SyncIOAddress},
     },
-    utils::unique_state_id,
 };
 
 #[derive(Clone, Debug)]
@@ -68,7 +66,9 @@ enum SyncAttempt {
     /// Could not establish a subscription with the target.
     Unreachable,
     /// A subscription ran and ended; the leader state should be re-checked.
-    Finished { applied_actions: bool },
+    Finished {
+        applied_actions: bool,
+    },
     /// The leader changed while streaming; re-check immediately.
     LeaderChanged,
     Shutdown,
@@ -103,11 +103,11 @@ where
 
     pub async fn run(mut self) {
         loop {
-            let leader_state = self.state.leader_state.lock().await.clone();
+            let leader_state = self.state.current_leader();
             let flow = match leader_state.mode {
-                LeaderMode::Leading => self.lead(leader_state.term).await,
-                LeaderMode::Following { leader } => self.follow(leader).await,
-                LeaderMode::NoLeader | LeaderMode::Electing { .. } => self.wait_for_leader().await,
+                LeaderMode::Leading => self.lead(leader_state.epoch).await,
+                LeaderMode::Following { leader } => self.follow(leader, leader_state.epoch).await,
+                LeaderMode::NoLeader | LeaderMode::Electing => self.wait_for_leader().await,
             };
 
             if matches!(flow, Flow::Shutdown) {
@@ -120,20 +120,14 @@ where
     /// Waits for a leader to emerge. Queued actions stay in the channel so
     /// they can be processed once a sync source is available.
     async fn wait_for_leader(&mut self) -> Flow {
-        tokio::time::sleep(self.timing.leader_poll_interval).await;
+        tokio::select! {
+            _ = self.state.leadership_changed.notified() => {},
+            _ = tokio::time::sleep(self.timing.leader_poll_interval) => {},
+        }
         Flow::Continue
     }
 
-    async fn lead(&mut self, term: ElectionTerm) -> Flow {
-        /* bump the recovery generation so followers of the previous leader
-         * can recover from us without a full state transfer */
-        let new_id = unique_state_id(&self.state.my_address);
-        self.state
-            .state
-            .update(iter::once(RecoverableStateAction::BumpGeneration { new_id }))
-            .await;
-        tracing::info!(%term, "leading, taking authority over shared state");
-
+    async fn lead(&mut self, epoch: LeadershipEpoch) -> Flow {
         loop {
             tokio::select! {
                 action = self.actions_rx.recv() => {
@@ -141,26 +135,22 @@ where
                         return Flow::Shutdown;
                     };
 
-                    let current = self.state.leader_state.lock().await.mode.clone();
-                    if let LeaderMode::Following { leader } = current {
-                        tracing::info!(?leader, "no longer leading, forwarding queued action to new leader");
-                        self.forward_action(leader, source, action).await;
-                        return Flow::Continue;
-                    }
-                    if !matches!(current, LeaderMode::Leading) {
-                        tracing::info!("no longer leading, releasing authority before applying queued action");
+                    if !self.state.valid_authority(epoch) {
                         return Flow::Continue;
                     }
 
                     let authority = self
                         .handle
                         .read_with(move |state| state.authority(RecoverableStateAction::StateAction { action }));
-                    self.state.state.update(iter::once(authority)).await;
+                    if !self.state.update_authoritative(epoch, authority).await {
+                        return Flow::Continue;
+                    }
                     tracing::debug!(?source, "applied action with local authority");
                 }
+                _ = self.state.leadership_changed.notified() => return Flow::Continue,
                 _ = tokio::time::sleep(self.timing.leader_poll_interval) => {
-                    if !matches!(self.state.leader_state.lock().await.mode, LeaderMode::Leading) {
-                        tracing::info!(%term, "no longer leading, releasing authority");
+                    if !self.state.valid_authority(epoch) {
+                        tracing::info!(%epoch, "no longer leading, releasing authority");
                         return Flow::Continue;
                     }
                 }
@@ -168,7 +158,7 @@ where
         }
     }
 
-    async fn follow(&mut self, leader: I::Address) -> Flow {
+    async fn follow(&mut self, leader: I::Address, epoch: LeadershipEpoch) -> Flow {
         /* the election logic should never point a follower at itself, but if
          * it ever does, subscribing to our own feed would idle forever (and
          * bounce forwarded actions back into our own queue) */
@@ -177,7 +167,7 @@ where
             return self.wait_for_leader().await;
         }
 
-        match self.sync_from(leader, leader).await {
+        match self.sync_from(leader, leader, epoch).await {
             SyncAttempt::Finished { applied_actions } => return self.pace_resubscribe(applied_actions).await,
             SyncAttempt::LeaderChanged => return Flow::Continue,
             SyncAttempt::Shutdown => return Flow::Shutdown,
@@ -188,7 +178,9 @@ where
 
         for relay in self.relay_candidates(leader).await {
             match self.peer_connections.query_leader(relay).await {
-                Ok(state) if matches!(&state.mode, LeaderMode::Following { leader: relayed } if *relayed == leader) => {}
+                Ok(state)
+                    if state.epoch == epoch
+                        && matches!(&state.mode, LeaderMode::Following { leader: relayed } if *relayed == leader) => {}
                 Ok(state) => {
                     tracing::debug!(?relay, ?state, "relay candidate does not follow our leader, skipping");
                     continue;
@@ -200,7 +192,7 @@ where
             }
 
             tracing::info!(?relay, ?leader, "syncing state through relay peer");
-            match self.sync_from(relay, leader).await {
+            match self.sync_from(relay, leader, epoch).await {
                 SyncAttempt::Finished { applied_actions } => return self.pace_resubscribe(applied_actions).await,
                 SyncAttempt::LeaderChanged => return Flow::Continue,
                 SyncAttempt::Shutdown => return Flow::Shutdown,
@@ -237,10 +229,22 @@ where
         candidates.into_iter().map(|(_, addr)| addr).collect()
     }
 
-    async fn sync_from(&mut self, target: I::Address, leader: I::Address) -> SyncAttempt {
+    async fn sync_from(&mut self, target: I::Address, leader: I::Address, epoch: LeadershipEpoch) -> SyncAttempt {
+        if !self.state.valid_replication(leader, epoch) {
+            return SyncAttempt::LeaderChanged;
+        }
         /* connect gives no timing guarantee, and an unbounded wait here would
          * also stop the task from noticing leader changes */
-        let connection = match tokio::time::timeout(self.settings.message_timeout, self.io.connect(&target)).await {
+        let deadline = self
+            .state
+            .election_status()
+            .valid_until
+            .unwrap_or_else(tokio::time::Instant::now);
+        let connection = match tokio::select! {
+            connection = tokio::time::timeout(self.settings.message_timeout, self.io.connect(&target)) => connection,
+            _ = self.state.leadership_changed.notified() => return SyncAttempt::LeaderChanged,
+            _ = tokio::time::sleep_until(deadline) => return SyncAttempt::LeaderChanged,
+        } {
             Ok(Ok(connection)) => connection,
             Ok(Err(error)) => {
                 tracing::debug!(?target, ?error, "failed to connect for state sync");
@@ -256,7 +260,7 @@ where
          * connection closes */
         let (_remote, write, mut read) = connection.client_channels::<D>(self.settings.clone());
 
-        let next_seq = match self.subscribe(&write, &mut read, target).await {
+        let next_seq = match self.subscribe(&write, &mut read, target, leader, epoch).await {
             Ok(next_seq) => next_seq,
             Err(error) => {
                 tracing::warn!(?target, ?error, "state subscription failed");
@@ -264,7 +268,7 @@ where
             }
         };
 
-        self.stream(target, leader, next_seq, &mut read).await
+        self.stream(target, leader, epoch, next_seq, &mut read).await
     }
 
     /// Handshakes and subscribes, recovering the local state when the target
@@ -275,6 +279,8 @@ where
         write: &Sender<SyncRequest<I::Address, D>>,
         read: &mut Receiver<SyncResponse<I::Address, D>>,
         target: I::Address,
+        leader: I::Address,
+        epoch: LeadershipEpoch,
     ) -> std::io::Result<u64> {
         let timeout = self.settings.message_timeout;
 
@@ -292,7 +298,10 @@ where
         send(write, SyncRequest::SubscribeRecovery(details)).await?;
 
         match recv(read, timeout).await? {
-            SyncResponse::Accepted(next_seq) => {
+            SyncResponse::Accepted(received_epoch, next_seq) => {
+                if received_epoch != epoch || !self.state.valid_replication(leader, epoch) {
+                    return Err(Error::new(ErrorKind::PermissionDenied, "subscription epoch is no longer valid"));
+                }
                 if next_seq != local_next_seq {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
@@ -300,6 +309,7 @@ where
                     ));
                 }
                 tracing::info!(?target, next_seq, "recovered existing state through subscription");
+                self.state.mark_synchronized(epoch);
                 Ok(next_seq)
             }
             SyncResponse::RecoveryFailed => {
@@ -307,9 +317,15 @@ where
                 send(write, SyncRequest::SubscribeFresh).await?;
 
                 match recv(read, timeout).await? {
-                    SyncResponse::FreshState(fresh) => {
+                    SyncResponse::FreshState(received_epoch, fresh) => {
+                        if received_epoch != epoch {
+                            return Err(Error::new(ErrorKind::PermissionDenied, "snapshot epoch mismatch"));
+                        }
                         let next_seq = fresh.details().next_seq();
-                        self.state.state.reset(fresh).await;
+                        if !self.state.reset_replica(leader, epoch, fresh).await {
+                            return Err(Error::new(ErrorKind::PermissionDenied, "snapshot epoch expired"));
+                        }
+                        self.state.mark_synchronized(epoch);
                         tracing::info!(?target, next_seq, "reset local state from fresh snapshot");
                         Ok(next_seq)
                     }
@@ -327,6 +343,7 @@ where
         &mut self,
         target: I::Address,
         leader: I::Address,
+        epoch: LeadershipEpoch,
         mut expected_seq: u64,
         read: &mut Receiver<SyncResponse<I::Address, D>>,
     ) -> SyncAttempt {
@@ -335,13 +352,18 @@ where
         loop {
             tokio::select! {
                 response = read.recv() => match response {
-                    Some(SyncResponse::AuthorityAction(seq, action)) => {
+                    Some(SyncResponse::AuthorityAction(received_epoch, seq, action)) => {
+                        if received_epoch != epoch || !self.state.valid_replication(leader, epoch) {
+                            return SyncAttempt::LeaderChanged;
+                        }
                         if seq != expected_seq {
                             tracing::warn!(?target, seq, expected_seq, "action feed out of sequence, dropping subscription");
                             return SyncAttempt::Finished { applied_actions };
                         }
                         expected_seq += 1;
-                        self.state.state.update(iter::once(action)).await;
+                        if !self.state.update_replica(leader, epoch, action).await {
+                            return SyncAttempt::LeaderChanged;
+                        }
                         applied_actions = true;
                     }
                     Some(SyncResponse::ActionStreamClosed) | None => {
@@ -357,17 +379,20 @@ where
                     let Some((source, action)) = action else {
                         return SyncAttempt::Shutdown;
                     };
-                    let current = self.state.leader_state.lock().await.mode.clone();
-                    if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
+                    if !self.state.valid_replication(leader, epoch) {
                         tracing::info!(?leader, "leader changed before forwarding action, dropping subscription");
                         self.drop_queued_actions();
                         return SyncAttempt::LeaderChanged;
                     }
                     self.forward_action(target, source, action).await;
                 }
+                _ = self.state.leadership_changed.notified() => {
+                    if !self.state.valid_replication(leader, epoch) {
+                        return SyncAttempt::LeaderChanged;
+                    }
+                }
                 _ = tokio::time::sleep(self.timing.leader_poll_interval) => {
-                    let current = self.state.leader_state.lock().await.mode.clone();
-                    if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
+                    if !self.state.valid_replication(leader, epoch) {
                         tracing::info!(?leader, "leader changed, dropping subscription");
                         self.drop_queued_actions();
                         return SyncAttempt::LeaderChanged;
@@ -422,10 +447,9 @@ fn expect_ok<A: SyncIOAddress, D: DeterministicState>(
 ) -> std::io::Result<()> {
     match response {
         SyncResponse::Ok => Ok(()),
-        response => Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("expected Ok during {step}, got {}", response.name()),
-        )),
+        response => {
+            Err(Error::new(ErrorKind::InvalidData, format!("expected Ok during {step}, got {}", response.name())))
+        }
     }
 }
 
@@ -438,20 +462,20 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::{
-            atomic::{AtomicU32, Ordering},
             Mutex as StdMutex,
+            atomic::{AtomicU32, Ordering},
         },
     };
 
     use sequenced_broadcast::SequencedBroadcastSettings;
     use tokio::{
-        io::{duplex, split, DuplexStream, ReadHalf, WriteHalf},
-        sync::{mpsc, Mutex, Notify},
+        io::{DuplexStream, ReadHalf, WriteHalf, duplex, split},
+        sync::{Mutex, Notify, mpsc},
     };
 
     use super::*;
     use crate::{
-        protocol::messages::LeaderState,
+        cluster::{election::LeadershipPermit, node_state::ElectionStatus},
         state::{recoverable_state::RecoverableState, subscribable_state::SubscribableState},
         transport::traits::SyncConnection,
     };
@@ -510,11 +534,26 @@ mod tests {
                 SequencedBroadcastSettings::default(),
             )
             .unwrap(),
-            leader_state: Mutex::new(LeaderState {
-                term: ElectionTerm::from_term(0),
-                mode,
-            }),
+            election: std::sync::RwLock::new(status(addr, mode, LeadershipEpoch::default())),
+            leadership_changed: Notify::new(),
+            eligible: std::sync::atomic::AtomicBool::new(true),
+            synced_epoch: std::sync::RwLock::new(None),
         })
+    }
+
+    fn status(addr: u64, mode: LeaderMode<u64>, epoch: LeadershipEpoch) -> ElectionStatus<u64> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        ElectionStatus {
+            owner: Some(match mode {
+                LeaderMode::Following { leader } => leader,
+                _ => addr,
+            }),
+            epoch,
+            ready: true,
+            valid_until: Some(deadline),
+            permit: matches!(mode, LeaderMode::Leading).then(|| LeadershipPermit::new(1, epoch, deadline)),
+            error: None,
+        }
     }
 
     fn start_task<I: SyncIO<Address = u64>>(
@@ -568,50 +607,43 @@ mod tests {
         wait_until("a connect attempt", || 1 <= io.connects.load(Ordering::SeqCst)).await;
 
         /* we win an election; the task must escape the connect and lead */
-        *state.leader_state.lock().await = LeaderState {
-            term: ElectionTerm::from_term(1),
-            mode: LeaderMode::Leading,
-        };
+        state.set_election_status(status(
+            1,
+            LeaderMode::Leading,
+            LeadershipEpoch {
+                incarnation: 1,
+                revision: 1,
+            },
+        ));
 
         let mut handle = state.state.create_handle();
-        let initial_seq = handle.read_with(|state| state.details().next_seq());
-        wait_until("the generation bump after taking leadership", || {
-            initial_seq < handle.read_with(|state| state.details().next_seq())
-        })
-        .await;
-
         /* and it must apply queued actions with local authority */
         actions_tx.send((1, 42)).await.unwrap();
-        wait_until("an action applied with local authority", || {
-            handle.read_with(|state| state.state().0) == 1
-        })
-        .await;
+        wait_until("an action applied with local authority", || handle.read_with(|state| state.state().0) == 1).await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn following_own_address_waits_without_self_subscribing() {
         let state = node_state(1, LeaderMode::Following { leader: 1 });
         let io = Arc::new(HangingIo::default());
-        let _actions_tx = start_task(&state, &io);
+        let actions_tx = start_task(&state, &io);
 
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(
-            io.connects.load(Ordering::SeqCst),
-            0,
-            "the sync task must not subscribe to its own address"
-        );
+        assert_eq!(io.connects.load(Ordering::SeqCst), 0, "the sync task must not subscribe to its own address");
 
         /* the task must still be responsive to leader changes */
-        *state.leader_state.lock().await = LeaderState {
-            term: ElectionTerm::from_term(1),
-            mode: LeaderMode::Leading,
-        };
+        state.set_election_status(status(
+            1,
+            LeaderMode::Leading,
+            LeadershipEpoch {
+                incarnation: 1,
+                revision: 1,
+            },
+        ));
 
         let mut handle = state.state.create_handle();
-        wait_until("the generation bump after taking leadership", || {
-            0 < handle.read_with(|state| state.details().next_seq())
-        })
-        .await;
+        actions_tx.send((1, 42)).await.unwrap();
+        wait_until("an action after taking leadership", || handle.read_with(|state| state.state().0) == 1).await;
     }
 
     /// Completes the sync handshake, accepts the recovery subscription, then
@@ -674,7 +706,9 @@ mod tests {
                 SyncRequest::ProtocolVersion(_) | SyncRequest::MyAddress(_) => SyncResponse::Ok,
                 SyncRequest::SubscribeRecovery(details) => {
                     /* accept, then drop the connection without streaming */
-                    let _ = write.send(SyncResponse::Accepted(details.next_seq())).await;
+                    let _ = write
+                        .send(SyncResponse::Accepted(LeadershipEpoch::default(), details.next_seq()))
+                        .await;
                     return;
                 }
                 _ => SyncResponse::UnexpectedRequest,
@@ -709,5 +743,96 @@ mod tests {
             minimum <= elapsed,
             "{ATTEMPTS} subscription attempts within {elapsed:?} are not paced (expected at least {minimum:?})"
         );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn same_address_epoch_change_rejects_old_stream() {
+        let state = node_state(1, LeaderMode::Following { leader: 2 });
+        let old_epoch = LeadershipEpoch::default();
+        let io = Arc::new(HangingIo::default());
+        let connections = Arc::new(PeerConnections::new(io.clone(), test_settings(), state.clone()));
+        let (_actions_tx, actions_rx) = mpsc::channel(16);
+        let mut task = StateSyncTask::new(state.clone(), connections, io, test_settings(), actions_rx, test_timing());
+        let (write, mut read) = mpsc::channel(16);
+        write
+            .send(SyncResponse::AuthorityAction(old_epoch, 0, RecoverableStateAction::StateAction { action: 1 }))
+            .await
+            .unwrap();
+        state.set_election_status(status(
+            1,
+            LeaderMode::Following { leader: 2 },
+            LeadershipEpoch {
+                incarnation: 0,
+                revision: 1,
+            },
+        ));
+        assert!(matches!(task.stream(2, 2, old_epoch, 0, &mut read).await, SyncAttempt::LeaderChanged));
+        assert_eq!(state.state.create_handle().read_with(|state| state.state().0), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_observation_rejects_replication_without_owner_change() {
+        let state = node_state(1, LeaderMode::Following { leader: 2 });
+        let epoch = LeadershipEpoch::default();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(
+            !state
+                .update_replica(2, epoch, RecoverableStateAction::StateAction { action: 1 })
+                .await
+        );
+        assert!(
+            !state
+                .reset_replica(2, epoch, RecoverableState::new(2, TestState(100)))
+                .await
+        );
+        assert_eq!(state.state.create_handle().read_with(|state| state.state().0), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_leader_does_not_resume_authority() {
+        let state = node_state(1, LeaderMode::Leading);
+        let epoch = LeadershipEpoch::default();
+        assert!(
+            state
+                .update_authoritative(epoch, RecoverableStateAction::StateAction { action: 1 })
+                .await
+        );
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(
+            !state
+                .update_authoritative(epoch, RecoverableStateAction::StateAction { action: 2 })
+                .await
+        );
+        assert_eq!(state.state.create_handle().read_with(|state| state.state().0), 1);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn relay_cannot_serve_an_epoch_before_synchronizing() {
+        use crate::cluster::rpc_server::{ResponseOrFeed, RpcServer};
+        let state = node_state(1, LeaderMode::Following { leader: 2 });
+        let (actions_tx, _actions_rx) = mpsc::channel(16);
+        let server = RpcServer::new(state.clone(), actions_tx);
+        assert!(matches!(
+            server.handle(3, SyncRequest::SubscribeFresh).await,
+            ResponseOrFeed::Response(SyncResponse::RecoveryFailed)
+        ));
+        let epoch = LeadershipEpoch::default();
+        state.mark_synchronized(epoch);
+        assert!(matches!(server.handle(3, SyncRequest::SubscribeFresh).await,
+            ResponseOrFeed::FreshState { epoch: served, .. } if served == epoch));
+        let next = LeadershipEpoch {
+            incarnation: 0,
+            revision: 1,
+        };
+        state.set_election_status(status(1, LeaderMode::Following { leader: 2 }, next));
+        assert!(matches!(
+            server.handle(3, SyncRequest::SubscribeFresh).await,
+            ResponseOrFeed::Response(SyncResponse::RecoveryFailed)
+        ));
+        let mut preparing = status(1, LeaderMode::Leading, next);
+        preparing.ready = false;
+        state.set_election_status(preparing);
+        assert!(matches!(
+            server.handle(3, SyncRequest::SubscribeFresh).await,
+            ResponseOrFeed::Response(SyncResponse::RecoveryFailed)
+        ));
     }
 }

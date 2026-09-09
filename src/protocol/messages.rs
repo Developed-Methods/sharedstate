@@ -1,4 +1,7 @@
-use std::{fmt::{Debug, Display}, num::NonZeroU64};
+use std::{
+    fmt::{Debug, Display},
+    num::NonZeroU64,
+};
 
 use message_encoding::MessageEncoding;
 
@@ -8,10 +11,10 @@ use crate::{
         recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
     },
     transport::traits::SyncIOAddress,
-    utils::{now_ms, unknown_id_err, unknown_version_err},
+    utils::{unknown_id_err, unknown_version_err},
 };
 
-pub const PROTOCOL_VERSION: u64 = 1;
+pub const PROTOCOL_VERSION: u64 = 2;
 
 pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
     ProtocolVersion(u64),
@@ -20,6 +23,7 @@ pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
     LeaderInformation(LeaderInfo<A>),
 
     SubscribeFresh,
+    RecoverySnapshot,
     SubscribeRecovery(RecoverableStateDetails),
     Action { source: A, action: D::Action },
     LeaderQuery,
@@ -27,67 +31,45 @@ pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeaderState<A: SyncIOAddress> {
-    pub term: ElectionTerm,
+    pub epoch: LeadershipEpoch,
     pub mode: LeaderMode<A>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Copy, PartialOrd, Ord)]
-pub struct ElectionTerm(u64);
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Copy, PartialOrd, Ord)]
+pub struct LeadershipEpoch {
+    pub incarnation: u128,
+    pub revision: i64,
+}
 
-impl Display for ElectionTerm {
+impl Display for LeadershipEpoch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.term(), self.0)
+        write!(f, "{:032x}/{}", self.incarnation, self.revision)
     }
 }
 
-impl Default for ElectionTerm {
-    fn default() -> Self {
-        let num = ElectionTerm(0).bump().id();
-        ElectionTerm(num & (u32::MAX as u64))
-    }
-}
-
-impl ElectionTerm {
-    pub fn from_term(term: u64) -> Self {
-        Self::from_parts(term, 0)
-    }
-
-    /// Builds a term with an explicit nonce. Terms with the same number but
-    /// different nonces come from different election roots and must not be
-    /// treated as the same election.
-    pub fn from_parts(term: u64, nonce: u32) -> Self {
-        ElectionTerm((term << 32) | nonce as u64)
-    }
-
-    pub fn bump(self) -> Self {
-        let term = self.term();
-        let epoch = now_ms();
-        ElectionTerm((term.saturating_add(1) << 32) | (epoch as u32 ^ (epoch >> 32) as u32) as u64)
-    }
-
-    pub fn id(&self) -> u64 {
-        self.0
-    }
-
-    pub fn term(self) -> u64 {
-        self.0 >> 32
-    }
-}
-
-impl MessageEncoding for ElectionTerm {
+impl MessageEncoding for LeadershipEpoch {
     fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
-        self.0.write_to(out)
+        out.write_all(&self.incarnation.to_be_bytes())?;
+        out.write_all(&self.revision.to_be_bytes())?;
+        Ok(24)
     }
 
     fn read_from<T: std::io::Read>(read: &mut T) -> std::io::Result<Self> {
-        u64::read_from(read).map(Self)
+        let mut incarnation = [0; 16];
+        let mut revision = [0; 8];
+        read.read_exact(&mut incarnation)?;
+        read.read_exact(&mut revision)?;
+        Ok(Self {
+            incarnation: u128::from_be_bytes(incarnation),
+            revision: i64::from_be_bytes(revision),
+        })
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LeaderMode<A: SyncIOAddress> {
     NoLeader,
-    Electing { vote: Option<A> },
+    Electing,
     Leading,
     Following { leader: A },
 }
@@ -96,7 +78,7 @@ pub enum LeaderMode<A: SyncIOAddress> {
 pub struct LeaderInfo<A: SyncIOAddress> {
     pub leader_state: LeaderState<A>,
     pub can_lead: bool,
-    pub reachable_voters: Vec<A>,
+    pub recovery_initialized: bool,
     pub recovery_details: RecoverableStateDetails,
 }
 
@@ -124,6 +106,7 @@ impl<A: SyncIOAddress, D: DeterministicState> Debug for SyncRequest<A, D> {
             Self::MyAddress(address) => write!(f, "MyAddress({address:?})"),
             Self::SharePeers(peers) => write!(f, "SharePeers({peers:?})"),
             Self::LeaderInformation(info) => write!(f, "LeaderInformation({info:?})"),
+            Self::RecoverySnapshot => write!(f, "RecoverySnapshot"),
             Self::SubscribeFresh => write!(f, "SubscribeFresh"),
             Self::SubscribeRecovery(details) => write!(f, "SubscribeRecovery({details:?})"),
             Self::Action { source, .. } => write!(f, "Action(source: {source:?})"),
@@ -136,10 +119,11 @@ pub enum SyncResponse<A: SyncIOAddress, D: DeterministicState> {
     Ok,
     FailedToQueueAction { source: A },
     Peers(Vec<SharePeerDetails<A>>),
-    Accepted(u64),
+    Accepted(LeadershipEpoch, u64),
     RecoveryFailed,
-    FreshState(RecoverableState<D>),
-    AuthorityAction(u64, RecoverableStateAction<D::AuthorityAction>),
+    FreshState(LeadershipEpoch, RecoverableState<D>),
+    RecoverySnapshot(RecoverableState<D>),
+    AuthorityAction(LeadershipEpoch, u64, RecoverableStateAction<D::AuthorityAction>),
     ActionStreamClosed,
     UnexpectedRequest,
     LeaderState(LeaderState<A>),
@@ -148,13 +132,14 @@ pub enum SyncResponse<A: SyncIOAddress, D: DeterministicState> {
 impl<A: SyncIOAddress, D: DeterministicState> SyncResponse<A, D> {
     pub fn name(&self) -> &'static str {
         match self {
+            SyncResponse::RecoverySnapshot(_) => "RecoverySnapshot",
             SyncResponse::Ok => "Ok",
             SyncResponse::FailedToQueueAction { .. } => "FailedToQueueAction",
             SyncResponse::Peers(_) => "Peers",
-            SyncResponse::Accepted(_) => "Accepted",
+            SyncResponse::Accepted(..) => "Accepted",
             SyncResponse::RecoveryFailed => "RecoveryFailed",
-            SyncResponse::FreshState(_) => "FreshState",
-            SyncResponse::AuthorityAction(_, _) => "AuthorityAction",
+            SyncResponse::FreshState(..) => "FreshState",
+            SyncResponse::AuthorityAction(..) => "AuthorityAction",
             SyncResponse::ActionStreamClosed => "ActionStreamClosed",
             SyncResponse::UnexpectedRequest => "UnexpectedRequest",
             SyncResponse::LeaderState(_) => "LeaderState",
@@ -185,6 +170,7 @@ where
                 sum += 3u16.write_to(out)?;
                 info.write_to(out)?
             }
+            Self::RecoverySnapshot => 8u16.write_to(out)?,
             Self::SubscribeFresh => 4u16.write_to(out)?,
             Self::SubscribeRecovery(details) => {
                 sum += 5u16.write_to(out)?;
@@ -214,6 +200,7 @@ where
                 action: MessageEncoding::read_from(read)?,
             },
             7 => Self::LeaderQuery,
+            8 => Self::RecoverySnapshot,
             other => return Err(unknown_id_err(other, "SyncRequest")),
         })
     }
@@ -222,24 +209,24 @@ where
 impl<A: SyncIOAddress> MessageEncoding for LeaderInfo<A> {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
-        sum += 5u16.write_to(out)?;
+        sum += 6u16.write_to(out)?;
         sum += self.leader_state.write_to(out)?;
         sum += self.can_lead.write_to(out)?;
-        sum += write_vec(&self.reachable_voters, out)?;
+        sum += self.recovery_initialized.write_to(out)?;
         sum += self.recovery_details.write_to(out)?;
         Ok(sum)
     }
 
     fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
         let version = u16::read_from(read)?;
-        if version != 5 {
+        if version != 6 {
             return Err(unknown_version_err(version, "LeaderInfo"));
         }
 
         Ok(Self {
             leader_state: MessageEncoding::read_from(read)?,
             can_lead: MessageEncoding::read_from(read)?,
-            reachable_voters: read_vec(read)?,
+            recovery_initialized: MessageEncoding::read_from(read)?,
             recovery_details: MessageEncoding::read_from(read)?,
         })
     }
@@ -248,20 +235,20 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderInfo<A> {
 impl<A: SyncIOAddress> MessageEncoding for LeaderState<A> {
     fn write_to<T: std::io::prelude::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
-        sum += 1u16.write_to(out)?;
-        sum += self.term.write_to(out)?;
+        sum += 2u16.write_to(out)?;
+        sum += self.epoch.write_to(out)?;
         sum += self.mode.write_to(out)?;
         Ok(sum)
     }
 
     fn read_from<T: std::io::prelude::Read>(read: &mut T) -> std::io::Result<Self> {
         let version = u16::read_from(read)?;
-        if version != 1 {
+        if version != 2 {
             return Err(unknown_version_err(version, "LeaderState"));
         }
 
         Ok(Self {
-            term: MessageEncoding::read_from(read)?,
+            epoch: MessageEncoding::read_from(read)?,
             mode: MessageEncoding::read_from(read)?,
         })
     }
@@ -274,9 +261,8 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderMode<A> {
             LeaderMode::NoLeader => {
                 sum += 0u16.write_to(out)?;
             }
-            LeaderMode::Electing { vote } => {
+            LeaderMode::Electing => {
                 sum += 1u16.write_to(out)?;
-                sum += vote.write_to(out)?;
             }
             LeaderMode::Leading => {
                 sum += 2u16.write_to(out)?;
@@ -293,9 +279,7 @@ impl<A: SyncIOAddress> MessageEncoding for LeaderMode<A> {
         let tag = u16::read_from(read)?;
         match tag {
             0 => Ok(LeaderMode::NoLeader),
-            1 => Ok(LeaderMode::Electing {
-                vote: MessageEncoding::read_from(read)?,
-            }),
+            1 => Ok(LeaderMode::Electing),
             2 => Ok(LeaderMode::Leading),
             3 => Ok(LeaderMode::Following {
                 leader: MessageEncoding::read_from(read)?,
@@ -340,6 +324,10 @@ where
     fn write_to<T: std::io::Write>(&self, out: &mut T) -> std::io::Result<usize> {
         let mut sum = 0;
         sum += match self {
+            Self::RecoverySnapshot(state) => {
+                sum += 10u16.write_to(out)?;
+                state.write_to(out)?
+            }
             Self::Ok => 0u16.write_to(out)?,
             Self::FailedToQueueAction { source } => {
                 sum += 1u16.write_to(out)?;
@@ -349,17 +337,20 @@ where
                 sum += 2u16.write_to(out)?;
                 write_vec(peers, out)?
             }
-            Self::Accepted(next_seq) => {
+            Self::Accepted(epoch, next_seq) => {
                 sum += 3u16.write_to(out)?;
+                sum += epoch.write_to(out)?;
                 next_seq.write_to(out)?
             }
             Self::RecoveryFailed => 4u16.write_to(out)?,
-            Self::FreshState(state) => {
+            Self::FreshState(epoch, state) => {
                 sum += 5u16.write_to(out)?;
+                sum += epoch.write_to(out)?;
                 state.write_to(out)?
             }
-            Self::AuthorityAction(seq, action) => {
+            Self::AuthorityAction(epoch, seq, action) => {
                 sum += 6u16.write_to(out)?;
+                sum += epoch.write_to(out)?;
                 sum += seq.write_to(out)?;
                 action.write_to(out)?
             }
@@ -381,13 +372,18 @@ where
                 source: MessageEncoding::read_from(read)?,
             },
             2 => Self::Peers(read_vec(read)?),
-            3 => Self::Accepted(MessageEncoding::read_from(read)?),
+            3 => Self::Accepted(MessageEncoding::read_from(read)?, MessageEncoding::read_from(read)?),
             4 => Self::RecoveryFailed,
-            5 => Self::FreshState(MessageEncoding::read_from(read)?),
-            6 => Self::AuthorityAction(MessageEncoding::read_from(read)?, MessageEncoding::read_from(read)?),
+            5 => Self::FreshState(MessageEncoding::read_from(read)?, MessageEncoding::read_from(read)?),
+            6 => Self::AuthorityAction(
+                MessageEncoding::read_from(read)?,
+                MessageEncoding::read_from(read)?,
+                MessageEncoding::read_from(read)?,
+            ),
             7 => Self::ActionStreamClosed,
             8 => Self::UnexpectedRequest,
             9 => Self::LeaderState(MessageEncoding::read_from(read)?),
+            10 => Self::RecoverySnapshot(MessageEncoding::read_from(read)?),
             other => return Err(unknown_id_err(other, "SyncResponse")),
         })
     }
@@ -462,11 +458,14 @@ mod tests {
     fn leader_info() -> LeaderInfo<u64> {
         LeaderInfo {
             leader_state: LeaderState {
-                term: ElectionTerm(2),
+                epoch: LeadershipEpoch {
+                    incarnation: u128::MAX,
+                    revision: i64::MAX,
+                },
                 mode: LeaderMode::Following { leader: 3 },
             },
             can_lead: true,
-            reachable_voters: vec![],
+            recovery_initialized: true,
             recovery_details: RecoverableStateDetails::new(1, 2),
         }
     }
@@ -484,7 +483,7 @@ mod tests {
 
         info.write_to(&mut bytes).unwrap();
 
-        assert_eq!(u16::read_from(&mut &bytes[..]).unwrap(), 5);
+        assert_eq!(u16::read_from(&mut &bytes[..]).unwrap(), 6);
 
         let decoded: LeaderInfo<u64> = LeaderInfo::read_from(&mut &bytes[..]).unwrap();
         assert_eq!(decoded.leader_state, info.leader_state);
@@ -521,15 +520,22 @@ mod tests {
             (SyncResponse::Ok, 0),
             (SyncResponse::FailedToQueueAction { source: 2 }, 1),
             (SyncResponse::Peers(vec![SharePeerDetails::from(3)]), 2),
-            (SyncResponse::Accepted(6), 3),
+            (SyncResponse::Accepted(LeadershipEpoch::default(), 6), 3),
             (SyncResponse::RecoveryFailed, 4),
-            (SyncResponse::FreshState(RecoverableState::new(7, TestState(8))), 5),
-            (SyncResponse::AuthorityAction(9, RecoverableStateAction::StateAction { action: TestAction(10) }), 6),
+            (SyncResponse::FreshState(LeadershipEpoch::default(), RecoverableState::new(7, TestState(8))), 5),
+            (
+                SyncResponse::AuthorityAction(
+                    LeadershipEpoch::default(),
+                    9,
+                    RecoverableStateAction::StateAction { action: TestAction(10) },
+                ),
+                6,
+            ),
             (SyncResponse::ActionStreamClosed, 7),
             (SyncResponse::UnexpectedRequest, 8),
             (
                 SyncResponse::LeaderState(LeaderState {
-                    term: ElectionTerm(3),
+                    epoch: LeadershipEpoch::default(),
                     mode: LeaderMode::Leading,
                 }),
                 9,
@@ -538,6 +544,30 @@ mod tests {
 
         for (response, tag) in cases {
             assert_eq!(first_tag(&response), tag);
+        }
+    }
+    #[test]
+    fn replication_envelopes_preserve_full_epoch() {
+        let epoch = LeadershipEpoch {
+            incarnation: u128::MAX - 17,
+            revision: i64::MAX - 9,
+        };
+        let responses: Vec<SyncResponse<u64, TestState>> = vec![
+            SyncResponse::Accepted(epoch, 7),
+            SyncResponse::FreshState(epoch, RecoverableState::new(2, TestState(7))),
+            SyncResponse::AuthorityAction(epoch, 7, RecoverableStateAction::StateAction { action: TestAction(8) }),
+        ];
+        for response in responses {
+            let mut encoded = Vec::new();
+            response.write_to(&mut encoded).unwrap();
+            let decoded = SyncResponse::<u64, TestState>::read_from(&mut &encoded[..]).unwrap();
+            let received = match decoded {
+                SyncResponse::Accepted(epoch, _)
+                | SyncResponse::FreshState(epoch, _)
+                | SyncResponse::AuthorityAction(epoch, _, _) => epoch,
+                _ => panic!("unexpected response"),
+            };
+            assert_eq!(received, epoch);
         }
     }
 }

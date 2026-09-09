@@ -1,5 +1,7 @@
-//! End-to-end failover test over real TCP with default settings, mirroring
-//! the kv_tui example's wiring.
+//! Failover over real TCP with a lease-backed etcd owner.
+use sharedstate::cluster;
+#[path = "support/etcd.rs"]
+mod test_support;
 
 use std::{
     collections::BTreeMap,
@@ -10,14 +12,14 @@ use std::{
 
 use message_encoding::MessageEncoding;
 use sharedstate::{
+    SharedState, SharedStateConfig, SharedStateSettings,
     cluster::leader::LeaderMode,
     state::deterministic_state::DeterministicState,
     transport::traits::{SyncConnection, SyncIO, SyncIOListener},
-    SharedState, SharedStateConfig, SharedStateSettings,
 };
 use tokio::net::{
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
     TcpListener, TcpStream,
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
 
 #[derive(Clone)]
@@ -111,7 +113,12 @@ impl MessageEncoding for KvState {
     }
 }
 
-async fn start_node(io: LocalhostTcpIo, can_lead: bool, peers: &[u16]) -> SharedState<LocalhostTcpIo, KvState> {
+async fn start_node(
+    io: LocalhostTcpIo,
+    can_lead: bool,
+    peers: &[u16],
+    etcd: &test_support::TestEtcd,
+) -> SharedState<LocalhostTcpIo, KvState> {
     let my_address = io.address;
     SharedState::start(SharedStateConfig {
         io: Arc::new(io),
@@ -119,7 +126,10 @@ async fn start_node(io: LocalhostTcpIo, can_lead: bool, peers: &[u16]) -> Shared
         can_lead,
         initial_peers: peers.to_vec(),
         initial_state: KvState::default(),
-        settings: SharedStateSettings::default(),
+        settings: SharedStateSettings {
+            election: etcd.config(false),
+            ..Default::default()
+        },
     })
     .unwrap()
 }
@@ -131,20 +141,12 @@ async fn wait_for_value(node: &SharedState<LocalhostTcpIo, KvState>, key: &str, 
         if handle.read_with(|state| state.state().values.get(key).map(String::as_str) == Some(value)) {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for node {} to see {key}={value}",
-            node.my_address(),
-        );
+        assert!(Instant::now() < deadline, "timed out waiting for node {} to see {key}={value}", node.my_address(),);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-async fn wait_for_settled_leader(
-    nodes: &[&SharedState<LocalhostTcpIo, KvState>],
-    leader: u16,
-    timeout: Duration,
-) {
+async fn wait_for_settled_leader(nodes: &[&SharedState<LocalhostTcpIo, KvState>], leader: u16, timeout: Duration) {
     for node in nodes {
         let deadline = Instant::now() + timeout;
         loop {
@@ -169,8 +171,11 @@ async fn wait_for_settled_leader(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn follower_actions_apply_after_leader_change_over_tcp() {
-    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init();
 
+    let etcd = test_support::TestEtcd::start().await;
     let io1 = LocalhostTcpIo::bind_ephemeral().await.unwrap();
     let io2 = LocalhostTcpIo::bind_ephemeral().await.unwrap();
     let io3 = LocalhostTcpIo::bind_ephemeral().await.unwrap();
@@ -179,7 +184,6 @@ async fn follower_actions_apply_after_leader_change_over_tcp() {
     let mut order = [addr1, addr2, addr3];
     order.sort();
     let first_leader = order[0];
-    let second_leader = order[1];
 
     /* the first leader runs on its own runtime so it can be killed like a
      * real process: every task dies and its sockets close */
@@ -197,7 +201,10 @@ async fn follower_actions_apply_after_leader_change_over_tcp() {
             can_lead: true,
             initial_peers: leader_peers,
             initial_state: KvState::default(),
-            settings: SharedStateSettings::default(),
+            settings: SharedStateSettings {
+                election: etcd.config(true),
+                ..Default::default()
+            },
         })
         .unwrap()
     };
@@ -209,7 +216,7 @@ async fn follower_actions_apply_after_leader_change_over_tcp() {
             .copied()
             .filter(|addr| *addr != io.address)
             .collect();
-        remaining.push(start_node(io, true, &peers).await);
+        remaining.push(start_node(io, true, &peers, &etcd).await);
     }
 
     {
@@ -230,7 +237,19 @@ async fn follower_actions_apply_after_leader_change_over_tcp() {
     leader_rt.shutdown_background();
 
     let remaining_refs: Vec<_> = remaining.iter().collect();
-    wait_for_settled_leader(&remaining_refs, second_leader, Duration::from_secs(60)).await;
+    let second_leader = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            for node in &remaining {
+                if matches!(node.leader_state().await.mode, LeaderMode::Leading) {
+                    return node.my_address();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a synchronized survivor must become leader");
+    wait_for_settled_leader(&remaining_refs, second_leader, Duration::from_secs(20)).await;
 
     /* the follower that moved to the new leader submits an action */
     let moved_follower = remaining

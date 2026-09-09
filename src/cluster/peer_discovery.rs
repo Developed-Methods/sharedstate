@@ -1,6 +1,6 @@
 use std::{future::Future, num::NonZeroU64, sync::Arc, time::Duration};
 
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use message_encoding::MessageEncoding;
 
 use crate::{
@@ -8,7 +8,7 @@ use crate::{
         node_state::{ConnectStatus, NodeState, PeerState},
         peer_connections::PeerConnections,
     },
-    protocol::messages::{LeaderInfo, LeaderState, SharePeerDetails},
+    protocol::messages::{LeaderInfo, SharePeerDetails},
     state::deterministic_state::DeterministicState,
     transport::traits::{SyncIO, SyncIOAddress},
     utils::now_ms,
@@ -109,22 +109,11 @@ where
 
     async fn share_leader_info(&self) {
         self.process_data_for_peers(
-            |peers| async move {
-                let mut reachable_voters = peers
-                    .iter()
-                    .filter_map(|peer| peer.connect_status.is_connected().then_some(peer.addr))
-                    .collect::<Vec<_>>();
-                if self.state.can_lead {
-                    reachable_voters.push(self.state.my_address);
-                }
-
+            |_peers| async move {
                 LeaderInfo {
                     can_lead: self.state.can_lead,
-                    leader_state: {
-                        let lock = self.state.leader_state.lock().await;
-                        LeaderState::clone(&*lock)
-                    },
-                    reachable_voters,
+                    leader_state: self.state.current_leader(),
+                    recovery_initialized: self.state.eligible.load(std::sync::atomic::Ordering::Acquire),
                     recovery_details: self.state.state.recovery_details().await,
                 }
             },
@@ -133,10 +122,7 @@ where
                 let leader_info = leader_info.clone();
 
                 async move {
-                    /* voters broadcast to everyone so observers learn the
-                     * leader; observers only report their state to voters.
-                     * If we don't know if peer is leader, assume it is so
-                     * we can get peer discovery */
+                    /* Eligible nodes exchange recovery metadata with observers. */
                     if !self.state.can_lead && !peer.can_lead.unwrap_or(true) {
                         return;
                     }

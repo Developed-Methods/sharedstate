@@ -9,30 +9,31 @@ use std::{
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use message_encoding::MessageEncoding;
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Position},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
-    Terminal,
 };
 use sharedstate::{
+    SharedState, SharedStateConfig, SharedStateSettings,
     cluster::{
+        election::EtcdElectionConfig,
         leader::LeaderMode,
         node_state::{ConnectStatus, NodeState},
     },
     state::{deterministic_state::DeterministicState, subscribable_state::StateHandle},
     transport::traits::{SyncConnection, SyncIO, SyncIOListener},
-    SharedState, SharedStateConfig, SharedStateSettings,
 };
 use tokio::{
     net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
@@ -51,6 +52,7 @@ const RENDER_INTERVAL: Duration = Duration::from_millis(100);
 struct Args {
     can_lead: bool,
     peers: Vec<u16>,
+    election: EtcdElectionConfig,
 }
 
 #[derive(Clone)]
@@ -397,7 +399,10 @@ async fn main() -> io::Result<()> {
         can_lead: args.can_lead,
         initial_peers: args.peers.clone(),
         initial_state: KvStore::new(),
-        settings: SharedStateSettings::default(),
+        settings: SharedStateSettings {
+            election: args.election.clone(),
+            ..Default::default()
+        },
     })
     .map_err(|error| Error::other(format!("failed to start shared state: {error:?}")))?;
 
@@ -412,38 +417,50 @@ async fn main() -> io::Result<()> {
 }
 
 fn parse_args() -> io::Result<Args> {
-    let mut args = env::args().skip(1).collect::<Vec<_>>();
-    if args.len() != 1 && args.len() != 2 {
-        return Err(usage_error());
-    }
-
-    let can_lead = match args.remove(0).to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => true,
-        "false" | "0" | "no" => false,
-        _ => return Err(usage_error()),
-    };
-
-    let peers = if let Some(raw) = args.pop() {
-        if raw.is_empty() {
-            return Err(usage_error());
+    let mut raw = env::args().skip(1);
+    let mut election = EtcdElectionConfig::default();
+    let mut can_lead = true;
+    let mut peers = Vec::new();
+    while let Some(flag) = raw.next() {
+        match flag.as_str() {
+            "--observer" => can_lead = false,
+            "--bootstrap" => election.bootstrap = true,
+            "--etcd-endpoints" => {
+                election.endpoints = raw
+                    .next()
+                    .ok_or_else(usage_error)?
+                    .split(',')
+                    .map(str::to_owned)
+                    .collect()
+            }
+            "--cluster-id" => election.cluster_id = raw.next().ok_or_else(usage_error)?,
+            "--incarnation" => {
+                election.election_incarnation =
+                    raw.next().ok_or_else(usage_error)?.parse().map_err(|_| usage_error())?
+            }
+            "--peers" => {
+                peers = raw
+                    .next()
+                    .ok_or_else(usage_error)?
+                    .split(',')
+                    .map(|port| port.parse().map_err(|_| usage_error()))
+                    .collect::<io::Result<Vec<_>>>()?
+            }
+            _ => return Err(usage_error()),
         }
-        raw.split(',')
-            .map(|part| {
-                if part.is_empty() {
-                    return Err(usage_error());
-                }
-                part.parse::<u16>().map_err(|_| usage_error())
-            })
-            .collect::<io::Result<Vec<_>>>()?
-    } else {
-        Vec::new()
-    };
-
-    Ok(Args { can_lead, peers })
+    }
+    Ok(Args {
+        can_lead,
+        peers,
+        election,
+    })
 }
 
 fn usage_error() -> io::Error {
-    Error::new(ErrorKind::InvalidInput, "usage: cargo run --example kv_tui -- <can_lead:true|false> [peer_ports_csv]")
+    Error::new(
+        ErrorKind::InvalidInput,
+        "usage: cargo run --example kv_tui -- [--etcd-endpoints http://127.0.0.1:2379] [--cluster-id NAME] [--incarnation NUMBER] [--bootstrap] [--observer] [--peers PORT,PORT]",
+    )
 }
 
 async fn run_tui(
@@ -567,7 +584,8 @@ fn input_view(input: &str, cursor: usize, max_width: u16) -> (String, u16) {
 }
 
 async fn build_summary(state: &NodeState<u16, KvStore>, state_handle: &mut StateHandle<KvStore>) -> Vec<String> {
-    let leader_state = state.leader_state.lock().await.clone();
+    let leader_state = state.current_leader();
+    let election = state.election_status();
     let (seq, item_count, values_preview) = state_handle.read_with(|recoverable| {
         let store = recoverable.state();
         let preview = store
@@ -582,7 +600,15 @@ async fn build_summary(state: &NodeState<u16, KvStore>, state_handle: &mut State
 
     let mut lines = vec![
         format!("address: 127.0.0.1:{}  can_lead: {}", state.my_address, state.can_lead),
-        format!("leader: term={} {}", leader_state.term, leader_mode_line(&leader_state.mode)),
+        format!("leader: epoch={:?} {}", leader_state.epoch, leader_mode_line(&leader_state.mode)),
+        format!(
+            "lease: owner_valid={} local_authority={} error={}",
+            election
+                .valid_until
+                .is_some_and(|deadline| tokio::time::Instant::now() < deadline),
+            election.permit.as_ref().is_some_and(|permit| permit.valid()),
+            election.error.as_deref().unwrap_or("none")
+        ),
         format!("kv: seq={seq} items={item_count}"),
     ];
     if !values_preview.is_empty() {
@@ -595,14 +621,15 @@ async fn build_summary(state: &NodeState<u16, KvStore>, state_handle: &mut State
     } else {
         for peer in peers.values() {
             lines.push(format!(
-                "  {} status={} can_lead={:?} last_global={:?} observed_leader={:?} observed_vote={:?} observed_term={:?}",
+                "  {} status={} can_lead={:?} last_global={:?} observed_leader={:?} observed_epoch={:?}",
                 peer.addr,
                 connect_status_line(peer.connect_status),
                 peer.can_lead,
                 peer.last_global_connectivity.map(|value| value.get()),
-                peer.leader_info.as_ref().and_then(|info| published_leader(peer.addr, &info.leader_state.mode)),
-                peer.leader_info.as_ref().and_then(|info| observed_vote(&info.leader_state.mode)),
-                peer.leader_info.as_ref().map(|info| info.leader_state.term),
+                peer.leader_info
+                    .as_ref()
+                    .and_then(|info| published_leader(peer.addr, &info.leader_state.mode)),
+                peer.leader_info.as_ref().map(|info| info.leader_state.epoch),
             ));
         }
     }
@@ -612,16 +639,9 @@ async fn build_summary(state: &NodeState<u16, KvStore>, state_handle: &mut State
 
 fn published_leader(observer: u16, mode: &LeaderMode<u16>) -> Option<u16> {
     match mode {
-        LeaderMode::NoLeader | LeaderMode::Electing { .. } => None,
+        LeaderMode::NoLeader | LeaderMode::Electing => None,
         LeaderMode::Leading => Some(observer),
         LeaderMode::Following { leader } => Some(*leader),
-    }
-}
-
-fn observed_vote(mode: &LeaderMode<u16>) -> Option<u16> {
-    match mode {
-        LeaderMode::Electing { vote } => *vote,
-        _ => None,
     }
 }
 
@@ -636,7 +656,7 @@ fn connect_status_line(status: ConnectStatus) -> String {
 fn leader_mode_line(mode: &LeaderMode<u16>) -> String {
     match mode {
         LeaderMode::NoLeader => "NoLeader".to_owned(),
-        LeaderMode::Electing { vote } => format!("Electing vote={vote:?}"),
+        LeaderMode::Electing => "Electing".to_owned(),
         LeaderMode::Leading => "Leading".to_owned(),
         LeaderMode::Following { leader } => format!("Following leader={leader}"),
     }
