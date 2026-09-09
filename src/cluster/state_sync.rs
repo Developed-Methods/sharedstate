@@ -55,6 +55,7 @@ pub struct StateSyncTask<I: SyncIO, D: DeterministicState> {
     io: Arc<I>,
     settings: NetIoSettings,
     actions_rx: Receiver<(I::Address, D::Action)>,
+    pending_action: Option<(I::Address, D::Action)>,
     handle: StateHandle<D>,
     timing: StateSyncTiming,
 }
@@ -96,6 +97,7 @@ where
             io,
             settings,
             actions_rx,
+            pending_action: None,
             handle,
             timing,
         }
@@ -136,7 +138,12 @@ where
 
         loop {
             tokio::select! {
-                action = self.actions_rx.recv() => {
+                action = async {
+                    match self.pending_action.take() {
+                        Some(action) => Some(action),
+                        None => self.actions_rx.recv().await,
+                    }
+                } => {
                     let Some((source, action)) = action else {
                         return Flow::Shutdown;
                     };
@@ -149,6 +156,7 @@ where
                     }
                     if !matches!(current, LeaderMode::Leading) {
                         tracing::info!("no longer leading, releasing authority before applying queued action");
+                        self.pending_action = Some((source, action));
                         return Flow::Continue;
                     }
 
@@ -353,14 +361,19 @@ where
                         return SyncAttempt::Finished { applied_actions };
                     }
                 },
-                action = self.actions_rx.recv() => {
+                action = async {
+                    match self.pending_action.take() {
+                        Some(action) => Some(action),
+                        None => self.actions_rx.recv().await,
+                    }
+                } => {
                     let Some((source, action)) = action else {
                         return SyncAttempt::Shutdown;
                     };
                     let current = self.state.leader_state.lock().await.mode.clone();
                     if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
                         tracing::info!(?leader, "leader changed before forwarding action, dropping subscription");
-                        self.drop_queued_actions();
+                        self.pending_action = Some((source, action));
                         return SyncAttempt::LeaderChanged;
                     }
                     self.forward_action(target, source, action).await;
@@ -369,16 +382,11 @@ where
                     let current = self.state.leader_state.lock().await.mode.clone();
                     if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
                         tracing::info!(?leader, "leader changed, dropping subscription");
-                        self.drop_queued_actions();
                         return SyncAttempt::LeaderChanged;
                     }
                 }
             }
         }
-    }
-
-    fn drop_queued_actions(&mut self) {
-        while self.actions_rx.try_recv().is_ok() {}
     }
 
     async fn forward_action(&self, target: I::Address, source: I::Address, action: D::Action) {
@@ -504,6 +512,7 @@ mod tests {
         Arc::new(NodeState {
             my_address: addr,
             can_lead: true,
+            pinned_leader: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
             state: SubscribableState::new(
                 RecoverableState::new(addr, TestState(0)),

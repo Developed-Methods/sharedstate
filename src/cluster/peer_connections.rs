@@ -631,6 +631,7 @@ mod tests {
         Arc::new(NodeState {
             my_address: 1,
             can_lead: true,
+            pinned_leader: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
             state: SubscribableState::new(RecoverableState::new(1, TestState), SequencedBroadcastSettings::default())
                 .unwrap(),
