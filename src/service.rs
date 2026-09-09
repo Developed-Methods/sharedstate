@@ -1,675 +1,819 @@
-//! High-level entry point that provisions everything a node needs to share
-//! state with a cluster: the RPC listener, peer discovery, leader election,
-//! and the state sync task.
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
-use std::{collections::HashMap, sync::Arc};
-
-use message_encoding::MessageEncoding;
-use sequenced_broadcast::{SequencedBroadcastSettings, SettingsError};
+use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{
-        Mutex,
-        mpsc::{self, error::SendError},
-    },
-    task::JoinHandle,
+    sync::{Semaphore, watch},
+    task::{JoinHandle, JoinSet},
+    time::{Instant, timeout_at},
 };
+use tokio_util::sync::CancellationToken;
 
-use crate::{
-    cluster::{
-        leader::{LeaderTask, LeaderTiming},
-        node_state::{NodeState, PeerState},
-        peer_connections::PeerConnections,
-        peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
-        rpc_server::RpcServer,
-        state_sync::{StateSyncTask, StateSyncTiming},
-    },
-    protocol::messages::{ElectionTerm, LeaderMode, LeaderState},
-    state::{
-        deterministic_state::DeterministicState,
-        recoverable_state::RecoverableState,
-        subscribable_state::{StateHandle, SubscribableState},
-    },
-    transport::{channels::NetIoSettings, traits::SyncIOListener},
-    utils::unique_state_id,
+use super::{
+    Command, Peer, Raft,
+    machine::{Machine, ReplicatedState, Revision, Session, SnapshotHandle},
+    network::Network,
+    protocol::{self, Request, Response as WireResponse},
+    storage::{Database, LogStore},
 };
+use crate::transport::traits::{SyncIO, SyncIOListener};
 
-pub struct SharedStateConfig<I: SyncIOListener, D: DeterministicState> {
-    pub io: Arc<I>,
-    pub my_address: I::Address,
-    pub can_lead: bool,
-    pub initial_peers: Vec<I::Address>,
-    pub initial_state: D,
-    pub settings: SharedStateSettings,
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OperationId {
+    pub client_id: uuid::Uuid,
+    pub sequence: u64,
 }
 
-pub struct SharedStateRecoverableConfig<I: SyncIOListener, D: DeterministicState> {
-    pub io: Arc<I>,
-    pub my_address: I::Address,
-    pub can_lead: bool,
-    pub initial_peers: Vec<I::Address>,
-    pub initial_state: RecoverableState<D>,
-    pub settings: SharedStateSettings,
+pub struct Operation<C> {
+    pub id: OperationId,
+    pub command: C,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct SharedStateSettings {
-    pub net: NetIoSettings,
-    pub broadcast: SequencedBroadcastSettings,
-    pub discovery_timing: PeerDiscoveryTiming,
-    pub leader_timing: LeaderTiming,
-    pub sync_timing: StateSyncTiming,
+#[derive(Clone, Debug)]
+pub struct CommitReceipt<R> {
+    pub operation_id: OperationId,
+    pub revision: Revision,
+    pub result: R,
 }
 
-const ACTION_QUEUE_CAPACITY: usize = 512;
-
-/// A running shared-state node. Dropping it stops the background tasks.
-pub struct SharedState<I: SyncIOListener, D: DeterministicState> {
-    node: Arc<NodeState<I::Address, D>>,
-    actions_tx: mpsc::Sender<(I::Address, D::Action)>,
-    tasks: Vec<JoinHandle<()>>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubmitError {
+    NotAdmitted { reason: String },
+    OutcomeUnknown { operation_id: OperationId },
+    SessionRejected { reason: String },
 }
 
-impl<I, D> SharedState<I, D>
-where
-    I: SyncIOListener,
-    D: DeterministicState + MessageEncoding,
-    D::Action: MessageEncoding,
-    D::AuthorityAction: MessageEncoding,
-{
-    pub fn start(config: SharedStateConfig<I, D>) -> Result<Self, SettingsError> {
-        let SharedStateConfig {
-            io,
-            my_address,
-            can_lead,
-            initial_peers,
-            initial_state,
-            settings,
-        } = config;
-
-        Self::start_recoverable(SharedStateRecoverableConfig {
-            io,
-            my_address,
-            can_lead,
-            initial_peers,
-            initial_state: RecoverableState::new(unique_state_id(&my_address), initial_state),
-            settings,
-        })
-    }
-
-    pub fn start_recoverable(config: SharedStateRecoverableConfig<I, D>) -> Result<Self, SettingsError> {
-        let SharedStateRecoverableConfig {
-            io,
-            my_address,
-            can_lead,
-            initial_peers,
-            initial_state,
-            settings,
-        } = config;
-
-        let peers = initial_peers
-            .into_iter()
-            .filter(|peer| *peer != my_address)
-            .map(|peer| (peer, PeerState::empty(peer)))
-            .collect::<HashMap<_, _>>();
-
-        let node = Arc::new(NodeState {
-            my_address,
-            can_lead,
-            peers: Mutex::new(peers),
-            state: SubscribableState::new(initial_state, settings.broadcast.clone())?,
-            leader_state: Mutex::new(LeaderState {
-                term: ElectionTerm::default(),
-                mode: LeaderMode::NoLeader,
-            }),
-        });
-
-        let peer_connections = Arc::new(PeerConnections::new(io.clone(), settings.net.clone(), node.clone()));
-        let (actions_tx, actions_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
-        let rpc_server = Arc::new(RpcServer::new(node.clone(), actions_tx.clone()));
-
-        let tasks = vec![
-            rpc_server.start_listener(io.clone(), settings.net.clone()),
-            tokio::spawn(
-                PeerDiscoveryTask::new(node.clone(), peer_connections.clone(), settings.discovery_timing).run(),
-            ),
-            tokio::spawn(LeaderTask::new(node.clone(), settings.leader_timing).run()),
-            tokio::spawn(
-                StateSyncTask::new(node.clone(), peer_connections, io, settings.net, actions_rx, settings.sync_timing)
-                    .run(),
-            ),
-        ];
-
-        Ok(Self {
-            node,
-            actions_tx,
-            tasks,
-        })
-    }
-
-    pub fn my_address(&self) -> I::Address {
-        self.node.my_address
-    }
-
-    pub fn can_lead(&self) -> bool {
-        self.node.can_lead
-    }
-
-    /// The underlying node state, for inspecting peers or leader details.
-    pub fn node(&self) -> &Arc<NodeState<I::Address, D>> {
-        &self.node
-    }
-
-    /// A read handle over the deterministic state.
-    pub fn state_handle(&self) -> StateHandle<D> {
-        self.node.state.create_handle()
-    }
-
-    pub async fn leader_state(&self) -> LeaderState<I::Address> {
-        self.node.leader_state.lock().await.clone()
-    }
-
-    /// Queues an action originating from this node. The sync task applies it
-    /// with authority when leading and forwards it to the leader otherwise.
-    pub async fn submit_action(&self, action: D::Action) -> Result<(), SendError<(I::Address, D::Action)>> {
-        self.actions_tx.send((self.node.my_address, action)).await
-    }
-
-    /// Sender for queueing actions on behalf of other sources.
-    pub fn actions_sender(&self) -> mpsc::Sender<(I::Address, D::Action)> {
-        self.actions_tx.clone()
-    }
+#[derive(Clone, Debug)]
+pub enum OperationStatus<R> {
+    Committed(CommitReceipt<R>),
+    PendingOrUnknown,
+    Retired,
 }
 
-impl<I: SyncIOListener, D: DeterministicState> Drop for SharedState<I, D> {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
+#[derive(Clone, Debug)]
+pub struct NodeConfig {
+    pub node_id: u64,
+    pub cluster_id: uuid::Uuid,
+    pub storage_path: PathBuf,
+    pub max_pending: usize,
+    pub max_command_bytes: usize,
+    pub max_sessions: usize,
+    pub publication_interval: Duration,
+    pub heartbeat: Duration,
+    pub election_min: Duration,
+    pub election_max: Duration,
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{
-        collections::BTreeMap,
-        io::Result,
-        time::{Duration, Instant},
-    };
-
-    use super::*;
-    use crate::{
-        cluster::{leader::LeaderTiming, peer_discovery::PeerDiscoveryTiming, state_sync::StateSyncTiming},
-        state::recoverable_state::RecoverableStateAction,
-        transport::simulated::{SimulatedIo, SimulatedNet},
-    };
-
-    #[derive(Clone, Debug, Default, PartialEq, Eq)]
-    struct KvState {
-        seq: u64,
-        values: BTreeMap<u64, u64>,
-    }
-
-    impl DeterministicState for KvState {
-        type Action = (u64, u64);
-        type AuthorityAction = (u64, u64);
-
-        fn accept_seq(&self) -> u64 {
-            self.seq
-        }
-
-        fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
-            action
-        }
-
-        fn update(&mut self, (key, value): &Self::AuthorityAction) {
-            self.values.insert(*key, *value);
-            self.seq += 1;
-        }
-    }
-
-    impl MessageEncoding for KvState {
-        fn write_to<T: std::io::Write>(&self, out: &mut T) -> Result<usize> {
-            let mut sum = self.seq.write_to(out)?;
-            sum += (self.values.len() as u64).write_to(out)?;
-            for (key, value) in &self.values {
-                sum += key.write_to(out)?;
-                sum += value.write_to(out)?;
-            }
-            Ok(sum)
-        }
-
-        fn read_from<T: std::io::Read>(read: &mut T) -> Result<Self> {
-            let seq = MessageEncoding::read_from(read)?;
-            let len = u64::read_from(read)? as usize;
-            let mut values = BTreeMap::new();
-            for _ in 0..len {
-                values.insert(MessageEncoding::read_from(read)?, MessageEncoding::read_from(read)?);
-            }
-            Ok(Self { seq, values })
-        }
-    }
-
-    fn fast_settings() -> SharedStateSettings {
-        SharedStateSettings {
-            net: NetIoSettings {
-                process_timeout: Duration::from_secs(1),
-                message_timeout: Duration::from_secs(2),
-            },
-            broadcast: SequencedBroadcastSettings::default(),
-            discovery_timing: PeerDiscoveryTiming {
-                observation_interval: Duration::from_millis(50),
-                max_concurrent_observations: 8,
-            },
-            leader_timing: LeaderTiming {
-                tick_interval: Duration::from_millis(25),
-            },
-            sync_timing: StateSyncTiming {
-                leader_poll_interval: Duration::from_millis(20),
-                retry_delay: Duration::from_millis(50),
-            },
-        }
-    }
-
-    async fn start_node(
-        net: &SimulatedNet,
-        address: u64,
-        can_lead: bool,
-        peers: &[u64],
-    ) -> SharedState<SimulatedIo, KvState> {
-        let io = net.start_io(address).await;
-        SharedState::start(SharedStateConfig {
-            io,
-            my_address: address,
-            can_lead,
-            initial_peers: peers.to_vec(),
-            initial_state: KvState::default(),
-            settings: fast_settings(),
-        })
-        .unwrap()
-    }
-
-    async fn wait_for<F: FnMut() -> bool>(what: &str, mut check: F) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !check() {
-            assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    async fn wait_for_value(node: &SharedState<SimulatedIo, KvState>, key: u64, value: u64) {
-        let mut handle = node.state_handle();
-        wait_for(&format!("node {} to see {key}={value}", node.my_address()), || {
-            handle.read_with(|state| state.state().values.get(&key) == Some(&value))
-        })
-        .await;
-    }
-
-    async fn wait_for_state(node: &SharedState<SimulatedIo, KvState>, expected: &BTreeMap<u64, u64>) {
-        let mut handle = node.state_handle();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let actual = handle.read_with(|state| state.state().clone());
-            if actual.seq == expected.len() as u64 && actual.values == *expected {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for node {} to settle on {expected:?}, actual seq {} values {:?}",
-                node.my_address(),
-                actual.seq,
-                actual.values,
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    async fn wait_for_cluster_state(nodes: &[&SharedState<SimulatedIo, KvState>], expected: &BTreeMap<u64, u64>) {
-        for node in nodes {
-            wait_for_state(node, expected).await;
-        }
-    }
-
-    async fn wait_for_common_leader(nodes: &[&SharedState<SimulatedIo, KvState>]) -> u64 {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let mut observed_leader = None;
-            let mut leader_is_leading = false;
-            let mut unsettled = Vec::new();
-
-            for node in nodes {
-                let state = node.leader_state().await;
-                let leader = match state.mode {
-                    LeaderMode::Leading => {
-                        leader_is_leading = true;
-                        node.my_address()
-                    }
-                    LeaderMode::Following { leader } => leader,
-                    _ => {
-                        unsettled.push((node.my_address(), state));
-                        continue;
-                    }
-                };
-
-                if observed_leader.is_some_and(|observed| observed != leader) {
-                    unsettled.push((node.my_address(), state));
-                }
-                observed_leader.get_or_insert(leader);
-            }
-
-            if let Some(leader) = observed_leader
-                && unsettled.is_empty()
-                && leader_is_leading
+impl NodeConfig {
+    pub async fn persistent(storage_path: PathBuf, cluster_id: uuid::Uuid) -> Result<Self, String> {
+        let path = storage_path.clone();
+        let node_id = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut identity_name = path.as_os_str().to_os_string();
+            identity_name.push(".identity");
+            let identity_path = PathBuf::from(identity_name);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&identity_path)
             {
-                return leader;
+                Ok(mut file) => {
+                    let random = uuid::Uuid::new_v4();
+                    let node_id = u64::from_be_bytes(random.as_bytes()[..8].try_into().unwrap());
+                    let bytes = serde_json::to_vec(&(1u32, cluster_id, node_id)).map_err(|e| e.to_string())?;
+                    file.write_all(&bytes).map_err(|e| e.to_string())?;
+                    file.sync_all().map_err(|e| e.to_string())?;
+                    let parent = identity_path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    std::fs::File::open(parent)
+                        .and_then(|f| f.sync_all())
+                        .map_err(|e| e.to_string())?;
+                    Ok(node_id)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let bytes = std::fs::read(&identity_path).map_err(|e| e.to_string())?;
+                    let (format, stored_cluster, node_id): (u32, uuid::Uuid, u64) =
+                        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+                    if format != 1 || stored_cluster != cluster_id {
+                        return Err("node identity format or cluster mismatch".into());
+                    }
+                    Ok(node_id)
+                }
+                Err(error) => Err(error.to_string()),
             }
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        Ok(Self::new(storage_path, cluster_id, node_id))
+    }
 
-            assert!(
-                Instant::now() < deadline,
-                "nodes never settled on a common leader, unsettled states {unsettled:?}",
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    pub fn new(storage_path: PathBuf, cluster_id: uuid::Uuid, node_id: u64) -> Self {
+        Self {
+            node_id,
+            cluster_id,
+            storage_path,
+            max_pending: 128,
+            max_command_bytes: 64 * 1024,
+            max_sessions: 10_000,
+            publication_interval: Duration::from_millis(100),
+            heartbeat: Duration::from_millis(500),
+            election_min: Duration::from_secs(3),
+            election_max: Duration::from_secs(5),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NodeStatus {
+    pub node_id: u64,
+    pub ready: bool,
+    pub leader: Option<u64>,
+    pub revision: Option<Revision>,
+    pub voters: BTreeSet<u64>,
+    pub failure: Option<String>,
+}
+
+#[derive(Clone)]
+struct StatusContext<S: ReplicatedState> {
+    local: u64,
+    cancel: CancellationToken,
+    metrics: watch::Receiver<openraft::RaftMetrics<u64, Peer>>,
+    snapshot: watch::Receiver<SnapshotHandle<S>>,
+    listener: tokio::task::AbortHandle,
+    publisher: tokio::task::AbortHandle,
+    critical: watch::Receiver<Option<String>>,
+}
+
+impl<S: ReplicatedState> StatusContext<S> {
+    fn current(&self) -> NodeStatus {
+        let metrics = self.metrics.borrow().clone();
+        let revision = self.snapshot.borrow().revision;
+        let failure = self
+            .critical
+            .borrow()
+            .clone()
+            .or_else(|| metrics.running_state.err().map(|e| e.to_string()))
+            .or_else(|| {
+                (self.listener.is_finished() && !self.cancel.is_cancelled()).then(|| "RPC listener stopped".into())
+            })
+            .or_else(|| {
+                self.publisher
+                    .is_finished()
+                    .then(|| "publication worker stopped".into())
+            });
+        NodeStatus {
+            node_id: self.local,
+            ready: failure.is_none()
+                && !self.cancel.is_cancelled()
+                && metrics.last_applied.is_some()
+                && revision.is_some(),
+            leader: metrics.current_leader,
+            revision,
+            voters: metrics.membership_config.membership().voter_ids().collect(),
+            failure,
+        }
+    }
+}
+
+pub struct Node<S: ReplicatedState, I: SyncIO<Address = u64>> {
+    raft: Option<Raft>,
+    database: Option<Database>,
+    network: Network<I>,
+    config: NodeConfig,
+    snapshot: watch::Receiver<SnapshotHandle<S>>,
+    sessions: watch::Receiver<BTreeMap<uuid::Uuid, Session>>,
+    admission: Arc<Semaphore>,
+    membership: tokio::sync::Mutex<()>,
+    cancel: CancellationToken,
+    listener: Option<JoinHandle<Result<(), String>>>,
+    publisher: Option<JoinHandle<Result<(), String>>>,
+    critical_failure: watch::Sender<Option<String>>,
+    status_context: StatusContext<S>,
+    status_watch: watch::Receiver<NodeStatus>,
+    status_task: Option<JoinHandle<()>>,
+}
+
+impl<S: ReplicatedState, I: SyncIOListener<Address = u64>> Node<S, I> {
+    pub async fn open(config: NodeConfig, io: Arc<I>, state: S) -> Result<Self, String> {
+        if config.max_pending == 0
+            || config.max_pending > 128
+            || config.publication_interval.is_zero()
+            || config.max_command_bytes == 0
+            || config.max_command_bytes > 64 * 1024
+            || config.max_sessions == 0
+        {
+            return Err("invalid admission limits".into());
+        }
+        let engine = openraft::Config {
+            heartbeat_interval: config
+                .heartbeat
+                .as_millis()
+                .try_into()
+                .map_err(|_| "heartbeat overflow")?,
+            election_timeout_min: config
+                .election_min
+                .as_millis()
+                .try_into()
+                .map_err(|_| "election timeout overflow")?,
+            election_timeout_max: config
+                .election_max
+                .as_millis()
+                .try_into()
+                .map_err(|_| "election timeout overflow")?,
+            max_payload_entries: 2,
+            snapshot_max_chunk_size: 64 * 1024,
+            install_snapshot_timeout: 5_000,
+            ..Default::default()
+        }
+        .validate()
+        .map_err(|e| e.to_string())?;
+        let database = Database::open(&config.storage_path, config.cluster_id, config.node_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let machine = Machine::open(state, database.clone(), config.cluster_id, config.max_sessions)
+            .await
+            .map_err(|e| e.to_string())?;
+        let snapshot = machine.publisher.subscribe();
+        let sessions = machine.sessions.subscribe();
+        let cancel = CancellationToken::new();
+        let network = Network {
+            io: io.clone(),
+            cluster: config.cluster_id,
+            local: config.node_id,
+            schema: S::SCHEMA_VERSION,
+            session_limit: config.max_sessions as u64,
+            cancel: cancel.clone(),
+        };
+        let publication = machine.publication(cancel.clone(), config.publication_interval);
+        let raft = Raft::new(config.node_id, Arc::new(engine), network.clone(), LogStore(database.clone()), machine)
+            .await
+            .map_err(|e| e.to_string())?;
+        let publisher = tokio::spawn(publication);
+        let listener_raft = raft.clone();
+        let listener_cancel = cancel.clone();
+        let cluster = config.cluster_id;
+        let session_limit = config.max_sessions as u64;
+        let local = config.node_id;
+        let listener_database = database.clone();
+        let admission = Arc::new(Semaphore::new(config.max_pending));
+        let ingress_admission = admission.clone();
+        let command_limit = config.max_command_bytes;
+        let listener = tokio::spawn(async move {
+            let mut children = JoinSet::new();
+            let writes = ingress_admission;
+            let snapshots = Arc::new(Semaphore::new(16));
+            let control = Arc::new(Semaphore::new(64));
+            let installs = Arc::new(Semaphore::new(1));
+            loop {
+                tokio::select! {
+                    _ = listener_cancel.cancelled() => break,
+                    child = children.join_next(), if !children.is_empty() => {
+                        if let Some(Err(error)) = child {
+                            children.abort_all();
+                            while children.join_next().await.is_some() {}
+                            return Err(error.to_string());
+                        }
+                    }
+                    incoming = io.next_client(), if children.len() < 256 => {
+                        let mut connection = match incoming {
+                            Ok(connection) => connection,
+                            Err(error) => { children.abort_all(); while children.join_next().await.is_some() {} return Err(error.to_string()); }
+                        };
+                        let raft = listener_raft.clone();
+                        let database = listener_database.clone();
+                        let cancel = listener_cancel.clone();
+                        let writes = writes.clone();
+                        let snapshots = snapshots.clone();
+                        let control = control.clone();
+                        let installs = installs.clone();
+                        children.spawn(async move {
+                            let serve = async {
+                                let source = protocol::verify(&mut connection.read, cluster, local, S::SCHEMA_VERSION, session_limit).await?;
+                                protocol::hello(&mut connection.write, cluster, local, source, S::SCHEMA_VERSION, session_limit).await?;
+                                use tokio::io::AsyncReadExt;
+                                let lane = connection.read.read_u8().await?;
+                                let _permit = match lane {
+                                    0 => control.try_acquire(),
+                                    1 => writes.try_acquire(),
+                                    2 => snapshots.try_acquire(),
+                                    _ => return Err(std::io::Error::other("invalid RPC lane")),
+                                }.map_err(|_| std::io::Error::other("RPC lane full"))?;
+                                let request: Request = protocol::read(&mut connection.read).await?;
+                                if request.lane() != lane { return Err(std::io::Error::other("RPC lane mismatch")); }
+                                let response = match request {
+                                    Request::Append(rpc) => WireResponse::Append(raft.append_entries(rpc).await),
+                                    Request::Vote(rpc) => WireResponse::Vote(raft.vote(rpc).await),
+                                    Request::Snapshot(rpc) => {
+                                        if rpc.offset.saturating_add(rpc.data.len() as u64) > 256 * 1024 * 1024 || rpc.data.len() > 64 * 1024 {
+                                            WireResponse::Rejected("snapshot limit exceeded".into())
+                                        } else { WireResponse::Snapshot(raft.install_snapshot(rpc).await) }
+                                    }
+                                    Request::SnapshotBegin { meta, bytes } => {
+                                        let existing = database.snapshot_manifest().await.map_err(std::io::Error::other)?;
+                                        let offset = if existing.as_ref().is_some_and(|(current, size)| *current == meta && *size == bytes) {
+                                            bytes
+                                        } else {
+                                            database.resume_snapshot(meta, bytes).await.map_err(std::io::Error::other)?
+                                        };
+                                        WireResponse::SnapshotOffset(offset)
+                                    }
+                                    Request::SnapshotPart { snapshot_id, offset, data, digest } => {
+                                        use sha2::{Digest, Sha256};
+                                        if Sha256::digest(&data).as_slice() != digest.as_slice() {
+                                            WireResponse::Rejected("snapshot chunk digest mismatch".into())
+                                        } else {
+                                            WireResponse::SnapshotOffset(database.receive_chunk(snapshot_id, offset, data).await.map_err(std::io::Error::other)?)
+                                        }
+                                    }
+                                    Request::SnapshotEnd { vote, meta } => {
+                                        use sha2::{Digest, Sha256};
+                                        let _install = installs.try_acquire().map_err(|_| std::io::Error::other("snapshot install busy"))?;
+                                        let current = database.snapshot_manifest().await.map_err(std::io::Error::other)?;
+                                        let bytes = if current.as_ref().is_some_and(|(current, _)| *current == meta) {
+                                            database.snapshot().await.map_err(std::io::Error::other)?.ok_or_else(|| std::io::Error::other("snapshot missing"))?.1
+                                        } else {
+                                            database.assembled_snapshot(meta.snapshot_id.clone()).await.map_err(std::io::Error::other)?
+                                        };
+                                        if format!("{:x}", Sha256::digest(&bytes)) != meta.snapshot_id {
+                                            WireResponse::Rejected("snapshot digest mismatch".into())
+                                        } else {
+                                            WireResponse::SnapshotInstalled(raft.install_full_snapshot(vote, openraft::Snapshot { meta, snapshot: Box::new(std::io::Cursor::new(bytes)) }).await)
+                                        }
+                                    }
+                                    Request::Feed { after } => {
+                                        use openraft::{RaftLogReader, storage::RaftLogStorage};
+                                        let mut log = LogStore(database.clone());
+                                        let metrics = raft.metrics().borrow().clone();
+                                        let state = log.get_log_state().await.map_err(std::io::Error::other)?;
+                                        let compatible = match after {
+                                            None => false,
+                                            Some(after) if metrics.last_applied.is_some_and(|x| after.index <= x.index) => {
+                                                let entry = log.try_get_log_entries(after.index..=after.index).await.map_err(std::io::Error::other)?;
+                                                entry.first().is_some_and(|e| e.log_id == after) || state.last_purged_log_id == Some(after)
+                                            }
+                                            _ => false,
+                                        };
+                                        if !compatible { WireResponse::SnapshotRequired }
+                                        else {
+                                            let start = after.unwrap().index.checked_add(1).ok_or_else(|| std::io::Error::other("revision overflow"))?;
+                                            let checkpoint = database.snapshot_manifest().await.map_err(std::io::Error::other)?.map(|(meta, _)| meta);
+                                            let mut end = metrics.last_applied.unwrap().index.saturating_add(1).min(start.saturating_add(2));
+                                            if let Some(base) = checkpoint.as_ref().and_then(|meta| meta.last_log_id)
+                                                && base.index >= start { end = end.min(base.index.saturating_add(1)); }
+                                            let entries = log.try_get_log_entries(start..end).await.map_err(std::io::Error::other)?;
+                                            if entries.len() as u64 != end.saturating_sub(start) { WireResponse::SnapshotRequired }
+                                            else { WireResponse::Feed { entries, applied: metrics.last_applied, leader: metrics.current_leader, checkpoint } }
+                                        }
+                                    }
+                                    Request::Checkpoint => match database.snapshot_manifest().await.map_err(std::io::Error::other)? {
+                                        Some((meta, bytes)) => WireResponse::Manifest { meta, bytes },
+                                        None => WireResponse::Rejected("checkpoint unavailable".into()),
+                                    },
+                                    Request::Manifest { preferred } => {
+                                        use openraft::storage::RaftLogStorage;
+                                        let purged = LogStore(database.clone()).get_log_state().await.map_err(std::io::Error::other)?.last_purged_log_id;
+                                        match database.lease_snapshot(preferred.clone()).await.map_err(std::io::Error::other)? {
+                                            Some((meta, bytes)) if meta.last_log_id.is_some() && (preferred.is_some() || meta.last_log_id >= purged) => WireResponse::Manifest { meta, bytes },
+                                            _ => { let _ = raft.trigger().snapshot().await; WireResponse::Rejected("snapshot pending".into()) }
+                                        }
+                                    }
+                                    Request::Chunk { snapshot_id, offset } => {
+                                        use sha2::{Digest, Sha256};
+                                        match database.snapshot_chunk(snapshot_id.clone(), offset, 256 * 1024).await {
+                                            Ok(data) => {
+                                                let digest = Sha256::digest(&data).to_vec();
+                                                WireResponse::Chunk { snapshot_id, offset, data, digest }
+                                            }
+                                            Err(_) => WireResponse::Rejected("snapshot expired".into()),
+                                        }
+                                    }
+                                    Request::Write(command) => {
+                                        if command.payload.len() > command_limit || (!command.retire && serde_json::from_slice::<S::Command>(&command.payload).is_err()) {
+                                            WireResponse::Rejected("invalid command".into())
+                                        } else { WireResponse::Write(raft.client_write(command).await) }
+                                    }
+                                };
+                                protocol::write(&mut connection.write, &response).await
+                            };
+                            tokio::select! {
+                                _ = cancel.cancelled() => {},
+                                result = tokio::time::timeout(Duration::from_secs(5), serve) => {
+                                    if let Ok(Err(error)) = result { tracing::debug!(%error, "RPC failed"); }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            children.abort_all();
+            while children.join_next().await.is_some() {}
+            Ok(())
+        });
+        let (critical_failure, critical) = watch::channel(None);
+        let status_context = StatusContext {
+            local: config.node_id,
+            cancel: cancel.clone(),
+            metrics: raft.metrics(),
+            snapshot: snapshot.clone(),
+            listener: listener.abort_handle(),
+            publisher: publisher.abort_handle(),
+            critical,
+        };
+        let (status_tx, status_watch) = watch::channel(status_context.current());
+        let mut monitor = status_context.clone();
+        let status_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = monitor.cancel.cancelled() => break,
+                    result = monitor.metrics.changed() => if result.is_err() { break; },
+                    _ = interval.tick() => {},
+                }
+                let next = monitor.current();
+                let previous = status_tx.borrow().leader;
+                if previous != next.leader {
+                    tracing::info!(node = monitor.local, previous = ?previous, leader = ?next.leader, "leadership changed");
+                }
+                status_tx.send_replace(next);
+            }
+            let mut final_status = monitor.current();
+            final_status.ready = false;
+            status_tx.send_replace(final_status);
+        });
+        Ok(Self {
+            raft: Some(raft),
+            database: Some(database),
+            network,
+            admission,
+            membership: tokio::sync::Mutex::new(()),
+            config,
+            snapshot,
+            sessions,
+            cancel,
+            listener: Some(listener),
+            publisher: Some(publisher),
+            critical_failure,
+            status_context,
+            status_watch,
+            status_task: Some(status_task),
+        })
+    }
+}
+
+impl<S: ReplicatedState, I: SyncIO<Address = u64>> Node<S, I> {
+    fn raft(&self) -> &Raft {
+        self.raft.as_ref().expect("node is running")
+    }
+
+    pub async fn bootstrap(&self, voters: BTreeMap<u64, u64>) -> Result<(), String> {
+        let _membership = self.membership.lock().await;
+        if voters.len() != 3 && voters.len() != 5 {
+            return Err("bootstrap requires three or five voters".into());
+        }
+        if voters.values().copied().collect::<BTreeSet<_>>().len() != voters.len() {
+            return Err("voter addresses must be distinct".into());
+        }
+        if !voters.contains_key(&self.config.node_id) {
+            return Err("bootstrap node must be an initial voter".into());
+        }
+        self.raft()
+            .initialize(
+                voters
+                    .into_iter()
+                    .map(|(id, address)| (id, Peer { address }))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn read_snapshot(&self) -> SnapshotHandle<S> {
+        self.snapshot.borrow().clone()
+    }
+
+    pub fn status(&self) -> NodeStatus {
+        let mut status = self.status_context.current();
+        if self.status_task.as_ref().is_some_and(|task| task.is_finished()) && !self.cancel.is_cancelled() {
+            status.ready = false;
+            status.failure = Some("status worker stopped".into());
+        }
+        status
+    }
+
+    pub fn watch_status(&self) -> watch::Receiver<NodeStatus> {
+        self.status_watch.clone()
+    }
+
+    pub async fn submit(
+        &self,
+        operation: Operation<S::Command>,
+        deadline: Instant,
+    ) -> Result<CommitReceipt<S::Result>, SubmitError> {
+        let id = operation.id;
+        let reject = |reason: &str| SubmitError::NotAdmitted { reason: reason.into() };
+        if self.cancel.is_cancelled() || self.status().failure.is_some() {
+            return Err(reject("node unavailable"));
+        }
+        if deadline <= Instant::now() {
+            return Err(reject("deadline exceeded"));
+        }
+        let _permit = self.admission.try_acquire().map_err(|_| reject("admission full"))?;
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let bytes = protocol::canonical(&operation.command, self.config.max_command_bytes)?;
+            let _: S::Command = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+            Ok::<_, std::io::Error>(bytes)
+        }))
+        .map_err(|_| reject("command codec panicked"))?
+        .map_err(|_| reject("command encoding failed or size limit exceeded"))?;
+        if payload.len() > self.config.max_command_bytes {
+            return Err(reject("command limit exceeded"));
+        }
+        let response = self
+            .send_command(
+                Command {
+                    operation: id,
+                    payload,
+                    retire: false,
+                },
+                deadline,
+            )
+            .await?;
+        let result =
+            serde_json::from_slice(&response.result).map_err(|_| SubmitError::OutcomeUnknown { operation_id: id })?;
+        Ok(CommitReceipt {
+            operation_id: id,
+            revision: Revision::new(response.revision.expect("applied command has revision"), self.config.cluster_id),
+            result,
+        })
+    }
+
+    pub async fn retire_session(&self, id: OperationId, deadline: Instant) -> Result<CommitReceipt<()>, SubmitError> {
+        let _permit = self.admission.try_acquire().map_err(|_| SubmitError::NotAdmitted {
+            reason: "admission full".into(),
+        })?;
+        let response = self
+            .send_command(
+                Command {
+                    operation: id,
+                    payload: Vec::new(),
+                    retire: true,
+                },
+                deadline,
+            )
+            .await?;
+        Ok(CommitReceipt {
+            operation_id: id,
+            revision: Revision::new(response.revision.expect("retirement has revision"), self.config.cluster_id),
+            result: (),
+        })
+    }
+
+    async fn send_command(&self, command: Command, deadline: Instant) -> Result<super::Response, SubmitError> {
+        let id = command.operation;
+        let reject = |reason: &str| SubmitError::NotAdmitted { reason: reason.into() };
+        if deadline <= Instant::now() || self.cancel.is_cancelled() || self.status().failure.is_some() {
+            return Err(reject("node unavailable or deadline exceeded"));
+        }
+        let metrics = self.raft().metrics().borrow().clone();
+        let leader = metrics.current_leader.ok_or_else(|| reject("no known leader"))?;
+        let peer = metrics
+            .membership_config
+            .membership()
+            .get_node(&leader)
+            .cloned()
+            .ok_or_else(|| reject("leader has no route"))?;
+        let result = tokio::select! {
+            _ = self.cancel.cancelled() => return Err(SubmitError::OutcomeUnknown { operation_id: id }),
+            result = timeout_at(deadline, async {
+                if leader == self.config.node_id { self.raft().client_write(command).await.map_err(|_| ()) }
+                else {
+                    match self.network.request(leader, &peer, Request::Write(command), deadline).await {
+                        Ok(WireResponse::Write(Ok(response))) => Ok(response),
+                        _ => Err(()),
+                    }
+                }
+            }) => result,
+        };
+        let response = result
+            .map_err(|_| SubmitError::OutcomeUnknown { operation_id: id })?
+            .map_err(|_| SubmitError::OutcomeUnknown { operation_id: id })?
+            .data;
+        if let Some(reason) = &response.error {
+            return Err(SubmitError::SessionRejected { reason: reason.clone() });
+        }
+        if self.status().failure.is_some() || self.cancel.is_cancelled() {
+            return Err(SubmitError::OutcomeUnknown { operation_id: id });
+        }
+        tracing::debug!(client = %id.client_id, sequence = id.sequence, revision = ?response.revision, "operation committed");
+        Ok(response)
+    }
+
+    pub fn operation_status(&self, id: OperationId) -> OperationStatus<S::Result> {
+        let sessions = self.sessions.borrow();
+        let Some(session) = sessions.get(&id.client_id) else {
+            return OperationStatus::PendingOrUnknown;
+        };
+        if session.retired || id.sequence < session.sequence {
+            return OperationStatus::Retired;
+        }
+        if session.sequence != id.sequence {
+            return OperationStatus::PendingOrUnknown;
+        }
+        match serde_json::from_slice(&session.response.result) {
+            Ok(result) => OperationStatus::Committed(CommitReceipt {
+                operation_id: id,
+                revision: Revision::new(
+                    session.response.revision.expect("session has revision"),
+                    self.config.cluster_id,
+                ),
+                result,
+            }),
+            Err(_) => OperationStatus::PendingOrUnknown,
         }
     }
 
-    async fn wait_for_leader(nodes: &[&SharedState<SimulatedIo, KvState>], leader: u64) {
-        for node in nodes {
-            let deadline = Instant::now() + Duration::from_secs(30);
+    pub async fn wait_for_revision(&self, revision: Revision, deadline: Instant) -> Result<(), String> {
+        if revision.cluster != self.config.cluster_id {
+            return Err("revision belongs to another cluster".into());
+        }
+        let mut snapshot = self.snapshot.clone();
+        tokio::select! {
+            _ = self.cancel.cancelled() => Err("node shutting down".into()),
+            result = timeout_at(deadline, async {
+                loop {
+                    if snapshot.borrow().revision.is_some_and(|r| r.index >= revision.index) { return Ok(()); }
+                    snapshot.changed().await.map_err(|_| "state owner stopped".to_owned())?;
+                }
+            }) => result.map_err(|_| "revision deadline exceeded".to_owned())?,
+        }
+    }
+
+    pub async fn checkpoint(&self, deadline: Instant) -> Result<(), String> {
+        let target = self
+            .raft()
+            .metrics()
+            .borrow()
+            .last_applied
+            .ok_or("no committed state")?;
+        self.raft().trigger().snapshot().await.map_err(|e| e.to_string())?;
+        let mut metrics = self.raft().metrics();
+        timeout_at(deadline, async {
             loop {
-                let state = node.leader_state().await;
-                let settled = match &state.mode {
-                    LeaderMode::Leading => node.my_address() == leader,
-                    LeaderMode::Following { leader: followed } => *followed == leader,
-                    _ => false,
-                };
-                if settled {
+                if metrics.borrow().snapshot.is_some_and(|log| log.index >= target.index) {
+                    return Ok(());
+                }
+                metrics.changed().await.map_err(|_| "consensus stopped".to_owned())?;
+            }
+        })
+        .await
+        .map_err(|_| "snapshot deadline exceeded".to_owned())?
+    }
+
+    /// Compare retained voter checkpoints after all voters reach the same quiesced barrier.
+    /// A content mismatch stops this node; differing checkpoint revisions require another comparison.
+    pub async fn verify_voter_checkpoints(&self, deadline: Instant) -> Result<(), String> {
+        let database = self.database.as_ref().ok_or("node stopped")?;
+        let (local, _) = database
+            .snapshot_manifest()
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or("no local checkpoint")?;
+        let metrics = self.raft().metrics().borrow().clone();
+        for id in metrics.membership_config.membership().voter_ids() {
+            if id == self.config.node_id {
+                continue;
+            }
+            let peer = metrics
+                .membership_config
+                .membership()
+                .get_node(&id)
+                .ok_or("voter route missing")?;
+            let response = self
+                .network
+                .request(id, peer, Request::Checkpoint, deadline)
+                .await
+                .map_err(|e| e.to_string())?;
+            let WireResponse::Manifest { meta, .. } = response else {
+                return Err("voter checkpoint unavailable".into());
+            };
+            if meta.last_log_id != local.last_log_id {
+                return Err("voter checkpoint revisions differ".into());
+            }
+            if meta.snapshot_id != local.snapshot_id {
+                let error = "voting state machines disagree at the same committed revision".to_owned();
+                self.critical_failure.send_replace(Some(error.clone()));
+                self.cancel.cancel();
+                tracing::error!(peer = id, revision = ?local.last_log_id, "voter checkpoint mismatch");
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn replace_voter(&self, old: u64, new: u64, address: u64, deadline: Instant) -> Result<(), String> {
+        timeout_at(deadline, async {
+            let _membership = self.membership.lock().await;
+            let mut voters = self.status().voters;
+            if !voters.remove(&old) || voters.contains(&new) || new == old {
+                return Err("invalid replacement voter identities".into());
+            }
+            if self.status().leader != Some(self.config.node_id) {
+                return Err("membership changes require the leader".into());
+            }
+            let metrics = self.raft().metrics().borrow().clone();
+            if metrics
+                .membership_config
+                .membership()
+                .nodes()
+                .any(|(id, peer)| *id != new && peer.address == address)
+            {
+                return Err("replacement address already belongs to a member".into());
+            }
+            // Initial application state is outside the log. Force learners to install its complete checkpoint.
+            self.checkpoint(deadline).await?;
+            let base = self.raft().metrics().borrow().snapshot.ok_or("checkpoint missing")?;
+            self.raft()
+                .trigger()
+                .purge_log(base.index)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut metrics = self.raft().metrics();
+            loop {
+                if metrics.borrow().purged.is_some_and(|log| log.index >= base.index) {
                     break;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "node {} never settled on leader {leader}, last state {state:?}",
-                    node.my_address(),
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                metrics.changed().await.map_err(|_| "consensus stopped".to_owned())?;
             }
-        }
-    }
-
-    #[tokio::test]
-    async fn cluster_replicates_actions_from_any_node() {
-        let net = SimulatedNet::new();
-        let node1 = start_node(&net, 1, true, &[2, 3]).await;
-        let node2 = start_node(&net, 2, true, &[1, 3]).await;
-        let node3 = start_node(&net, 3, false, &[1]).await;
-
-        wait_for_leader(&[&node1, &node2, &node3], 1).await;
-
-        /* leader applies its own action with authority */
-        node1.submit_action((10, 100)).await.unwrap();
-        wait_for_value(&node1, 10, 100).await;
-        wait_for_value(&node2, 10, 100).await;
-        wait_for_value(&node3, 10, 100).await;
-
-        /* followers forward actions to the leader */
-        node2.submit_action((20, 200)).await.unwrap();
-        node3.submit_action((30, 300)).await.unwrap();
-        for node in [&node1, &node2, &node3] {
-            wait_for_value(node, 20, 200).await;
-            wait_for_value(node, 30, 300).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn start_recoverable_preserves_initial_recovery_details() {
-        let net = SimulatedNet::new();
-        let io = net.start_io(1).await;
-
-        let mut initial_state = RecoverableState::new(101, KvState::default());
-        initial_state.update(&RecoverableStateAction::StateAction { action: (1, 10) });
-        initial_state.update(&RecoverableStateAction::BumpGeneration { new_id: 202 });
-        initial_state.update(&RecoverableStateAction::StateAction { action: (2, 20) });
-        let expected_details = initial_state.details().clone();
-
-        let node = SharedState::start_recoverable(SharedStateRecoverableConfig {
-            io,
-            my_address: 1,
-            can_lead: true,
-            initial_peers: Vec::new(),
-            initial_state,
-            settings: fast_settings(),
+            self.raft()
+                .add_learner(new, Peer { address }, true)
+                .await
+                .map_err(|e| e.to_string())?;
+            voters.insert(new);
+            self.raft()
+                .change_membership(voters, false)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(())
         })
-        .unwrap();
-
-        let mut handle = node.state_handle();
-        let actual_details = handle.recover_details();
-
-        assert_eq!(actual_details, expected_details);
+        .await
+        .map_err(|_| "membership outcome unknown".to_owned())?
     }
 
-    #[tokio::test]
-    async fn follower_relays_through_peer_when_leader_is_unreachable() {
-        let net = SimulatedNet::new();
-        let node1 = start_node(&net, 1, true, &[2, 3]).await;
-        let node2 = start_node(&net, 2, true, &[1, 3]).await;
-        let node3 = start_node(&net, 3, false, &[1, 2]).await;
-
-        wait_for_leader(&[&node1, &node2, &node3], 1).await;
-
-        node1.submit_action((1, 1)).await.unwrap();
-        wait_for_value(&node3, 1, 1).await;
-
-        /* sever the direct path between the observer and the leader; node 3
-         * must sync and forward actions through node 2 */
-        net.set_edge_blocked(1, 3, true).await;
-
-        node1.submit_action((2, 2)).await.unwrap();
-        wait_for_value(&node3, 2, 2).await;
-
-        node3.submit_action((3, 3)).await.unwrap();
-        wait_for_value(&node1, 3, 3).await;
-        wait_for_value(&node2, 3, 3).await;
-        wait_for_value(&node3, 3, 3).await;
-    }
-
-    #[tokio::test]
-    async fn follower_recovers_when_leader_link_goes_silent() {
-        let net = SimulatedNet::new();
-        let node1 = start_node(&net, 1, true, &[2, 3]).await;
-        let node2 = start_node(&net, 2, true, &[1, 3]).await;
-        let node3 = start_node(&net, 3, false, &[1, 2]).await;
-
-        wait_for_leader(&[&node1, &node2, &node3], 1).await;
-        node1.submit_action((1, 1)).await.unwrap();
-        wait_for_value(&node3, 1, 1).await;
-
-        /* silently stall the observer's link to the leader, like a half-open
-         * TCP connection: connections stay up but carry no bytes. The
-         * subscription must time out instead of idling forever, and sync must
-         * continue through node 2 */
-        net.set_edge_blackholed(1, 3, true).await;
-
-        node1.submit_action((2, 2)).await.unwrap();
-        wait_for_value(&node3, 2, 2).await;
-
-        /* the observer's actions must still reach the leader via the relay */
-        node3.submit_action((3, 3)).await.unwrap();
-        wait_for_value(&node1, 3, 3).await;
-        wait_for_value(&node2, 3, 3).await;
-    }
-
-    #[tokio::test]
-    async fn old_leader_rejoins_as_follower_and_its_actions_apply() {
-        let net = SimulatedNet::new();
-        let node1 = start_node(&net, 1, true, &[2, 3]).await;
-        let node2 = start_node(&net, 2, true, &[1, 3]).await;
-        let node3 = start_node(&net, 3, true, &[1, 2]).await;
-
-        wait_for_leader(&[&node1, &node2, &node3], 1).await;
-        node1.submit_action((1, 1)).await.unwrap();
-        wait_for_value(&node3, 1, 1).await;
-
-        /* partition the leader away; the others elect node 2 */
-        net.set_node_blocked(1, true).await;
-        wait_for_leader(&[&node2, &node3], 2).await;
-
-        node2.submit_action((2, 2)).await.unwrap();
-        wait_for_value(&node3, 2, 2).await;
-
-        /* heal the partition; node 1 must concede and follow node 2 */
-        net.set_node_blocked(1, false).await;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let state = node1.leader_state().await;
-            if matches!(state.mode, LeaderMode::Following { leader: 2 }) {
-                break;
-            }
-            assert!(Instant::now() < deadline, "node 1 never conceded to node 2, last state {state:?}");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        wait_for_value(&node1, 2, 2).await;
-
-        /* the moved follower's actions must reach the new leader */
-        node1.submit_action((3, 3)).await.unwrap();
-        wait_for_value(&node1, 3, 3).await;
-        wait_for_value(&node2, 3, 3).await;
-        wait_for_value(&node3, 3, 3).await;
-    }
-
-    #[tokio::test]
-    async fn observer_actions_apply_after_leader_change() {
-        let net = SimulatedNet::new();
-        let node1 = start_node(&net, 1, true, &[2, 3, 4]).await;
-        let node2 = start_node(&net, 2, true, &[1, 3, 4]).await;
-        let node3 = start_node(&net, 3, true, &[1, 2, 4]).await;
-        let node4 = start_node(&net, 4, false, &[1, 2, 3]).await;
-
-        wait_for_leader(&[&node1, &node2, &node3, &node4], 1).await;
-
-        node4.submit_action((1, 1)).await.unwrap();
-        wait_for_value(&node1, 1, 1).await;
-        wait_for_value(&node4, 1, 1).await;
-
-        /* leader dies; observer must move to the new leader and its actions
-         * must keep applying */
-        net.set_node_blocked(1, true).await;
-        net.stop_node(1).await;
-        drop(node1);
-
-        wait_for_leader(&[&node2, &node3, &node4], 2).await;
-
-        node4.submit_action((2, 2)).await.unwrap();
-        wait_for_value(&node2, 2, 2).await;
-        wait_for_value(&node3, 2, 2).await;
-        wait_for_value(&node4, 2, 2).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn action_flood_during_failover_does_not_wedge_sync() {
-        let net = SimulatedNet::new();
-        let node1 = Arc::new(start_node(&net, 1, true, &[2, 3]).await);
-        let node2 = Arc::new(start_node(&net, 2, true, &[1, 3]).await);
-        let node3 = Arc::new(start_node(&net, 3, true, &[1, 2]).await);
-
-        let old_leader = wait_for_common_leader(&[&node1, &node2, &node3]).await;
-        let (survivor_a, survivor_b, new_leader, moved_follower) = match old_leader {
-            1 => (node2.clone(), node3.clone(), 2, node3.clone()),
-            2 => (node1.clone(), node3.clone(), 1, node3.clone()),
-            3 => (node1.clone(), node2.clone(), 1, node2.clone()),
-            _ => unreachable!("test only starts nodes 1, 2, and 3"),
-        };
-
-        /* keep a continuous stream of actions flowing from both survivors
-         * while the leader dies; the sync tasks must still notice the leader
-         * change instead of forwarding in circles forever */
-        let flood = {
-            let survivor_a = survivor_a.clone();
-            let survivor_b = survivor_b.clone();
-            tokio::spawn(async move {
-                let mut i = 0u64;
-                loop {
-                    let _ = survivor_a.submit_action((1000 + i, i)).await;
-                    let _ = survivor_b.submit_action((2000 + i, i)).await;
-                    i += 1;
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+    pub async fn shutdown(mut self, deadline: Instant) -> Result<(), String> {
+        self.cancel.cancel();
+        self.admission.close();
+        timeout_at(deadline, async {
+            let mut failures = Vec::new();
+            if let Some(listener) = self.listener.take() {
+                match listener.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => failures.push(error),
+                    Err(error) => failures.push(error.to_string()),
                 }
-            })
-        };
-
-        net.set_node_blocked(old_leader, true).await;
-        net.stop_node(old_leader).await;
-        flood.abort();
-
-        wait_for_leader(&[&survivor_a, &survivor_b], new_leader).await;
-
-        /* after the failover flood, a fresh action from the moved follower
-         * must not be wedged behind stale routing state */
-        moved_follower.submit_action((1, 1)).await.unwrap();
-        wait_for_value(&survivor_a, 1, 1).await;
-        wait_for_value(&survivor_b, 1, 1).await;
+            }
+            if let Some(publisher) = self.publisher.take() {
+                match publisher.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => failures.push(error),
+                    Err(error) => failures.push(error.to_string()),
+                }
+            }
+            if let Some(status_task) = self.status_task.take()
+                && let Err(error) = status_task.await
+            {
+                failures.push(error.to_string());
+            }
+            if let Some(raft) = self.raft.take()
+                && let Err(error) = raft.shutdown().await
+            {
+                failures.push(error.to_string());
+            }
+            if let Some(database) = self.database.take()
+                && let Err(error) = database.shutdown().await
+            {
+                failures.push(error.to_string());
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(failures.join("; "))
+            }
+        })
+        .await
+        .map_err(|_| "shutdown deadline exceeded".to_owned())?
     }
+}
 
-    #[tokio::test]
-    async fn cluster_recovers_after_leader_failure() {
-        let net = SimulatedNet::new();
-        let node1 = start_node(&net, 1, true, &[2, 3]).await;
-        let node2 = start_node(&net, 2, true, &[1, 3]).await;
-        let node3 = start_node(&net, 3, true, &[1, 2]).await;
-
-        wait_for_leader(&[&node1, &node2, &node3], 1).await;
-
-        node1.submit_action((1, 1)).await.unwrap();
-        wait_for_value(&node2, 1, 1).await;
-        wait_for_value(&node3, 1, 1).await;
-
-        /* leader goes down: the survivors elect node 2 and keep accepting
-         * actions */
-        net.set_node_blocked(1, true).await;
-        net.stop_node(1).await;
-        drop(node1);
-
-        wait_for_leader(&[&node2, &node3], 2).await;
-
-        node3.submit_action((2, 2)).await.unwrap();
-        wait_for_value(&node2, 2, 2).await;
-        wait_for_value(&node3, 2, 2).await;
-    }
-
-    #[tokio::test]
-    async fn five_node_cluster_replicates_from_all_nodes_after_leader_failure() {
-        let net = SimulatedNet::new();
-        let node1 = start_node(&net, 1, true, &[2, 3, 4, 5]).await;
-        let node2 = start_node(&net, 2, true, &[1, 3, 4, 5]).await;
-        let node3 = start_node(&net, 3, true, &[1, 2, 4, 5]).await;
-        let node4 = start_node(&net, 4, false, &[1, 2, 3, 5]).await;
-        let node5 = start_node(&net, 5, false, &[1, 2, 3, 4]).await;
-
-        let all_nodes = [&node1, &node2, &node3, &node4, &node5];
-        let first_leader = wait_for_common_leader(&all_nodes).await;
-        assert_eq!(first_leader, 1);
-
-        let mut expected = BTreeMap::new();
-        for node in all_nodes {
-            let key = 100 + node.my_address();
-            let value = key * 10;
-            node.submit_action((key, value)).await.unwrap();
-            expected.insert(key, value);
-        }
-        wait_for_cluster_state(&[&node1, &node2, &node3, &node4, &node5], &expected).await;
-
-        net.set_node_blocked(first_leader, true).await;
-        net.stop_node(first_leader).await;
-        drop(node1);
-
-        let remaining_nodes = [&node2, &node3, &node4, &node5];
-        let second_leader = wait_for_common_leader(&remaining_nodes).await;
-        assert_ne!(second_leader, first_leader);
-        assert_eq!(second_leader, 2);
-
-        for node in remaining_nodes {
-            let key = 200 + node.my_address();
-            let value = key * 10;
-            node.submit_action((key, value)).await.unwrap();
-            expected.insert(key, value);
-        }
-        wait_for_cluster_state(&[&node2, &node3, &node4, &node5], &expected).await;
+impl<S: ReplicatedState, I: SyncIO<Address = u64>> Drop for Node<S, I> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.admission.close();
     }
 }

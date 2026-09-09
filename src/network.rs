@@ -205,8 +205,8 @@ impl<I: SyncIO<Address = u64>> RaftNetwork<TypeConfig> for Client<I> {
 mod tests {
     use super::*;
     use crate::{
+        storage::Database,
         transport::{simulated::SimulatedNet, traits::SyncIOListener},
-        v4::storage::Database,
     };
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncReadExt;

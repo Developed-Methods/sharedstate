@@ -1,4 +1,4 @@
-# v4 architecture decisions
+# architecture decisions
 
 ## Commitment and reads
 
@@ -6,7 +6,6 @@ Successful writes require majority commitment and leader application.
 Local reads may be stale and include their committed revision.
 Applications implement deterministic commands without external side effects.
 Immutable `Arc` snapshots let retained readers coexist with subsequent publication.
-The legacy authority callback can depend on stale state; migration requires auditing that dependency.
 
 ## Membership and bootstrap
 
@@ -39,4 +38,3 @@ Target three or five durable voters, 20–50 readers, and approximately 60 MB of
 The benchmark uses 60 MiB as a conservative approximation.
 The production write rate is unspecified; throughput measurements do not establish an admission target.
 Measure command rate, clone cost, memory, RTT, disk latency, and transfer bandwidth.
-Keep the existing production entry point until the experimental implementation passes its integration gates.

@@ -1,8 +1,7 @@
-#![cfg(feature = "experimental-v4")]
 use serde::{Deserialize, Serialize};
 use sharedstate::{
+    Node, NodeConfig, ReplicatedState,
     transport::{simulated::SimulatedNet, traits::SyncIO},
-    v4::{Node, NodeConfig, ReplicatedState},
 };
 use std::time::Duration;
 use tokio::time::Instant;

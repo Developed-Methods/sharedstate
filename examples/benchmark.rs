@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sharedstate::{
-    transport::simulated::SimulatedNet,
-    v4::{Node, NodeConfig, Operation, OperationId, ReadReplica, ReplicatedState},
+    Node, NodeConfig, Operation, OperationId, ReadReplica, ReplicatedState, transport::simulated::SimulatedNet,
 };
 use std::{collections::BTreeMap, time::Duration};
 use tokio::time::Instant;

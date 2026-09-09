@@ -504,7 +504,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v4::{
+    use crate::{
         TypeConfig,
         machine::{Machine, ReplicatedState},
     };

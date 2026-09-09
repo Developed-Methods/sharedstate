@@ -1,4 +1,4 @@
-# v4 invariants
+# invariants
 
 | ID | Contract |
 |---|---|

@@ -1,9 +1,5 @@
-#![cfg(feature = "experimental-v4")]
 use serde::{Deserialize, Serialize};
-use sharedstate::{
-    transport::simulated::SimulatedNet,
-    v4::{Node, NodeConfig, Operation, OperationId, ReplicatedState},
-};
+use sharedstate::{Node, NodeConfig, Operation, OperationId, ReplicatedState, transport::simulated::SimulatedNet};
 use std::{collections::BTreeMap, time::Duration};
 use tokio::time::Instant;
 

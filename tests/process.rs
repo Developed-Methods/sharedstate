@@ -1,4 +1,3 @@
-#![cfg(feature = "experimental-v4")]
 use std::{collections::BTreeMap, process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
@@ -13,7 +12,7 @@ struct Process {
 }
 impl Process {
     async fn start(path: &std::path::Path, cluster: uuid::Uuid, id: u64, port: u16) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_v4-counter"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_sharedstate-counter"))
             .arg(path)
             .arg(cluster.to_string())
             .arg(id.to_string())

@@ -1,4 +1,4 @@
-# Local upgrade measurements
+# Local workload measurements
 
 Target: three or five voters, 20–50 readers, approximately 60 MB of state.
 The production write rate has not been specified.
@@ -64,5 +64,5 @@ No simultaneous full-cluster recovery measurement establishes the plan's 60-seco
 RTT, durable-write latency, clone duration, and replay headroom require separate instrumentation and deployment measurements.
 The current full-state cloning and JSON snapshots remain resource risks for frequent publication.
 
-Run `cargo run --release --locked --features experimental-v4 --example v4_benchmark -- 20 60 1000 3` to reproduce the workload.
+Run `cargo run --release --locked --example benchmark -- 20 60 1000 3` to reproduce the workload.
 Use a larger environment before running 50 full-state readers together.

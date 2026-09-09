@@ -1,4 +1,4 @@
-name: Upgrade validation
+name: Validation
 
 on:
   pull_request:
@@ -20,4 +20,4 @@ jobs:
         with:
           toolchain: 1.98.0
           components: rustfmt, clippy
-      - run: bash scripts/validate-upgrade.sh
+      - run: bash scripts/validate.sh

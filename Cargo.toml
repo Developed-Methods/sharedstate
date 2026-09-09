@@ -1,44 +1,28 @@
 [package]
 name = "sharedstate"
-version = "3.0.0"
+version = "4.0.0"
 edition = "2024"
 authors = ["Patrick Lorio <patrick@methods.dev>"]
 description = "Sync heavily read state across many servers"
 repository = "https://github.com/Developed-Methods/sharedstate"
 license-file = "LICENSE.txt"
 
-[features]
-experimental-v4 = ["dep:openraft", "dep:rusqlite", "dep:serde_json", "dep:sha2", "dep:uuid", "dep:base64"]
-
 [dependencies]
-base64 = { version = "=0.22.1", optional = true }
-openraft = { version = "=0.9.25", features = ["serde", "storage-v2"], optional = true }
-rusqlite = { version = "0.32", features = ["bundled", "blob"], optional = true }
-serde_json = { version = "1", optional = true }
-sha2 = { version = "0.10", optional = true }
-uuid = { version = "1", features = ["v4", "serde"], optional = true }
-message-encoding = "0.2.4"
-sequenced-broadcast = "0.3.0"
+base64 = { version = "=0.22.1" }
+openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
+rusqlite = { version = "0.32", features = ["bundled", "blob"] }
+serde_json = { version = "1" }
+sha2 = { version = "0.10" }
+uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1.40", features = ["full"] }
 tokio-util = "0.7.12"
-futures-util = "0.3.31"
 tracing = "0.1.40"
-hotread = "0.1.1"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1.40", features = ["full", "test-util"] }
-tracing-subscriber = "0.3"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "std"] }
-crossterm = "0.29.0"
-unicode-width = "0.2.2"
 
 [[bin]]
-name = "v4-counter"
-path = "tools/v4_counter.rs"
-required-features = ["experimental-v4"]
-
-[[example]]
-name = "v4_benchmark"
-required-features = ["experimental-v4"]
+name = "sharedstate-counter"
+path = "tools/counter.rs"

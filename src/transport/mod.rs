@@ -1,5 +1,4 @@
-//! Network transport traits, channel workers, and simulated transport.
+//! Transport interfaces and simulated networking.
 
-pub mod channels;
 pub mod simulated;
 pub mod traits;

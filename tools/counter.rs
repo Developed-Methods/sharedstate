@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sharedstate::v4::{Node, NodeConfig, Operation, OperationId, ReplicatedState, TcpTransport};
+use sharedstate::{Node, NodeConfig, Operation, OperationId, ReplicatedState, TcpTransport};
 use std::{collections::BTreeMap, io::Write, net::SocketAddrV4, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -22,7 +22,7 @@ impl ReplicatedState for Counter {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 5 {
-        return Err("usage: v4-counter DATABASE CLUSTER_UUID NODE_ID IPV4:PORT".into());
+        return Err("usage: sharedstate-counter DATABASE CLUSTER_UUID NODE_ID IPV4:PORT".into());
     }
     let node = Node::open(
         NodeConfig::new(args[1].clone().into(), args[2].parse()?, args[3].parse()?),

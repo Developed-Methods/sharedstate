@@ -1,4 +1,4 @@
-# Experimental v4 protocol contract
+# protocol contract
 
 The implementation pins Openraft 0.9.25 with its storage-v2 trait API.
 Application-facing types hide the engine configuration and wire types.
@@ -61,4 +61,3 @@ Shutdown cancels ingress and awaits cooperative workers before closing storage.
 A blocked application callback or physical disk operation can outlive a shutdown deadline.
 An expired shutdown deadline reports incomplete cleanup.
 Dropping a handle requests cancellation; it does not certify that cleanup completed.
-The remaining fault and capacity gates appear in the [workflow](../upgrade/workflow.md).

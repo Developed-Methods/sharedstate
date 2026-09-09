@@ -1,9 +1,7 @@
-#![cfg(feature = "experimental-v4")]
-
 use serde::{Deserialize, Serialize};
 use sharedstate::{
+    Node, NodeConfig, Operation, OperationId, OperationStatus, ReplicatedState, SubmitError,
     transport::simulated::{SimulatedIo, SimulatedNet},
-    v4::{Node, NodeConfig, Operation, OperationId, OperationStatus, ReplicatedState, SubmitError},
 };
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::time::Instant;
@@ -248,7 +246,7 @@ async fn t09_explicit_replacement_and_no_automatic_bootstrap() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_replicas_install_verified_base_and_follow_committed_suffix() {
-    use sharedstate::v4::ReadReplica;
+    use sharedstate::ReadReplica;
     let cluster = Cluster::new().await;
     let leader = cluster.leader(None).await;
     let client_id = uuid::Uuid::new_v4();
@@ -427,7 +425,7 @@ impl ReplicatedState for DivergentCounter {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t21_checkpoint_mismatch_recovers_from_verified_snapshot() {
-    use sharedstate::v4::ReadReplica;
+    use sharedstate::ReadReplica;
     let cluster = Cluster::new().await;
     let leader = cluster.leader(None).await;
     let client_id = uuid::Uuid::new_v4();

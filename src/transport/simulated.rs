@@ -3,8 +3,8 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc as StdArc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
@@ -12,8 +12,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{duplex, split, AsyncRead, AsyncWrite, DuplexStream, ReadBuf, ReadHalf, WriteHalf},
-    sync::{mpsc, oneshot, Mutex},
+    io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, ReadHalf, WriteHalf, duplex, split},
+    sync::{Mutex, mpsc, oneshot},
 };
 
 use crate::transport::traits::{SyncConnection, SyncIO, SyncIOListener};
@@ -157,11 +157,7 @@ impl SimulatedNet {
     }
 
     pub fn edge_key(a: u64, b: u64) -> (u64, u64) {
-        if a < b {
-            (a, b)
-        } else {
-            (b, a)
-        }
+        if a < b { (a, b) } else { (b, a) }
     }
 }
 
@@ -224,8 +220,12 @@ impl SyncIO for SimulatedIo {
         let (client, server) = duplex(64 * 1024);
         let (client_read, client_write) = split(client);
         let (server_read, server_write) = split(server);
-        let [(client_read_handle, client_read_kill), (client_write_handle, client_write_kill), (server_read_handle, server_read_kill), (server_write_handle, server_write_kill)] =
-            handles;
+        let [
+            (client_read_handle, client_read_kill),
+            (client_write_handle, client_write_kill),
+            (server_read_handle, server_read_kill),
+            (server_write_handle, server_write_kill),
+        ] = handles;
         drop((client_read_handle, client_write_handle, server_read_handle, server_write_handle));
 
         tx.send(SimulatedIncoming {
@@ -330,7 +330,13 @@ impl<I> KillableIo<I> {
                 self.blackhole_delay = Some(Box::pin(tokio::time::sleep(BLACKHOLE_POLL_INTERVAL)));
             }
 
-            match self.blackhole_delay.as_mut().expect("delay initialized").as_mut().poll(cx) {
+            match self
+                .blackhole_delay
+                .as_mut()
+                .expect("delay initialized")
+                .as_mut()
+                .poll(cx)
+            {
                 Poll::Ready(()) => {
                     self.blackhole_delay = None;
                 }
