@@ -53,6 +53,18 @@ where
     }
 
     pub async fn tick(&mut self) {
+        // Keep pin changes serialized with the entire election decision.
+        let pinned = self.state.pinned_leader.lock().await;
+        if let Some(leader) = *pinned {
+            let mode = self.state.pinned_leader_mode(leader).await;
+            let mut state = self.state.leader_state.lock().await;
+            if state.mode != mode {
+                tracing::info!(?leader, ?mode, "pinned leader state updated");
+                state.mode = mode;
+            }
+            return;
+        }
+
         let my_recovery = self.state.state.recovery_details().await;
 
         let (me, peer_views) = {
