@@ -1,918 +1,366 @@
 use std::{
-    cmp::Reverse,
-    collections::{HashMap, HashSet},
-    sync::Arc,
+    io,
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
+use message_encoding::MessageEncoding;
+use tokio::time::Instant;
+
 use crate::{
-    cluster::node_state::{ConnectStatus, NodeState, PeerState},
-    protocol::messages::{ElectionTerm, LeaderState},
-    state::{deterministic_state::DeterministicState, recoverable_state::RecoverableStateDetails},
-    transport::traits::SyncIOAddress,
+    cluster::{
+        election::{EtcdElection, EtcdElectionConfig, Observation, Session},
+        node_state::{ConnectStatus, ElectionStatus, NodeState},
+        peer_connections::PeerConnections,
+    },
+    protocol::messages::{LeadershipEpoch, SyncRequest, SyncResponse},
+    state::{deterministic_state::DeterministicState, recoverable_state::RecoverableStateAction},
+    transport::traits::SyncIO,
+    utils::unique_state_id,
 };
 
 pub use crate::protocol::messages::LeaderMode;
 
-#[derive(Clone, Debug)]
-pub struct LeaderTiming {
-    pub tick_interval: Duration,
+pub struct EtcdLeaderTask<I: SyncIO, D: DeterministicState> {
+    state: Arc<NodeState<I::Address, D>>,
+    peers: Arc<PeerConnections<I, D>>,
+    config: EtcdElectionConfig,
 }
 
-impl Default for LeaderTiming {
-    fn default() -> Self {
-        Self {
-            tick_interval: Duration::from_millis(250),
-        }
-    }
-}
-
-pub struct LeaderTask<A, D>
+impl<I, D> EtcdLeaderTask<I, D>
 where
-    A: SyncIOAddress,
-    D: DeterministicState,
+    I: SyncIO,
+    D: DeterministicState + MessageEncoding,
+    D::Action: MessageEncoding,
+    D::AuthorityAction: MessageEncoding,
 {
-    state: Arc<NodeState<A, D>>,
-    timing: LeaderTiming,
-}
-
-impl<A, D> LeaderTask<A, D>
-where
-    A: SyncIOAddress,
-    D: DeterministicState,
-{
-    pub fn new(state: Arc<NodeState<A, D>>, timing: LeaderTiming) -> Self {
-        Self { state, timing }
+    pub fn new(
+        state: Arc<NodeState<I::Address, D>>,
+        peers: Arc<PeerConnections<I, D>>,
+        config: EtcdElectionConfig,
+    ) -> Self {
+        Self { state, peers, config }
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(self) {
         loop {
-            self.tick().await;
-            tokio::time::sleep(self.timing.tick_interval).await;
+            let result = match EtcdElection::connect(self.config.clone()).await {
+                Ok(mut election) => self.participate(&mut election).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                self.state.revoke_authority(Some(error.to_string()));
+                tracing::warn!(%error, "etcd election unavailable");
+            }
+            tokio::time::sleep(self.retry_delay()).await;
         }
     }
 
-    pub async fn tick(&mut self) {
-        let my_recovery = self.state.state.recovery_details().await;
+    fn retry_delay(&self) -> Duration {
+        let mut random = [0; 2];
+        let _ = getrandom::fill(&mut random);
+        Duration::from_millis(100 + u16::from_le_bytes(random) as u64 % 400)
+    }
 
-        let (me, peer_views) = {
-            let peers = self.state.peers.lock().await;
+    async fn participate(&self, election: &mut EtcdElection<I::Address>) -> io::Result<()> {
+        loop {
+            let observation = election.observe().await?;
+            let vacant = observation.owner.is_none();
+            self.observe(observation).await;
+            if vacant && self.state.can_lead && self.state.eligible.load(Ordering::Acquire) {
+                tokio::time::sleep(self.retry_delay()).await;
+                if let Some(mut session) = election.acquire(self.state.my_address).await? {
+                    self.publish_local(&session);
+                    self.own(election, &mut session).await?;
+                }
+            }
+        }
+    }
 
-            /* count, per address, how many connected peers report reaching
-             * it; a peer that over a third of reporters can reach is treated
-             * as reachable even when our own dial to it failed, so a local
-             * connectivity problem doesn't trigger a cluster-wide election */
-            let (reporter_count, reach_table) = peers
-                .values()
-                .filter(|peer| peer.connect_status.is_connected())
-                .filter_map(|peer| peer.leader_info.as_ref())
-                .fold((0u32, HashMap::<A, u32>::new()), |(count, mut table), info| {
-                    for addr in &info.reachable_voters {
-                        *table.entry(*addr).or_insert(0) += 1;
-                    }
-                    (count + 1, table)
-                });
-
-            let report_threshold = reporter_count / 3;
-
-            let peer_views = peers
-                .values()
-                .map(|peer| {
-                    let reported_reachable =
-                        report_threshold < reach_table.get(&peer.addr).copied().unwrap_or(0);
-                    PeerView::new(peer, reported_reachable)
-                })
-                .collect::<Vec<_>>();
-
-            let me = PeerView {
-                addr: self.state.my_address,
-                is_voter: self.state.can_lead,
-                connected: true,
-                unreachable: false,
-                leader_state: None,
-                recovery: Some(my_recovery),
-                /* mirrors the reachable_voters list peers receive from us in
-                 * LeaderInfo so we score ourselves the way peers score us */
-                reachable: peers
-                    .values()
-                    .filter(|peer| peer.connect_status.is_connected())
-                    .map(|peer| peer.addr)
-                    .chain([self.state.my_address])
-                    .collect(),
-            };
-
-            (me, peer_views)
-        };
-
-        let mut leader_state = self.state.leader_state.lock().await;
-
-        let next = if self.state.can_lead {
-            next_voter_state(&me, &leader_state, &peer_views)
+    async fn observe(&self, observation: Observation<I::Address>) {
+        let status = if let Some(owner) = observation.owner {
+            if owner.address != self.state.my_address {
+                self.state.note_known_peer_activity(owner.address).await;
+            }
+            ElectionStatus {
+                owner: Some(owner.address),
+                epoch: owner.epoch,
+                ready: owner.ready,
+                valid_until: Some(observation.valid_until),
+                permit: None,
+                error: None,
+            }
         } else {
-            next_observer_state(&leader_state, &peer_views)
+            ElectionStatus::default()
         };
-
-        if *leader_state != next {
-            tracing::info!(previous = ?*leader_state, ?next, "leader state updated");
-            *leader_state = next;
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct PeerView<A: SyncIOAddress> {
-    addr: A,
-    is_voter: bool,
-    connected: bool,
-    unreachable: bool,
-    leader_state: Option<LeaderState<A>>,
-    recovery: Option<RecoverableStateDetails>,
-    reachable: Vec<A>,
-}
-
-impl<A: SyncIOAddress> PeerView<A> {
-    fn new(peer: &PeerState<A>, reported_reachable: bool) -> Self {
-        /* a peer only counts as unreachable when our own dial failed and the
-         * rest of the cluster doesn't vouch for it either */
-        let unreachable =
-            matches!(peer.connect_status, ConnectStatus::FailedToConnect { .. }) && !reported_reachable;
-        let known_can_lead = peer
-            .can_lead
-            .or(peer.leader_info.as_ref().map(|info| info.can_lead));
-
-        Self {
-            addr: peer.addr,
-            /* until we learn a peer's can_lead, assume it votes so we don't
-             * claim leadership before discovery settles; unreachable peers
-             * with unknown status are excluded so they can't block elections */
-            is_voter: known_can_lead.unwrap_or(!unreachable),
-            connected: peer.connect_status.is_connected(),
-            unreachable,
-            leader_state: peer.leader_info.as_ref().map(|info| info.leader_state.clone()),
-            recovery: peer.leader_info.as_ref().map(|info| info.recovery_details.clone()),
-            reachable: peer
-                .leader_info
-                .as_ref()
-                .map(|info| info.reachable_voters.clone())
-                .unwrap_or_default(),
-        }
+        self.state.set_election_status(status);
     }
 
-    fn mode_at_term(&self, term: ElectionTerm) -> Option<&LeaderMode<A>> {
-        /* full term identity (number and nonce): claims from a same-numbered
-         * term started by a different root never count here */
-        self.leader_state
-            .as_ref()
-            .and_then(|state| (state.term == term).then_some(&state.mode))
-    }
-}
-
-/// Decides the next leader state for a node that can lead.
-///
-/// Convergence comes from deterministic rules that every voter applies to the
-/// same gossiped data:
-///  - the election term only moves forward, everyone adopts the highest seen
-///    (ordered by term number, then nonce)
-///  - terms with the same number but a different nonce come from different
-///    election roots: their claims and votes never carry over, and a leader
-///    that observes a conflicting root at its own term number starts a fresh
-///    election in a strictly higher term instead of being overridden
-///  - a voter votes for the reachable candidate that can recover the most
-///    known peer states, then the best connected one, and finally falls back
-///    to the lowest address, so votes can't tie
-///  - leadership requires a strict majority of the known voter set, and
-///    conflicting claims in one term resolve to the lowest address without
-///    bumping the term (term bumps are reserved for leader failure and
-///    conflicting election roots)
-fn next_voter_state<A: SyncIOAddress>(
-    me: &PeerView<A>,
-    current: &LeaderState<A>,
-    peers: &[PeerView<A>],
-) -> LeaderState<A> {
-    let voters = || peers.iter().filter(|peer| peer.is_voter);
-    let seen_terms = || voters().filter_map(|peer| peer.leader_state.as_ref().map(|state| state.term));
-
-    let term = seen_terms()
-        .chain(std::iter::once(current.term))
-        .max()
-        .unwrap();
-
-    /* our term number was also reached by a different root (same number,
-     * different nonce); if we hold a leadership claim it must not be merged
-     * away or fought over, so trigger a new election that both roots adopt */
-    if matches!(current.mode, LeaderMode::Leading)
-        && term.term() == current.term.term()
-        && seen_terms().any(|seen| seen.term() == current.term.term() && seen != current.term)
-    {
-        tracing::warn!(
-            term = %current.term,
-            "a different election root reached our term number, starting a new election"
-        );
-        return LeaderState {
-            term: term.bump(),
-            mode: LeaderMode::Electing { vote: None },
-        };
+    fn publish_local(&self, session: &Session<I::Address>) {
+        self.state.set_election_status(ElectionStatus {
+            owner: Some(session.owner.address),
+            epoch: session.owner.epoch,
+            ready: session.owner.ready,
+            valid_until: Some(session.permit.deadline()),
+            permit: Some(session.permit.clone()),
+            error: None,
+        });
     }
 
-    let mode = if term == current.term {
-        current.mode.clone()
-    } else {
-        /* a new term number, or the same number from a different root:
-         * either way our old mode is meaningless there */
-        LeaderMode::Electing { vote: None }
-    };
-
-    let voter_count = voters().count() + 1;
-    let has_majority = |supporters: usize| voter_count < supporters * 2;
-
-    /* a Leading claim at the current term is authoritative (it required a
-     * majority); if partitions merge with two claims, the lowest address wins */
-    let peer_claim = voters()
-        .filter(|peer| peer.connected)
-        .filter(|peer| matches!(peer.mode_at_term(term), Some(LeaderMode::Leading)))
-        .map(|peer| peer.addr)
-        .min();
-
-    match mode {
-        LeaderMode::Leading => {
-            let reachable_count = voters().filter(|peer| !peer.unreachable).count() + 1;
-            if !has_majority(reachable_count) {
-                tracing::warn!(
-                    %term,
-                    voter_count,
-                    reachable_count,
-                    "lost contact with voter majority, stepping down"
-                );
-                return LeaderState {
-                    term: term.bump(),
-                    mode: LeaderMode::Electing { vote: None },
-                };
-            }
-
-            match peer_claim {
-                Some(leader) if leader < me.addr => {
-                    tracing::warn!(?leader, %term, "conceding to lower address leading the same term");
-                    LeaderState {
-                        term,
-                        mode: LeaderMode::Following { leader },
+    async fn own(&self, election: &mut EtcdElection<I::Address>, session: &mut Session<I::Address>) -> io::Result<()> {
+        let preparation = self.prepare(session.owner.epoch);
+        tokio::pin!(preparation);
+        let promotion_deadline = Instant::now() + self.config.promotion_timeout;
+        let mut prepared = false;
+        let mut preparation_done = false;
+        let mut next_renewal = Instant::now() + self.config.renewal_interval;
+        let result = async {
+        loop {
+            if !session.permit.valid() { return Err(io::Error::other("leadership permit expired")); }
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(session.permit.deadline()) => {
+                    return Err(io::Error::other("leadership permit expired"));
+                }
+                _ = tokio::time::sleep_until(next_renewal) => {
+                    election.renew(session).await?;
+                    self.publish_local(session);
+                    next_renewal = Instant::now() + self.config.renewal_interval;
+                }
+                _ = tokio::time::sleep_until(promotion_deadline), if !prepared => {
+                    return Err(io::Error::other("promotion timed out; recover state before retrying"));
+                }
+                result = &mut preparation, if !preparation_done => {
+                    preparation_done = true;
+                    result?;
+                    election.publish_ready(session).await?;
+                    if !session.permit.valid() { return Err(io::Error::other("permit expired while publishing readiness")); }
+                    prepared = true;
+                    self.publish_local(session);
+                }
+                observation = election.observe() => {
+                    let observation = observation?;
+                    if observation.owner.as_ref() != Some(&session.owner) {
+                        return Err(io::Error::other("etcd ownership changed"));
                     }
                 }
-                _ => LeaderState {
-                    term,
-                    mode: LeaderMode::Leading,
-                },
             }
         }
-        LeaderMode::Following { leader } => {
-            if let Some(claim) = peer_claim {
-                return LeaderState {
-                    term,
-                    mode: LeaderMode::Following { leader: claim },
-                };
-            }
-
-            let leader_view = peers.iter().find(|peer| peer.addr == leader);
-
-            if leader_view.map(|peer| peer.unreachable).unwrap_or(true) {
-                tracing::warn!(?leader, %term, "leader is unreachable, starting a new election");
-                return LeaderState {
-                    term: term.bump(),
-                    mode: LeaderMode::Electing { vote: None },
-                };
-            }
-
-            match leader_view.and_then(|peer| peer.mode_at_term(term)) {
-                /* leader conceded to someone else this term, go with it */
-                Some(LeaderMode::Following { leader: new_leader }) => LeaderState {
-                    term,
-                    mode: LeaderMode::Following { leader: *new_leader },
-                },
-                /* leader gave up its claim (e.g. restarted and re-joined the
-                 * term), rejoin the election so votes can settle */
-                Some(LeaderMode::Electing { .. }) | Some(LeaderMode::NoLeader) => LeaderState {
-                    term,
-                    mode: LeaderMode::Electing { vote: None },
-                },
-                /* still leading, or we only have stale info from another term */
-                Some(LeaderMode::Leading) | None => LeaderState {
-                    term,
-                    mode: LeaderMode::Following { leader },
-                },
-            }
+        }.await;
+        // Finish admitted state mutations after revocation to preserve state and broadcast consistency.
+        self.state
+            .revoke_authority(result.as_ref().err().map(ToString::to_string));
+        session.permit.revoke();
+        let _ = election.revoke(session).await;
+        if !preparation_done {
+            let _ = preparation.await;
         }
-        LeaderMode::Electing { .. } | LeaderMode::NoLeader => {
-            if let Some(leader) = peer_claim {
-                return LeaderState {
-                    term,
-                    mode: LeaderMode::Following { leader },
-                };
-            }
-
-            /* prefer the candidate whose state can recover the most known
-             * peers (so the fewest nodes start fresh), then the one with the
-             * best connectivity to voters, then the lowest address */
-            let known_states = peers
-                .iter()
-                .chain([me])
-                .filter_map(|peer| peer.recovery.as_ref())
-                .collect::<Vec<_>>();
-            let voter_addrs = voters()
-                .map(|peer| peer.addr)
-                .chain([me.addr])
-                .collect::<HashSet<_>>();
-
-            let score = |candidate: &PeerView<A>| {
-                let recoverable = candidate
-                    .recovery
-                    .as_ref()
-                    .map(|details| {
-                        known_states
-                            .iter()
-                            .filter(|follower| details.can_recover_follower(follower))
-                            .count()
-                    })
-                    .unwrap_or(0);
-                let connectivity = candidate
-                    .reachable
-                    .iter()
-                    .filter(|addr| voter_addrs.contains(addr))
-                    .count();
-                (recoverable, connectivity)
-            };
-
-            let vote = voters()
-                .filter(|peer| peer.connected)
-                .chain([me])
-                .max_by_key(|candidate| (score(candidate), Reverse(candidate.addr)))
-                .map(|candidate| candidate.addr)
-                .expect("candidates always include self");
-
-            if vote == me.addr {
-                let support = 1 + voters()
-                    .filter(|peer| peer.connected)
-                    .filter(|peer| match peer.mode_at_term(term) {
-                        Some(LeaderMode::Electing { vote: Some(vote) }) => *vote == me.addr,
-                        Some(LeaderMode::Following { leader }) => *leader == me.addr,
-                        _ => false,
-                    })
-                    .count();
-
-                if has_majority(support) {
-                    tracing::info!(%term, support, voter_count, "won election with voter majority");
-                    return LeaderState {
-                        term,
-                        mode: LeaderMode::Leading,
-                    };
-                }
-            }
-
-            LeaderState {
-                term,
-                mode: LeaderMode::Electing { vote: Some(vote) },
-            }
-        }
+        result
     }
-}
 
-/// Decides the next leader state for a node that cannot lead. Observers never
-/// vote; they mirror what the connected voters report, preferring a direct
-/// Leading claim and falling back to the most-followed address.
-fn next_observer_state<A: SyncIOAddress>(current: &LeaderState<A>, peers: &[PeerView<A>]) -> LeaderState<A> {
-    let voter_states = peers
-        .iter()
-        .filter(|peer| peer.is_voter && peer.connected)
-        .filter_map(|peer| peer.leader_state.as_ref().map(|state| (peer.addr, state)))
-        .collect::<Vec<_>>();
-
-    let Some(term) = voter_states.iter().map(|(_, state)| state.term).max() else {
-        return current.clone();
-    };
-
-    let claimed = voter_states
-        .iter()
-        .filter(|(_, state)| state.term == term && matches!(state.mode, LeaderMode::Leading))
-        .map(|(addr, _)| *addr)
-        .min();
-
-    let followed = voter_states
-        .iter()
-        .filter(|(_, state)| state.term == term)
-        .filter_map(|(_, state)| match &state.mode {
-            LeaderMode::Following { leader } => Some(*leader),
-            _ => None,
-        })
-        .fold(HashMap::<A, usize>::new(), |mut counts, leader| {
-            *counts.entry(leader).or_default() += 1;
-            counts
-        })
-        .into_iter()
-        .max_by_key(|(addr, count)| (*count, std::cmp::Reverse(*addr)))
-        .map(|(addr, _)| addr);
-
-    let mode = match claimed.or(followed) {
-        Some(leader) => LeaderMode::Following { leader },
-        None => LeaderMode::NoLeader,
-    };
-
-    LeaderState { term, mode }
+    async fn prepare(&self, epoch: LeadershipEpoch) -> io::Result<()> {
+        // Resolve available peer metadata before comparing histories; the promotion deadline bounds this wait.
+        loop {
+            if !self.state.election_status().valid() {
+                return Err(io::Error::other("permit expired while awaiting recovery metadata"));
+            }
+            let pending = self.state.peers.lock().await.values().any(|peer| {
+                peer.leader_info.is_none() && !matches!(peer.connect_status, ConnectStatus::FailedToConnect { .. })
+            });
+            if !pending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut local = self.state.state.settled_recovery_details().await;
+        let peers = self
+            .state
+            .peers
+            .lock()
+            .await
+            .values()
+            .filter_map(|peer| {
+                peer.leader_info
+                    .as_ref()
+                    .filter(|info| info.recovery_initialized)
+                    .map(|info| (peer.addr, info.recovery_details.clone()))
+            })
+            .collect::<Vec<_>>();
+        let mut required = Vec::new();
+        for (address, details) in &peers {
+            if local.can_recover_follower(details) {
+                continue;
+            }
+            if !details.can_recover_follower(&local) {
+                return Err(io::Error::other("promotion blocked by conflicting recovery histories"));
+            }
+            required.push(*address);
+        }
+        for address in required {
+            let response = self
+                .peers
+                .send_rpc(address, SyncRequest::RecoverySnapshot)
+                .await
+                .map_err(|error| io::Error::other(format!("promotion recovery failed: {error:?}")))?;
+            let SyncResponse::RecoverySnapshot(snapshot) = response else {
+                return Err(io::Error::other("promotion source rejected snapshot request"));
+            };
+            if local.can_recover_follower(snapshot.details()) {
+                continue;
+            }
+            if !snapshot.details().can_recover_follower(&local) {
+                return Err(io::Error::other("promotion snapshot conflicts with local history"));
+            }
+            local = snapshot.details().clone();
+            if !self.state.reset_preparing(epoch, snapshot).await {
+                return Err(io::Error::other("permit expired during promotion recovery"));
+            }
+        }
+        let latest_peers = self
+            .state
+            .peers
+            .lock()
+            .await
+            .values()
+            .filter_map(|peer| peer.leader_info.as_ref())
+            .filter(|info| info.recovery_initialized)
+            .map(|info| info.recovery_details.clone())
+            .collect::<Vec<_>>();
+        if latest_peers.iter().any(|details| !local.can_recover_follower(details)) {
+            return Err(io::Error::other("promotion cannot recover known peer histories"));
+        }
+        if !self
+            .state
+            .update_preparing(
+                epoch,
+                RecoverableStateAction::BumpGeneration {
+                    new_id: unique_state_id(&self.state.my_address),
+                },
+            )
+            .await
+        {
+            return Err(io::Error::other("permit expired before promotion generation bump"));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        cluster::{node_state::PeerState, rpc_server::RpcServer},
+        protocol::messages::{LeaderInfo, LeaderState},
+        state::{recoverable_state::RecoverableState, subscribable_state::SubscribableState},
+        transport::{
+            channels::NetIoSettings,
+            simulated::{SimulatedIo, SimulatedNet},
+        },
+    };
+    use std::{
+        collections::HashMap,
+        sync::{RwLock, atomic::AtomicBool},
+    };
+    use tokio::sync::{Mutex, Notify, mpsc};
 
-    fn ls(term: u64, mode: LeaderMode<u16>) -> LeaderState<u16> {
-        LeaderState { term: ElectionTerm::from_term(term), mode }
-    }
-
-    fn ls_root(term: u64, nonce: u32, mode: LeaderMode<u16>) -> LeaderState<u16> {
-        LeaderState { term: ElectionTerm::from_parts(term, nonce), mode }
-    }
-
-    /* all test voters share the same recoverable state by default so scores
-     * tie and the address tiebreak decides, matching a healthy cluster */
-    fn shared_recovery() -> RecoverableStateDetails {
-        RecoverableStateDetails::new(7, 1)
-    }
-
-    fn voter(addr: u16, state: Option<LeaderState<u16>>) -> PeerView<u16> {
-        PeerView {
-            addr,
-            is_voter: true,
-            connected: true,
-            unreachable: false,
-            leader_state: state,
-            recovery: Some(shared_recovery()),
-            reachable: vec![],
+    #[derive(Clone)]
+    struct Counter(u64);
+    impl DeterministicState for Counter {
+        type Action = u64;
+        type AuthorityAction = u64;
+        fn accept_seq(&self) -> u64 {
+            self.0
+        }
+        fn authority(&self, action: u64) -> u64 {
+            action
+        }
+        fn update(&mut self, _: &u64) {
+            self.0 += 1;
         }
     }
-
-    fn me(addr: u16) -> PeerView<u16> {
-        voter(addr, None)
-    }
-
-    fn unreachable(mut peer: PeerView<u16>) -> PeerView<u16> {
-        peer.connected = false;
-        peer.unreachable = true;
-        peer
-    }
-
-    fn electing(vote: u16) -> LeaderMode<u16> {
-        LeaderMode::Electing { vote: Some(vote) }
-    }
-
-    fn following(leader: u16) -> LeaderMode<u16> {
-        LeaderMode::Following { leader }
-    }
-
-    fn assert_logical_state(actual: LeaderState<u16>, term: u64, mode: LeaderMode<u16>) {
-        assert_eq!(actual.term.term(), term);
-        assert_eq!(actual.mode, mode);
-    }
-
-    #[test]
-    fn lone_voter_becomes_leader() {
-        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &[]);
-        assert_eq!(next, ls(0, LeaderMode::Leading));
-    }
-
-    #[test]
-    fn waits_for_reachable_peers_with_unknown_status() {
-        let peers = [PeerView {
-            addr: 2,
-            is_voter: true,
-            connected: false,
-            unreachable: false,
-            leader_state: None,
-            recovery: None,
-            reachable: vec![],
-        }];
-
-        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &peers);
-        assert_eq!(next, ls(0, electing(1)));
-    }
-
-    #[test]
-    fn unreachable_peers_do_not_block_election() {
-        let peers = [unreachable(voter(2, None)), unreachable(voter(3, None))];
-
-        /* 2 of 3 voters unreachable: still just electing, no majority */
-        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &peers);
-        assert_eq!(next, ls(0, electing(1)));
-
-        /* but a peer we never learned anything about is not a voter */
-        let mut unknown = unreachable(voter(9, None));
-        unknown.is_voter = false;
-        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &[unknown]);
-        assert_eq!(next, ls(0, LeaderMode::Leading));
-    }
-
-    #[test]
-    fn votes_for_lowest_reachable_address() {
-        let peers = [voter(1, None), voter(3, None)];
-        let next = next_voter_state(&me(2), &ls(4, LeaderMode::Electing { vote: None }), &peers);
-        assert_eq!(next, ls(4, electing(1)));
-    }
-
-    #[test]
-    fn skips_unreachable_candidates() {
-        let peers = [unreachable(voter(1, None)), voter(3, None)];
-        let next = next_voter_state(&me(2), &ls(4, LeaderMode::Electing { vote: None }), &peers);
-        assert_eq!(next, ls(4, electing(2)));
-    }
-
-    #[test]
-    fn does_not_vote_for_candidate_with_unknown_recovery_state() {
-        /* peer 1 is reachable but hasn't shared its recovery details yet, so
-         * it can't be preferred over ourselves */
-        let mut unknown = voter(1, None);
-        unknown.recovery = None;
-
-        let next = next_voter_state(&me(2), &ls(4, LeaderMode::Electing { vote: None }), &[unknown]);
-        assert_eq!(next, ls(4, electing(2)));
-    }
-
-    #[test]
-    fn prefers_candidate_that_can_recover_more_voters() {
-        let other_root = RecoverableStateDetails::new(9, 1);
-
-        /* voter 3 shares state with voters 4 and 5; we can only recover
-         * ourselves, so 3 wins the vote despite its higher address */
-        let mut candidate = voter(3, None);
-        candidate.recovery = Some(other_root.clone());
-        let mut peer4 = voter(4, None);
-        peer4.recovery = Some(other_root.clone());
-        let mut peer5 = voter(5, None);
-        peer5.recovery = Some(other_root);
-
-        let mut myself = me(1);
-        myself.recovery = Some(RecoverableStateDetails::new(5, 1));
-
-        let peers = [candidate, peer4, peer5];
-        let next = next_voter_state(&myself, &ls(4, LeaderMode::Electing { vote: None }), &peers);
-        assert_eq!(next, ls(4, electing(3)));
-    }
-
-    #[test]
-    fn prefers_candidate_with_better_voter_connectivity() {
-        /* equal recovery scores: voter 2 reaches every voter while voter 1
-         * only reaches itself, so 2 wins despite its higher address */
-        let mut peer1 = voter(1, None);
-        peer1.reachable = vec![1];
-        let mut peer2 = voter(2, None);
-        peer2.reachable = vec![1, 2, 3];
-
-        let peers = [peer1, peer2];
-        let next = next_voter_state(&me(3), &ls(4, LeaderMode::Electing { vote: None }), &peers);
-        assert_eq!(next, ls(4, electing(2)));
-    }
-
-    #[test]
-    fn connectivity_only_counts_voters() {
-        /* voter 2's longer reach list is padded with non-voter addresses, so
-         * it doesn't beat voter 1 */
-        let mut peer1 = voter(1, None);
-        peer1.reachable = vec![1, 2];
-        let mut peer2 = voter(2, None);
-        peer2.reachable = vec![2, 100, 101, 102];
-
-        let peers = [peer1, peer2];
-        let next = next_voter_state(&me(3), &ls(4, LeaderMode::Electing { vote: None }), &peers);
-        assert_eq!(next, ls(4, electing(1)));
-    }
-
-    #[test]
-    fn wins_election_with_majority() {
-        let peers = [voter(2, Some(ls(4, electing(1)))), voter(3, Some(ls(4, electing(3))))];
-        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers);
-        assert_eq!(next, ls(4, LeaderMode::Leading));
-    }
-
-    #[test]
-    fn does_not_win_without_majority() {
-        let peers = [voter(2, Some(ls(4, electing(2)))), voter(3, Some(ls(4, electing(3))))];
-        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers);
-        assert_eq!(next, ls(4, electing(1)));
-    }
-
-    #[test]
-    fn following_a_winner_counts_as_support() {
-        let peers = [voter(2, Some(ls(4, following(1)))), voter(3, Some(ls(4, electing(3))))];
-        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers);
-        assert_eq!(next, ls(4, LeaderMode::Leading));
-    }
-
-    #[test]
-    fn stale_term_votes_do_not_count() {
-        let peers = [voter(2, Some(ls(3, electing(1)))), voter(3, Some(ls(3, following(1))))];
-        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers);
-        assert_eq!(next, ls(4, electing(1)));
-    }
-
-    #[test]
-    fn votes_from_a_different_election_root_do_not_count() {
-        /* the peers voted for us, but in a same-numbered term from a
-         * different root (lower nonce); those votes must not produce a
-         * majority in our election */
-        let peers = [
-            voter(2, Some(ls(4, electing(1)))),
-            voter(3, Some(ls(4, following(1)))),
-        ];
-        let next = next_voter_state(&me(1), &ls_root(4, 9, electing(1)), &peers);
-        assert_eq!(next, ls_root(4, 9, electing(1)));
-
-        /* the same votes at the exact same term do count */
-        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers);
-        assert_eq!(next, ls(4, LeaderMode::Leading));
-    }
-
-    #[test]
-    fn adopts_highest_term_and_follows_its_claim() {
-        let peers = [voter(2, Some(ls(7, LeaderMode::Leading))), voter(3, Some(ls(6, following(3))))];
-        let next = next_voter_state(&me(1), &ls(2, LeaderMode::Leading), &peers);
-        assert_eq!(next, ls(7, following(2)));
-    }
-
-    #[test]
-    fn conflicting_leaders_resolve_to_lowest_address_without_term_bump() {
-        let peers = [voter(2, Some(ls(4, LeaderMode::Leading)))];
-
-        /* higher address concedes */
-        let next = next_voter_state(&me(3), &ls(4, LeaderMode::Leading), &peers);
-        assert_eq!(next, ls(4, following(2)));
-
-        /* lower address keeps the claim */
-        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers);
-        assert_eq!(next, ls(4, LeaderMode::Leading));
-    }
-
-    #[test]
-    fn leader_starts_new_election_when_a_different_root_reaches_its_term() {
-        /* the peer's term has our number but a different nonce: it was
-         * created by a different root, so instead of conceding by address we
-         * bump into a fresh election */
-        let peers = [voter(2, Some(ls_root(4, 9, LeaderMode::Leading)))];
-        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers);
-        assert_logical_state(next, 5, LeaderMode::Electing { vote: None });
-
-        /* also when our nonce is the greater one */
-        let peers = [voter(2, Some(ls(4, LeaderMode::Leading)))];
-        let next = next_voter_state(&me(1), &ls_root(4, 9, LeaderMode::Leading), &peers);
-        assert_logical_state(next, 5, LeaderMode::Electing { vote: None });
-    }
-
-    #[test]
-    fn adopting_a_conflicting_root_term_restarts_the_election() {
-        /* an electing voter that adopts a same-numbered term from a different
-         * root drops its old vote and re-elects within the adopted term */
-        let peers = [voter(2, Some(ls_root(4, 9, LeaderMode::Electing { vote: None })))];
-        let next = next_voter_state(&me(1), &ls(4, following(3)), &peers);
-        assert_eq!(next.term, ElectionTerm::from_parts(4, 9));
-        assert_eq!(next.mode, electing(1));
-    }
-
-    #[test]
-    fn follower_starts_new_term_when_leader_is_unreachable() {
-        let peers = [unreachable(voter(1, Some(ls(4, LeaderMode::Leading)))), voter(3, None)];
-        let next = next_voter_state(&me(2), &ls(4, following(1)), &peers);
-        assert_logical_state(next, 5, LeaderMode::Electing { vote: None });
-    }
-
-    #[test]
-    fn follower_keeps_leader_with_stale_gossip() {
-        /* the leader's last gossip is from an older term but it is still
-         * reachable; don't churn */
-        let peers = [voter(1, Some(ls(3, LeaderMode::Leading)))];
-        let next = next_voter_state(&me(2), &ls(4, following(1)), &peers);
-        assert_eq!(next, ls(4, following(1)));
-    }
-
-    #[test]
-    fn follower_rejoins_election_when_leader_abdicates() {
-        let peers = [voter(1, Some(ls(4, LeaderMode::Electing { vote: None })))];
-        let next = next_voter_state(&me(2), &ls(4, following(1)), &peers);
-        assert_eq!(next, ls(4, LeaderMode::Electing { vote: None }));
-    }
-
-    #[test]
-    fn follower_adopts_leaders_concession() {
-        let peers = [voter(2, Some(ls(4, following(1)))), voter(1, None)];
-        let next = next_voter_state(&me(3), &ls(4, following(2)), &peers);
-        assert_eq!(next, ls(4, following(1)));
-    }
-
-    #[test]
-    fn leader_steps_down_without_reachable_majority() {
-        let peers = [unreachable(voter(2, None)), unreachable(voter(3, None))];
-        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers);
-        assert_logical_state(next, 5, LeaderMode::Electing { vote: None });
-    }
-
-    #[test]
-    fn leader_keeps_leading_with_reachable_majority() {
-        let peers = [voter(2, Some(ls(4, following(1)))), unreachable(voter(3, None))];
-        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers);
-        assert_eq!(next, ls(4, LeaderMode::Leading));
-    }
-
-    #[test]
-    fn split_votes_converge_on_lowest_address() {
-        /* every voter recomputes its vote deterministically, so an initial
-         * split (everyone voted for itself) resolves to the lowest address */
-        let peers = [voter(2, Some(ls(0, electing(2)))), voter(3, Some(ls(0, electing(3))))];
-        let next = next_voter_state(&me(1), &ls(0, electing(1)), &peers);
-        assert_eq!(next, ls(0, electing(1)));
-
-        let peers = [voter(1, Some(ls(0, electing(1)))), voter(3, Some(ls(0, electing(3))))];
-        let next = next_voter_state(&me(2), &ls(0, electing(2)), &peers);
-        assert_eq!(next, ls(0, electing(1)));
-
-        /* once the split voters adopt the lowest address, it wins */
-        let peers = [voter(2, Some(ls(0, electing(1)))), voter(3, Some(ls(0, electing(1))))];
-        let next = next_voter_state(&me(1), &ls(0, electing(1)), &peers);
-        assert_eq!(next, ls(0, LeaderMode::Leading));
-    }
-
-    #[test]
-    fn observer_follows_claimed_leader() {
-        let peers = [voter(1, Some(ls(4, LeaderMode::Leading))), voter(2, Some(ls(4, following(1))))];
-        let next = next_observer_state(&ls(0, LeaderMode::NoLeader), &peers);
-        assert_eq!(next, ls(4, following(1)));
-    }
-
-    #[test]
-    fn observer_falls_back_to_most_followed_leader() {
-        let peers = [
-            voter(2, Some(ls(4, following(1)))),
-            voter(3, Some(ls(4, following(1)))),
-            voter(4, Some(ls(4, following(4)))),
-        ];
-        let next = next_observer_state(&ls(0, LeaderMode::NoLeader), &peers);
-        assert_eq!(next, ls(4, following(1)));
-    }
-
-    #[test]
-    fn observer_reports_no_leader_during_election() {
-        let peers = [voter(1, Some(ls(4, electing(1)))), voter(2, Some(ls(4, electing(1))))];
-        let next = next_observer_state(&ls(3, following(1)), &peers);
-        assert_eq!(next, ls(4, LeaderMode::NoLeader));
-    }
-
-    #[test]
-    fn observer_keeps_state_without_voter_info() {
-        let current = ls(4, following(1));
-        assert_eq!(next_observer_state(&current, &[]), current);
-
-        let peers = [unreachable(voter(1, Some(ls(4, LeaderMode::Leading))))];
-        assert_eq!(next_observer_state(&current, &peers), current);
-    }
-
-    struct SimNode {
-        addr: u16,
-        can_lead: bool,
-        state: LeaderState<u16>,
-        recovery: RecoverableStateDetails,
-    }
-
-    fn sim_node(addr: u16, can_lead: bool) -> SimNode {
-        SimNode {
-            addr,
-            can_lead,
-            state: ls(0, LeaderMode::NoLeader),
-            recovery: shared_recovery(),
+    impl MessageEncoding for Counter {
+        fn write_to<W: io::Write>(&self, out: &mut W) -> io::Result<usize> {
+            self.0.write_to(out)
+        }
+        fn read_from<R: io::Read>(read: &mut R) -> io::Result<Self> {
+            Ok(Self(u64::read_from(read)?))
         }
     }
-
-    /* run synchronized gossip rounds: every node decides against the states
-     * all nodes published in the previous round; down nodes keep publishing
-     * their last (stale) state, matching how leader_info persists */
-    fn run_rounds(nodes: &mut [SimNode], down: &[u16], rounds: usize) {
-        for _ in 0..rounds {
-            let published = nodes
-                .iter()
-                .map(|node| (node.addr, node.can_lead, node.state.clone(), node.recovery.clone()))
-                .collect::<Vec<_>>();
-
-            for node in nodes.iter_mut() {
-                if down.contains(&node.addr) {
-                    continue;
-                }
-
-                let peers = published
-                    .iter()
-                    .filter(|(addr, _, _, _)| *addr != node.addr)
-                    .map(|(addr, can_lead, state, recovery)| PeerView {
-                        addr: *addr,
-                        is_voter: *can_lead,
-                        connected: !down.contains(addr),
-                        unreachable: down.contains(addr),
-                        leader_state: Some(state.clone()),
-                        recovery: Some(recovery.clone()),
-                        reachable: vec![],
-                    })
-                    .collect::<Vec<_>>();
-
-                let myself = PeerView {
-                    addr: node.addr,
-                    is_voter: node.can_lead,
-                    connected: true,
-                    unreachable: false,
-                    leader_state: None,
-                    recovery: Some(node.recovery.clone()),
-                    reachable: vec![],
-                };
-
-                node.state = if node.can_lead {
-                    next_voter_state(&myself, &node.state, &peers)
-                } else {
-                    next_observer_state(&node.state, &peers)
-                };
-            }
-        }
+    fn node(address: u64, state: RecoverableState<Counter>) -> Arc<NodeState<u64, Counter>> {
+        Arc::new(NodeState {
+            my_address: address,
+            can_lead: true,
+            peers: Mutex::new(HashMap::new()),
+            state: SubscribableState::new(state, Default::default()).unwrap(),
+            election: RwLock::new(Default::default()),
+            leadership_changed: Notify::new(),
+            eligible: AtomicBool::new(true),
+            synced_epoch: RwLock::new(None),
+        })
+    }
+    async fn add_peer(node: &NodeState<u64, Counter>, peer: &NodeState<u64, Counter>) {
+        let mut entry = PeerState::empty(peer.my_address);
+        entry.leader_info = Some(LeaderInfo {
+            leader_state: LeaderState {
+                epoch: Default::default(),
+                mode: LeaderMode::NoLeader,
+            },
+            can_lead: true,
+            recovery_initialized: true,
+            recovery_details: peer.state.recovery_details().await,
+        });
+        node.peers.lock().await.insert(peer.my_address, entry);
     }
 
-    fn assert_all_agree(nodes: &[SimNode], leader: u16, term: u64, down: &[u16]) {
-        for node in nodes {
-            if down.contains(&node.addr) {
-                continue;
-            }
-            let expected = if node.addr == leader {
-                LeaderMode::Leading
-            } else {
-                following(leader)
-            };
-            assert_eq!(node.state.term.term(), term, "node {} disagrees", node.addr);
-            assert_eq!(node.state.mode, expected, "node {} disagrees", node.addr);
-        }
+    #[tokio::test]
+    async fn lagging_owner_recovers_and_bumps_once_before_ready() {
+        let etcd = crate::test_support::TestEtcd::start().await;
+        let net = SimulatedNet::new();
+        let io1 = net.start_io(1).await;
+        let io2 = net.start_io(2).await;
+        let initial = RecoverableState::new(123, Counter(0));
+        let candidate = node(1, initial.clone());
+        let mut advanced = initial.clone();
+        advanced.update(&RecoverableStateAction::StateAction { action: 1 });
+        let source = node(2, advanced);
+        add_peer(&candidate, &source).await;
+        let settings = NetIoSettings::default();
+        let (tx, _rx) = mpsc::channel(16);
+        let server = Arc::new(RpcServer::new(source, tx)).start_listener(io2, settings.clone());
+        let connections = Arc::new(PeerConnections::<SimulatedIo, Counter>::new(io1, settings, candidate.clone()));
+        let task = EtcdLeaderTask::new(candidate.clone(), connections, etcd.config(false));
+        let mut election = EtcdElection::connect(etcd.config(false)).await.unwrap();
+        let mut session = election.acquire(1).await.unwrap().unwrap();
+        task.publish_local(&session);
+        assert!(!candidate.valid_authority(session.owner.epoch));
+        task.prepare(session.owner.epoch).await.unwrap();
+        assert!(!election.read().await.unwrap().owner.unwrap().ready);
+        let settled = candidate.state.settled_recovery_details().await;
+        assert_eq!(settled.next_seq(), initial.details().next_seq() + 2);
+        assert_eq!(candidate.state.create_handle().read_with(|v| v.state().0), 1);
+        election.publish_ready(&mut session).await.unwrap();
+        task.publish_local(&session);
+        assert!(candidate.valid_authority(session.owner.epoch));
+        election.revoke(&session).await.unwrap();
+        server.abort();
     }
 
-    #[test]
-    fn cluster_converges_through_leader_failure_and_recovery() {
-        let mut nodes = (1..=7).map(|addr| sim_node(addr, addr <= 5)).collect::<Vec<_>>();
-
-        /* cold start: everyone agrees on the lowest address */
-        run_rounds(&mut nodes, &[], 5);
-        assert_all_agree(&nodes, 1, 0, &[]);
-
-        /* leader dies: survivors elect the next address in a new term */
-        run_rounds(&mut nodes, &[1], 6);
-        assert_all_agree(&nodes, 2, 1, &[1]);
-
-        /* old leader rejoins with a stale Leading claim and concedes */
-        run_rounds(&mut nodes, &[], 3);
-        assert_all_agree(&nodes, 2, 1, &[]);
-    }
-
-    #[test]
-    fn merged_roots_hold_a_fresh_election_and_prefer_recovery() {
-        /* two clusters formed independently and both reached term 3; when
-         * they merge, neither leader is silently overridden: both bump into
-         * a fresh election which the root that can recover the most voters
-         * (nodes 3, 4, 5) wins */
-        let root_a = RecoverableStateDetails::new(100, 1);
-        let root_b = RecoverableStateDetails::new(200, 1);
-
-        let mut nodes = vec![
-            SimNode {
-                addr: 1,
-                can_lead: true,
-                state: ls_root(3, 7, LeaderMode::Leading),
-                recovery: root_a.clone(),
-            },
-            SimNode {
-                addr: 2,
-                can_lead: true,
-                state: ls_root(3, 7, following(1)),
-                recovery: root_a,
-            },
-            SimNode {
-                addr: 3,
-                can_lead: true,
-                state: ls_root(3, 9, LeaderMode::Leading),
-                recovery: root_b.clone(),
-            },
-            SimNode {
-                addr: 4,
-                can_lead: true,
-                state: ls_root(3, 9, following(3)),
-                recovery: root_b.clone(),
-            },
-            SimNode {
-                addr: 5,
-                can_lead: true,
-                state: ls_root(3, 9, following(3)),
-                recovery: root_b,
-            },
-        ];
-
-        run_rounds(&mut nodes, &[], 8);
-        assert_all_agree(&nodes, 3, 4, &[]);
-    }
-
-    #[test]
-    fn observer_ignores_stale_term_claims() {
-        let peers = [voter(1, Some(ls(3, LeaderMode::Leading))), voter(3, Some(ls(4, following(2))))];
-        let next = next_observer_state(&ls(3, following(1)), &peers);
-        assert_eq!(next, ls(4, following(2)));
+    #[tokio::test]
+    async fn conflicting_known_histories_block_promotion() {
+        let etcd = crate::test_support::TestEtcd::start().await;
+        let net = SimulatedNet::new();
+        let io = net.start_io(1).await;
+        let candidate = node(1, RecoverableState::new(123, Counter(0)));
+        let conflict = node(2, RecoverableState::new(456, Counter(0)));
+        add_peer(&candidate, &conflict).await;
+        let peers = Arc::new(PeerConnections::new(io, Default::default(), candidate.clone()));
+        let task = EtcdLeaderTask::new(candidate.clone(), peers, etcd.config(false));
+        let mut election = EtcdElection::connect(etcd.config(false)).await.unwrap();
+        let session = election.acquire(1).await.unwrap().unwrap();
+        task.publish_local(&session);
+        assert!(task.prepare(session.owner.epoch).await.is_err());
+        assert!(!candidate.valid_authority(session.owner.epoch));
+        assert!(!election.read().await.unwrap().owner.unwrap().ready);
+        election.revoke(&session).await.unwrap();
     }
 }

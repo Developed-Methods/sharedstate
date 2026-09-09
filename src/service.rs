@@ -8,22 +8,23 @@ use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedBroadcastSettings, SettingsError};
 use tokio::{
     sync::{
-        mpsc::{self, error::SendError},
         Mutex,
+        mpsc::{self, error::SendError},
     },
     task::JoinHandle,
 };
 
 use crate::{
     cluster::{
-        leader::{LeaderTask, LeaderTiming},
+        election::EtcdElectionConfig,
+        leader::EtcdLeaderTask,
         node_state::{NodeState, PeerState},
         peer_connections::PeerConnections,
         peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
         rpc_server::RpcServer,
         state_sync::{StateSyncTask, StateSyncTiming},
     },
-    protocol::messages::{ElectionTerm, LeaderMode, LeaderState},
+    protocol::messages::LeaderState,
     state::{
         deterministic_state::DeterministicState,
         recoverable_state::RecoverableState,
@@ -56,7 +57,7 @@ pub struct SharedStateSettings {
     pub net: NetIoSettings,
     pub broadcast: SequencedBroadcastSettings,
     pub discovery_timing: PeerDiscoveryTiming,
-    pub leader_timing: LeaderTiming,
+    pub election: EtcdElectionConfig,
     pub sync_timing: StateSyncTiming,
 }
 
@@ -86,17 +87,25 @@ where
             settings,
         } = config;
 
-        Self::start_recoverable(SharedStateRecoverableConfig {
-            io,
-            my_address,
-            can_lead,
-            initial_peers,
-            initial_state: RecoverableState::new(unique_state_id(&my_address), initial_state),
-            settings,
-        })
+        let eligible = settings.election.bootstrap && can_lead;
+        Self::start_inner(
+            SharedStateRecoverableConfig {
+                io,
+                my_address,
+                can_lead,
+                initial_peers,
+                initial_state: RecoverableState::new(unique_state_id(&my_address), initial_state),
+                settings,
+            },
+            eligible,
+        )
     }
 
     pub fn start_recoverable(config: SharedStateRecoverableConfig<I, D>) -> Result<Self, SettingsError> {
+        Self::start_inner(config, true)
+    }
+
+    fn start_inner(config: SharedStateRecoverableConfig<I, D>, eligible: bool) -> Result<Self, SettingsError> {
         let SharedStateRecoverableConfig {
             io,
             my_address,
@@ -117,10 +126,10 @@ where
             can_lead,
             peers: Mutex::new(peers),
             state: SubscribableState::new(initial_state, settings.broadcast.clone())?,
-            leader_state: Mutex::new(LeaderState {
-                term: ElectionTerm::default(),
-                mode: LeaderMode::NoLeader,
-            }),
+            election: Default::default(),
+            leadership_changed: tokio::sync::Notify::new(),
+            eligible: std::sync::atomic::AtomicBool::new(eligible),
+            synced_epoch: Default::default(),
         });
 
         let peer_connections = Arc::new(PeerConnections::new(io.clone(), settings.net.clone(), node.clone()));
@@ -132,7 +141,7 @@ where
             tokio::spawn(
                 PeerDiscoveryTask::new(node.clone(), peer_connections.clone(), settings.discovery_timing).run(),
             ),
-            tokio::spawn(LeaderTask::new(node.clone(), settings.leader_timing).run()),
+            tokio::spawn(EtcdLeaderTask::new(node.clone(), peer_connections.clone(), settings.election).run()),
             tokio::spawn(
                 StateSyncTask::new(node.clone(), peer_connections, io, settings.net, actions_rx, settings.sync_timing)
                     .run(),
@@ -165,7 +174,7 @@ where
     }
 
     pub async fn leader_state(&self) -> LeaderState<I::Address> {
-        self.node.leader_state.lock().await.clone()
+        self.node.current_leader()
     }
 
     /// Queues an action originating from this node. The sync task applies it
@@ -182,6 +191,7 @@ where
 
 impl<I: SyncIOListener, D: DeterministicState> Drop for SharedState<I, D> {
     fn drop(&mut self) {
+        self.node.revoke_authority(None);
         for task in &self.tasks {
             task.abort();
         }
@@ -198,7 +208,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        cluster::{leader::LeaderTiming, peer_discovery::PeerDiscoveryTiming, state_sync::StateSyncTiming},
+        cluster::{peer_discovery::PeerDiscoveryTiming, state_sync::StateSyncTiming},
+        protocol::messages::LeaderMode,
         state::recoverable_state::RecoverableStateAction,
         transport::simulated::{SimulatedIo, SimulatedNet},
     };
@@ -249,7 +260,7 @@ mod tests {
         }
     }
 
-    fn fast_settings() -> SharedStateSettings {
+    fn fast_settings(etcd: &crate::test_support::TestEtcd, bootstrap: bool) -> SharedStateSettings {
         SharedStateSettings {
             net: NetIoSettings {
                 process_timeout: Duration::from_secs(1),
@@ -260,9 +271,7 @@ mod tests {
                 observation_interval: Duration::from_millis(50),
                 max_concurrent_observations: 8,
             },
-            leader_timing: LeaderTiming {
-                tick_interval: Duration::from_millis(25),
-            },
+            election: etcd.config(bootstrap),
             sync_timing: StateSyncTiming {
                 leader_poll_interval: Duration::from_millis(20),
                 retry_delay: Duration::from_millis(50),
@@ -270,8 +279,29 @@ mod tests {
         }
     }
 
+    struct TestNet {
+        network: SimulatedNet,
+        etcd: crate::test_support::TestEtcd,
+    }
+
+    impl TestNet {
+        async fn new() -> Self {
+            Self {
+                network: SimulatedNet::new(),
+                etcd: crate::test_support::TestEtcd::start().await,
+            }
+        }
+    }
+
+    impl std::ops::Deref for TestNet {
+        type Target = SimulatedNet;
+        fn deref(&self) -> &Self::Target {
+            &self.network
+        }
+    }
+
     async fn start_node(
-        net: &SimulatedNet,
+        net: &TestNet,
         address: u64,
         can_lead: bool,
         peers: &[u64],
@@ -283,7 +313,7 @@ mod tests {
             can_lead,
             initial_peers: peers.to_vec(),
             initial_state: KvState::default(),
-            settings: fast_settings(),
+            settings: fast_settings(&net.etcd, address == 1),
         })
         .unwrap()
     }
@@ -333,6 +363,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let mut observed_leader = None;
+            let mut observed_epoch = None;
             let mut leader_is_leading = false;
             let mut unsettled = Vec::new();
 
@@ -350,10 +381,13 @@ mod tests {
                     }
                 };
 
-                if observed_leader.is_some_and(|observed| observed != leader) {
-                    unsettled.push((node.my_address(), state));
+                if observed_leader.is_some_and(|observed| observed != leader)
+                    || observed_epoch.is_some_and(|epoch| epoch != state.epoch)
+                {
+                    unsettled.push((node.my_address(), state.clone()));
                 }
                 observed_leader.get_or_insert(leader);
+                observed_epoch.get_or_insert(state.epoch);
             }
 
             if let Some(leader) = observed_leader {
@@ -394,8 +428,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_candidate_and_bootstrap_observer_leave_vacant_owner_unclaimed() {
+        let net = TestNet::new().await;
+        let candidate = start_node(&net, 2, true, &[3]).await;
+        let observer = SharedState::start(SharedStateConfig {
+            io: net.start_io(3).await,
+            my_address: 3,
+            can_lead: false,
+            initial_peers: vec![2],
+            initial_state: KvState::default(),
+            settings: fast_settings(&net.etcd, true),
+        })
+        .unwrap();
+        let config = net.etcd.config(false);
+        let mut client = etcd_client::Client::connect(config.endpoints.clone(), None)
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            assert!(client.get(config.leader_key(), None).await.unwrap().kvs().is_empty());
+            assert!(matches!(candidate.leader_state().await.mode, LeaderMode::NoLeader));
+            assert!(matches!(observer.leader_state().await.mode, LeaderMode::NoLeader));
+            assert!(!candidate.node().eligible.load(std::sync::atomic::Ordering::Acquire));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let bootstrap = start_node(&net, 1, true, &[2, 3]).await;
+        wait_for_leader(&[&bootstrap, &candidate, &observer], 1).await;
+        bootstrap.submit_action((1, 10)).await.unwrap();
+        wait_for_value(&candidate, 1, 10).await;
+        wait_for_value(&observer, 1, 10).await;
+        assert!(candidate.node().eligible.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn peer_partition_does_not_replace_live_etcd_owner() {
+        let net = TestNet::new().await;
+        let node1 = start_node(&net, 1, true, &[2]).await;
+        let node2 = start_node(&net, 2, true, &[1]).await;
+        wait_for_leader(&[&node1, &node2], 1).await;
+        node1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&node2, 1, 1).await;
+        net.set_node_blocked(1, true).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(matches!(node1.leader_state().await.mode, LeaderMode::Leading));
+        assert!(matches!(node2.leader_state().await.mode, LeaderMode::Following { leader: 1 }));
+        net.set_node_blocked(1, false).await;
+        node2.submit_action((2, 2)).await.unwrap();
+        wait_for_value(&node1, 2, 2).await;
+        wait_for_value(&node2, 2, 2).await;
+    }
+
+    #[tokio::test]
+    async fn etcd_loss_stops_authority_while_peer_links_remain_connected() {
+        let mut net = TestNet::new().await;
+        let node1 = start_node(&net, 1, true, &[2]).await;
+        let node2 = start_node(&net, 2, true, &[1]).await;
+        wait_for_leader(&[&node1, &node2], 1).await;
+        node1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&node2, 1, 1).await;
+        net.etcd.stop();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while matches!(node1.leader_state().await.mode, LeaderMode::Leading) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("authority must expire without etcd");
+        let before = node1.state_handle().read_with(|state| state.state().clone());
+        node1.submit_action((2, 2)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(node1.state_handle().read_with(|state| state.state().clone()), before);
+        assert!(
+            node1
+                .node()
+                .peers
+                .lock()
+                .await
+                .get(&2)
+                .unwrap()
+                .connect_status
+                .is_connected()
+        );
+    }
+
+    #[tokio::test]
     async fn cluster_replicates_actions_from_any_node() {
-        let net = SimulatedNet::new();
+        let net = TestNet::new().await;
         let node1 = start_node(&net, 1, true, &[2, 3]).await;
         let node2 = start_node(&net, 2, true, &[1, 3]).await;
         let node3 = start_node(&net, 3, false, &[1]).await;
@@ -419,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_recoverable_preserves_initial_recovery_details() {
-        let net = SimulatedNet::new();
+        let net = TestNet::new().await;
         let io = net.start_io(1).await;
 
         let mut initial_state = RecoverableState::new(101, KvState::default());
@@ -434,7 +553,7 @@ mod tests {
             can_lead: true,
             initial_peers: Vec::new(),
             initial_state,
-            settings: fast_settings(),
+            settings: fast_settings(&net.etcd, false),
         })
         .unwrap();
 
@@ -446,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn follower_relays_through_peer_when_leader_is_unreachable() {
-        let net = SimulatedNet::new();
+        let net = TestNet::new().await;
         let node1 = start_node(&net, 1, true, &[2, 3]).await;
         let node2 = start_node(&net, 2, true, &[1, 3]).await;
         let node3 = start_node(&net, 3, false, &[1, 2]).await;
@@ -471,7 +590,7 @@ mod tests {
 
     #[tokio::test]
     async fn follower_recovers_when_leader_link_goes_silent() {
-        let net = SimulatedNet::new();
+        let net = TestNet::new().await;
         let node1 = start_node(&net, 1, true, &[2, 3]).await;
         let node2 = start_node(&net, 2, true, &[1, 3]).await;
         let node3 = start_node(&net, 3, false, &[1, 2]).await;
@@ -497,7 +616,7 @@ mod tests {
 
     #[tokio::test]
     async fn old_leader_rejoins_as_follower_and_its_actions_apply() {
-        let net = SimulatedNet::new();
+        let net = TestNet::new().await;
         let node1 = start_node(&net, 1, true, &[2, 3]).await;
         let node2 = start_node(&net, 2, true, &[1, 3]).await;
         let node3 = start_node(&net, 3, true, &[1, 2]).await;
@@ -506,27 +625,29 @@ mod tests {
         node1.submit_action((1, 1)).await.unwrap();
         wait_for_value(&node3, 1, 1).await;
 
-        /* partition the leader away; the others elect node 2 */
+        let initial_state = node1.state_handle().read_with(Clone::clone);
         net.set_node_blocked(1, true).await;
-        wait_for_leader(&[&node2, &node3], 2).await;
+        net.stop_node(1).await;
+        drop(node1);
+        let successor = wait_for_common_leader(&[&node2, &node3]).await;
 
         node2.submit_action((2, 2)).await.unwrap();
         wait_for_value(&node3, 2, 2).await;
 
-        /* heal the partition; node 1 must concede and follow node 2 */
         net.set_node_blocked(1, false).await;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let state = node1.leader_state().await;
-            if matches!(state.mode, LeaderMode::Following { leader: 2 }) {
-                break;
-            }
-            assert!(Instant::now() < deadline, "node 1 never conceded to node 2, last state {state:?}");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let node1 = SharedState::start_recoverable(SharedStateRecoverableConfig {
+            io: net.start_io(1).await,
+            my_address: 1,
+            can_lead: true,
+            initial_peers: vec![2, 3],
+            initial_state,
+            settings: fast_settings(&net.etcd, false),
+        })
+        .unwrap();
+        wait_for_leader(&[&node1, &node2, &node3], successor).await;
         wait_for_value(&node1, 2, 2).await;
 
-        /* the moved follower's actions must reach the new leader */
+        /* The restarted follower forwards actions to the new leader. */
         node1.submit_action((3, 3)).await.unwrap();
         wait_for_value(&node1, 3, 3).await;
         wait_for_value(&node2, 3, 3).await;
@@ -535,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn observer_actions_apply_after_leader_change() {
-        let net = SimulatedNet::new();
+        let net = TestNet::new().await;
         let node1 = start_node(&net, 1, true, &[2, 3, 4]).await;
         let node2 = start_node(&net, 2, true, &[1, 3, 4]).await;
         let node3 = start_node(&net, 3, true, &[1, 2, 4]).await;
@@ -553,7 +674,7 @@ mod tests {
         net.stop_node(1).await;
         drop(node1);
 
-        wait_for_leader(&[&node2, &node3, &node4], 2).await;
+        wait_for_common_leader(&[&node2, &node3, &node4]).await;
 
         node4.submit_action((2, 2)).await.unwrap();
         wait_for_value(&node2, 2, 2).await;
@@ -563,19 +684,21 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn action_flood_during_failover_does_not_wedge_sync() {
-        let net = SimulatedNet::new();
+        let net = TestNet::new().await;
         let node1 = Arc::new(start_node(&net, 1, true, &[2, 3]).await);
         let node2 = Arc::new(start_node(&net, 2, true, &[1, 3]).await);
         let node3 = Arc::new(start_node(&net, 3, true, &[1, 2]).await);
 
         let old_leader = wait_for_common_leader(&[&node1, &node2, &node3]).await;
-        let (survivor_a, survivor_b, new_leader, moved_follower) = match old_leader {
-            1 => (node2.clone(), node3.clone(), 2, node3.clone()),
-            2 => (node1.clone(), node3.clone(), 1, node3.clone()),
-            3 => (node1.clone(), node2.clone(), 1, node2.clone()),
-            _ => unreachable!("test only starts nodes 1, 2, and 3"),
+        let (survivor_a, survivor_b) = match old_leader {
+            1 => (node2.clone(), node3.clone()),
+            2 => (node1.clone(), node3.clone()),
+            3 => (node1.clone(), node2.clone()),
+            _ => unreachable!(),
         };
-
+        survivor_a.submit_action((9, 9)).await.unwrap();
+        wait_for_value(&survivor_a, 9, 9).await;
+        wait_for_value(&survivor_b, 9, 9).await;
         /* keep a continuous stream of actions flowing from both survivors
          * while the leader dies; the sync tasks must still notice the leader
          * change instead of forwarding in circles forever */
@@ -595,9 +718,14 @@ mod tests {
 
         net.set_node_blocked(old_leader, true).await;
         net.stop_node(old_leader).await;
+        drop((node1, node2, node3));
+        let new_leader = wait_for_common_leader(&[&survivor_a, &survivor_b]).await;
         flood.abort();
-
-        wait_for_leader(&[&survivor_a, &survivor_b], new_leader).await;
+        let moved_follower = if survivor_a.my_address() == new_leader {
+            &survivor_b
+        } else {
+            &survivor_a
+        };
 
         /* after the failover flood, a fresh action from the moved follower
          * must not be wedged behind stale routing state */
@@ -608,7 +736,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_recovers_after_leader_failure() {
-        let net = SimulatedNet::new();
+        let net = TestNet::new().await;
         let node1 = start_node(&net, 1, true, &[2, 3]).await;
         let node2 = start_node(&net, 2, true, &[1, 3]).await;
         let node3 = start_node(&net, 3, true, &[1, 2]).await;
@@ -619,13 +747,12 @@ mod tests {
         wait_for_value(&node2, 1, 1).await;
         wait_for_value(&node3, 1, 1).await;
 
-        /* leader goes down: the survivors elect node 2 and keep accepting
-         * actions */
+        /* The surviving replicas acquire ownership and continue applying actions. */
         net.set_node_blocked(1, true).await;
         net.stop_node(1).await;
         drop(node1);
 
-        wait_for_leader(&[&node2, &node3], 2).await;
+        wait_for_common_leader(&[&node2, &node3]).await;
 
         node3.submit_action((2, 2)).await.unwrap();
         wait_for_value(&node2, 2, 2).await;
@@ -634,7 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn five_node_cluster_replicates_from_all_nodes_after_leader_failure() {
-        let net = SimulatedNet::new();
+        let net = TestNet::new().await;
         let node1 = start_node(&net, 1, true, &[2, 3, 4, 5]).await;
         let node2 = start_node(&net, 2, true, &[1, 3, 4, 5]).await;
         let node3 = start_node(&net, 3, true, &[1, 2, 4, 5]).await;
@@ -661,7 +788,7 @@ mod tests {
         let remaining_nodes = [&node2, &node3, &node4, &node5];
         let second_leader = wait_for_common_leader(&remaining_nodes).await;
         assert_ne!(second_leader, first_leader);
-        assert_eq!(second_leader, 2);
+        assert!([2, 3].contains(&second_leader));
 
         for node in remaining_nodes {
             let key = 200 + node.my_address();

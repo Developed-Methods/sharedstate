@@ -1,19 +1,20 @@
 use std::{
-    collections::{hash_map, HashMap},
+    collections::{HashMap, hash_map},
     sync::Arc,
     time::Duration,
 };
 
 use message_encoding::MessageEncoding;
 use tokio::sync::{
-    mpsc::{error::TrySendError, Receiver, Sender},
-    oneshot, Mutex,
+    Mutex,
+    mpsc::{Receiver, Sender, error::TrySendError},
+    oneshot,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     cluster::node_state::NodeState,
-    protocol::messages::{LeaderInfo, LeaderState, SharePeerDetails, SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{LeaderInfo, LeaderState, PROTOCOL_VERSION, SharePeerDetails, SyncRequest, SyncResponse},
     state::deterministic_state::DeterministicState,
     transport::{
         channels::NetIoSettings,
@@ -59,7 +60,12 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcResponseHandler<A, D> {
             Self::ForwardedAction { target, source } => match response {
                 Ok(SyncResponse::Ok) => {}
                 Ok(response) => {
-                    tracing::warn!(?target, ?source, response = response.name(), "sync target rejected forwarded action");
+                    tracing::warn!(
+                        ?target,
+                        ?source,
+                        response = response.name(),
+                        "sync target rejected forwarded action"
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(?target, ?source, ?error, "failed to forward action to sync target");
@@ -131,11 +137,7 @@ where
         .await
     }
 
-    async fn enqueue_message(
-        &self,
-        peer: I::Address,
-        msg: RpcMessage<I::Address, D>,
-    ) -> Result<(), PeerRpcError> {
+    async fn enqueue_message(&self, peer: I::Address, msg: RpcMessage<I::Address, D>) -> Result<(), PeerRpcError> {
         let mut pending = Some(msg);
 
         loop {
@@ -328,14 +330,11 @@ where
         let connection = loop {
             /* connect gives no timing guarantee; bound it so a hanging
              * transport surfaces as a normal connect failure */
-            let connect_result = match tokio::time::timeout(settings.message_timeout, io.connect(&self.remote_addr)).await
-            {
-                Ok(result) => result,
-                Err(_) => Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "timed out connecting to peer",
-                )),
-            };
+            let connect_result =
+                match tokio::time::timeout(settings.message_timeout, io.connect(&self.remote_addr)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out connecting to peer")),
+                };
 
             match connect_result {
                 Ok(connection) => break connection,
@@ -490,8 +489,8 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -499,13 +498,13 @@ mod tests {
     use message_encoding::MessageEncoding;
     use sequenced_broadcast::SequencedBroadcastSettings;
     use tokio::{
-        io::{duplex, split, DuplexStream, ReadHalf, WriteHalf},
+        io::{DuplexStream, ReadHalf, WriteHalf, duplex, split},
         sync::{Mutex, Notify, Semaphore},
     };
 
     use super::*;
     use crate::{
-        protocol::messages::{ElectionTerm, LeaderMode},
+        cluster::node_state::ElectionStatus,
         state::{recoverable_state::RecoverableState, subscribable_state::SubscribableState},
         transport::traits::SyncConnection,
     };
@@ -634,10 +633,10 @@ mod tests {
             peers: Mutex::new(HashMap::new()),
             state: SubscribableState::new(RecoverableState::new(1, TestState), SequencedBroadcastSettings::default())
                 .unwrap(),
-            leader_state: Mutex::new(LeaderState {
-                term: ElectionTerm::from_term(0),
-                mode: LeaderMode::Following { leader: 2 },
-            }),
+            election: std::sync::RwLock::new(ElectionStatus::default()),
+            leadership_changed: Notify::new(),
+            eligible: std::sync::atomic::AtomicBool::new(false),
+            synced_epoch: std::sync::RwLock::new(None),
         })
     }
 

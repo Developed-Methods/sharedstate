@@ -12,3 +12,7 @@ pub mod transport;
 mod utils;
 
 pub use service::{SharedState, SharedStateConfig, SharedStateRecoverableConfig, SharedStateSettings};
+
+#[cfg(test)]
+#[path = "../tests/support/etcd.rs"]
+mod test_support;

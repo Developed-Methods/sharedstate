@@ -102,8 +102,7 @@ impl<D: DeterministicState> SubscribableState<D> {
 
             if yields == YIELD_LIMIT {
                 last_warned = Some(tokio::time::Instant::now());
-            }
-            else if last_warned.is_none_or(|at| WARN_INTERVAL <= at.elapsed()) {
+            } else if last_warned.is_none_or(|at| WARN_INTERVAL <= at.elapsed()) {
                 tracing::warn!(
                     blocked_by_workers = maintenance.blocked_by_workers,
                     elapsed = ?started.elapsed(),
@@ -118,20 +117,29 @@ impl<D: DeterministicState> SubscribableState<D> {
     }
 
     pub async fn reset(&self, new_state: RecoverableState<D>) {
+        self.reset_guarded(new_state, || Some(())).await;
+    }
+
+    pub async fn reset_guarded<G>(&self, new_state: RecoverableState<D>, admit: impl FnOnce() -> Option<G>) -> bool {
         let mut broadcast_locked = self.broadcast.lock().await;
         let mut sender_locked = self.broadcast_sender.lock().await;
 
         let new_recover_details = new_state.details().clone();
 
-        self.state.queue_update(HotStateAction::Reset(new_state));
-        self.settle().await;
-
+        {
+            let Some(_guard) = admit() else {
+                return false;
+            };
+            self.state.queue_update(HotStateAction::Reset(new_state));
+        }
         let (broadcast, broadcast_sender) =
             SequencedBroadcast::new(new_recover_details.next_seq(), self.broadcast_settings.clone()).unwrap();
 
         *broadcast_locked = broadcast;
         let mut old_sender = std::mem::replace(&mut *sender_locked, broadcast_sender);
         old_sender.close();
+        self.settle().await;
+        true
     }
 
     pub async fn subscribe(
@@ -182,6 +190,14 @@ impl<D: DeterministicState> SubscribableState<D> {
     }
 
     pub async fn update(&self, actions: impl Iterator<Item = RecoverableStateAction<D::AuthorityAction>>) {
+        self.update_guarded(actions, || Some(())).await;
+    }
+
+    pub async fn update_guarded<G>(
+        &self,
+        actions: impl Iterator<Item = RecoverableStateAction<D::AuthorityAction>>,
+        admit: impl FnOnce() -> Option<G>,
+    ) -> bool {
         let mut batch = Vec::with_capacity(actions.size_hint().0.max(4));
         let mut sender = self.broadcast_sender.lock().await;
 
@@ -190,12 +206,18 @@ impl<D: DeterministicState> SubscribableState<D> {
             HotStateAction::Action(action)
         });
 
-        self.state.queue_updates(read_for_state);
+        {
+            let Some(_guard) = admit() else {
+                return false;
+            };
+            self.state.queue_updates(read_for_state);
+        }
         for action in batch {
             let _ = sender.send(action).await;
         }
 
         self.settle().await;
+        true
     }
 }
 
@@ -281,16 +303,44 @@ mod tests {
 
     fn new_state() -> Arc<SubscribableState<Counter>> {
         Arc::new(
-            SubscribableState::new(
-                RecoverableState::new(1, Counter(0)),
-                SequencedBroadcastSettings::default(),
-            )
-            .unwrap(),
+            SubscribableState::new(RecoverableState::new(1, Counter(0)), SequencedBroadcastSettings::default())
+                .unwrap(),
         )
     }
 
     fn action() -> RecoverableStateAction<u64> {
         RecoverableStateAction::StateAction { action: 7 }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guarded_update_rechecks_deadline_after_waiting_for_sender() {
+        let state = new_state();
+        let sender = state.broadcast_sender.lock().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let update =
+            state.update_guarded(iter::once(action()), || (tokio::time::Instant::now() < deadline).then_some(()));
+        tokio::pin!(update);
+        assert!(futures_util::poll!(&mut update).is_pending());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        drop(sender);
+        assert!(!update.await);
+        assert_eq!(state.create_handle().read_with(|v| v.state().0), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guarded_reset_rechecks_deadline_after_waiting_for_broadcast() {
+        let state = new_state();
+        let broadcast = state.broadcast.lock().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let reset = state.reset_guarded(RecoverableState::new(2, Counter(10)), || {
+            (tokio::time::Instant::now() < deadline).then_some(())
+        });
+        tokio::pin!(reset);
+        assert!(futures_util::poll!(&mut reset).is_pending());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        drop(broadcast);
+        assert!(!reset.await);
+        assert_eq!(state.create_handle().read_with(|v| v.state().0), 0);
     }
 
     /// A handle that read the state and never went quiescent blocks hot-read
@@ -313,10 +363,7 @@ mod tests {
         };
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(
-            !updates.is_finished(),
-            "updates must not settle while a read handle is pinned"
-        );
+        assert!(!updates.is_finished(), "updates must not settle while a read handle is pinned");
 
         handle.quiescent();
         tokio::time::timeout(std::time::Duration::from_secs(5), updates)

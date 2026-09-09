@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sharedstate: etcd for leader election only</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#000;color:#fff;font:16px/1.55 system-ui,sans-serif}main{max-width:1050px;margin:auto;padding:28px 22px 70px}h1{font-size:27px;line-height:1.2;margin:8px 0 14px}h2{font-size:21px;margin:34px 0 10px;border-top:1px solid #444;padding-top:20px}h3{font-size:17px;margin:20px 0 6px}p{margin:9px 0}a{color:#a9d8ff;text-underline-offset:3px}nav{display:flex;gap:8px 18px;flex-wrap:wrap;margin:18px 0}.meta,small{color:#bbb}.decision{padding:14px 18px;border-left:3px solid #fff;background:#171717}.table{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;vertical-align:top;border-bottom:1px solid #444;padding:10px}th{background:#191919}code{font-family:ui-monospace,monospace;font-size:.88em;overflow-wrap:anywhere}pre{background:#171717;border:1px solid #444;padding:16px;overflow:auto;font-size:14px;line-height:1.5}li{margin:6px 0}svg{width:100%;height:auto;display:block;margin:16px 0}details{background:#141414;padding:12px 16px;margin:12px 0}summary{cursor:pointer;font-weight:600}section{scroll-margin-top:20px}.note{border:1px solid #555;padding:12px 16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}@media(max-width:650px){main{padding:18px 14px 50px}.grid{grid-template-columns:1fr}h1{font-size:24px}th,td{padding:8px}table{min-width:590px}}@media print{body{background:#fff;color:#000}a{color:#124c80}h2{break-after:avoid}.decision,pre,th,details{background:#eee;color:#000}.meta,small{color:#444}svg{background:#000}nav{display:none}}
+</style></head><body><main><p class="meta">Narrow redesign proposal · 9 September 2026 · Checkout 5fc00db · Supersedes the storage redesign plans</p>
+<h1>Use etcd only for leader election</h1>
+<div class="decision"><p><strong>Replace the custom election algorithm with one lease-backed leader record in etcd.</strong></p><p>Keep shared state, actions, snapshots, replication, recovery, and local reads in the existing Rust system.</p><p>etcd answers one question: which node currently owns leadership for this cluster?</p></div>
+<nav aria-label="Contents"><a href="#scope">Scope</a><a href="#election">Election lifecycle</a><a href="#integration">Integration</a><a href="#safety">Lease loss and promotion</a><a href="#delivery">Implementation</a></nav>
+<section id="scope"><h2>1. Exact boundary</h2>
+<div class="table"><table><thead><tr><th>Replace or adjust</th><th>Keep</th></tr></thead><tbody>
+<tr><td>Voting, candidate scoring, locally generated terms, and reachability-based election decisions in <code>src/cluster/leader.rs</code>.</td><td><code>DeterministicState</code> and its action/update API.</td></tr>
+<tr><td>The source of truth for <code>LeaderState</code>: derive it from the etcd owner record.</td><td>Leader-to-follower action replication and forwarding through peers.</td></tr>
+<tr><td>Leadership checks: include the lease session and full election epoch.</td><td><code>RecoverableState</code>, generation bumps, snapshot transfer, and sequenced broadcast.</td></tr>
+<tr><td>Election-only peer metadata, such as <code>reachable_voters</code>.</td><td>Peer discovery, connections, transport adapters, RPC, relay paths, and hot-read handles.</td></tr>
+</tbody></table></div>
+<p><code>submit_action</code> continues to mean queue acceptance. This change introduces no commit receipt, durable action log, or new state-storage API.</p>
+<pre><code>                    etcd
+              lease + owner record
+                /      |      \
+             node A  node B  node C
+                \      |      /
+             existing peer network
+          actions / snapshots / recovery
+
+Application reads → existing local StateHandle
+Application writes → existing queue → elected leader</code></pre>
+<p>Application action volume does not determine etcd write volume. etcd traffic consists of lease renewal, owner observation, and leadership transitions.</p>
+</section>
+<section id="election"><h2>2. One leased record per cluster</h2>
+<pre><code>/sharedstate/{cluster_id}/{election_incarnation}/leader
+    {
+        protocol_version,
+        node_address,
+        process_session_id,
+        phase: "preparing" | "ready"
+    }
+    attached to: lease_id
+
+LeadershipEpoch = (election_incarnation, key.create_revision)</code></pre>
+<p>Use a fresh process session ID for each acquisition attempt. An address alone cannot distinguish a restarted node from its predecessor.</p>
+<p>Use the key’s full creation revision as the epoch. Updating its readiness phase preserves that epoch.</p>
+<p>The incarnation separates restored or replaced etcd clusters. Provision a new incarnation during such maintenance and restart participating applications together.</p>
+<p>etcd transactions support atomic comparisons. Lease expiry removes attached keys, which permits another acquisition. <a href="https://etcd.io/docs/v3.6/learning/api/" target="_blank" rel="noopener noreferrer">etcd transaction and lease API</a></p>
+<h3>Acquisition</h3>
+<ol><li>Start the existing RPC listener and peer synchronization tasks.</li><li>Read the owner record using a linearizable read.</li><li>If an owner exists, observe it and follow when it becomes ready.</li><li>If no owner exists, eligible <code>can_lead</code> nodes request a lease.</li><li>Attempt an atomic create-if-absent transaction with the leased record in <code>preparing</code> phase.</li><li>If acquisition loses, revoke the unused lease and follow the recorded owner.</li><li>If acquisition wins, maintain the lease while completing the promotion checks.</li><li>After preparation, conditionally set the same record to <code>ready</code>.</li><li>Enter <code>Leading</code> only after confirming ownership, readiness, and current lease validity.</li></ol>
+<pre><code>Acquire:
+    IF VERSION(leader_key) == 0
+    THEN PUT leader_key = my_preparing_record WITH lease
+    ELSE GET leader_key
+
+Publish ready:
+    IF CREATE(leader_key) == my_epoch
+       AND VALUE(leader_key) == my_preparing_record
+    THEN PUT leader_key = my_ready_record WITH same_lease</code></pre>
+<p>Use jitter between unsuccessful acquisition attempts. No candidate ranking or address-based winner guarantee remains.</p>
+<p>If an acquisition response is lost, read the record and verify its session and lease. Never infer ownership from a timeout.</p>
+<h3>Observation</h3>
+<p>Every node observes the same owner key, including nodes with <code>can_lead = false</code>. Observers never acquire leases.</p>
+<p>After reading at revision R, watch from R + 1. On compaction, repeat the read and restart the watch.</p>
+<p>Use periodic bounded linearizable reads to detect a silent watch. Watch delivery alone has no bounded freshness guarantee. <a href="https://etcd.io/docs/v3.6/learning/api_guarantees/" target="_blank" rel="noopener noreferrer">etcd guarantees</a></p>
+<p>Register the advertised owner address with existing peer connections. Continue using initial peers for relay discovery and recovery sources.</p>
+<p>An unreachable owner is not permission to replace it. Acquisition remains conditional on the key’s absence.</p>
+<h3>Resignation</h3>
+<p>Close local authority admission before releasing ownership. Stop the old epoch’s action production and close its active replication feeds.</p>
+<p>Then revoke this session’s lease. If cleanup cannot reach etcd, allow the lease to expire.</p>
+<p>Never unconditionally delete the leader key during delayed cleanup. A successor may already own it.</p>
+</section>
+<section id="integration"><h2>3. Fit the existing code</h2>
+<div class="table"><table><thead><tr><th>Location</th><th>Focused change</th></tr></thead><tbody>
+<tr><td><code>src/cluster/leader.rs</code></td><td>Replace election computation with <code>EtcdLeaderTask</code>: acquisition, renewal, observation, and resignation.</td></tr>
+<tr><td><code>src/service.rs</code></td><td>Add etcd election configuration and start the replacement leader task. Retain RPC, discovery, and state-sync tasks.</td></tr>
+<tr><td><code>src/cluster/node_state.rs</code></td><td>Track the observed epoch and local leadership permit. Retain peer and shared-state fields.</td></tr>
+<tr><td><code>src/cluster/state_sync.rs</code></td><td>Check the exact epoch and permit before authoritative updates. React to revocation and epoch changes immediately.</td></tr>
+<tr><td><code>src/cluster/rpc_server.rs</code></td><td>Identify the epoch in subscription responses and feeds. Close or reject feeds from invalidated epochs.</td></tr>
+<tr><td><code>src/protocol/messages.rs</code></td><td>Encode a full-width epoch in leader information and replication envelopes. Bump the wire protocol version.</td></tr>
+<tr><td><code>src/cluster/peer_discovery.rs</code></td><td>Keep address exchange and recovery metadata. Remove reachability reports used only for voting.</td></tr>
+<tr><td><code>src/cluster/peer_connections.rs</code></td><td>Keep transport and RPC handling. Require matching owner address and epoch when selecting a relay.</td></tr>
+<tr><td><code>examples/kv_tui.rs</code></td><td>Add etcd endpoint and cluster arguments. Display leader, epoch, and lease health alongside existing state views.</td></tr>
+</tbody></table></div>
+<p>The current <code>ElectionTerm</code> packs a term and nonce into a u64. Do not pass etcd revisions through its shifting constructors.</p>
+<p>Replace that representation with an explicit epoch type. Keep recovery generations separate because they describe replicated state history.</p>
+<p>A local mode can remain <code>NoLeader</code>, <code>Electing</code>, <code>Leading</code>, or <code>Following</code>. Remove the vote payload from <code>Electing</code>.</p>
+<p>Represent <code>preparing</code> ownership internally without advertising an active leader. Wake state sync through a notification when ownership changes.</p>
+<pre><code>EtcdElectionConfig {
+    endpoints,
+    cluster_id,
+    election_incarnation,
+    tls_configuration,
+    lease_ttl,
+    renewal_interval,
+    request_timeout,
+    authority_safety_margin,
+    promotion_timeout,
+}
+
+Retain: io, my_address, can_lead, initial_peers,
+        initial_state, broadcast and synchronization settings.</code></pre>
+<p>Keep startup synchronous if preserving the existing API is useful. Start in <code>NoLeader</code> and expose connection failures through status.</p>
+</section>
+<section id="safety"><h2>4. Lease loss must stop authority</h2>
+<p>Model local authority as a revocable permit containing the session, epoch, and conservative monotonic deadline.</p>
+<p>Derive renewal deadlines conservatively from request timing and returned TTL. Reject delayed responses that cannot establish a usable remaining interval.</p>
+<p>Invalidate the permit on lease expiry, ownership mismatch, renewal failure, or an elapsed deadline. Stop applying authoritative actions immediately.</p>
+<p>Check the permit at the actual update boundary, including after awaited work. A boolean checked before an await is insufficient.</p>
+<p>After an uncertain session, revoke it and acquire a fresh session before leading again. Do not revive an old permit.</p>
+<p>Initially request a 15-second lease and renew around every five seconds. Treat these as test values, with conservative demotion before expiry.</p>
+<p>Use the server-granted TTL in the implementation. Validate deadline behavior under delayed responses, scheduler stalls, and process suspension.</p>
+<h3>Reject stale replication epochs</h3>
+<p>Carry the origin epoch on authoritative stream envelopes and snapshot handshakes. Relays preserve that epoch rather than substituting their own identity.</p>
+<p>Accept a stream only for the locally validated ready owner and epoch. Cancel it on ownership changes or expired observation validity.</p>
+<p>A higher epoch claimed by a peer is not proof of ownership. Refresh the etcd record before accepting it.</p>
+<p>Following by address alone is insufficient: a restarted leader may reuse its address with a different epoch.</p>
+<p><strong>Guarantee boundary:</strong> etcd serializes ownership of its key. It does not atomically fence writes to this project’s in-memory state.</p>
+<p>Deadlines and epoch checks limit stale-leader activity. A replica with stale ownership knowledge can still accept stale traffic until it invalidates that knowledge.</p>
+<p>This narrow change does not establish linearizable replication under arbitrary process pauses or partitions. Do not describe a lease as that guarantee.</p>
+<p>External irreversible effects require fencing at their destination. Existing state updates remain subject to the project’s replication and recovery semantics.</p>
+<h3>Promotion still needs state preparation</h3>
+<p>The existing election considers recovery compatibility when preferring candidates. Replacing that selection with an etcd race changes which replica may win.</p>
+<p>Keep a bounded preparation step before publishing <code>ready</code>. Compare available peer recovery details and recover from a compatible source when necessary.</p>
+<p>Reuse existing recovery checks and snapshot transfer. Do not introduce new voting, majority counting, or distributed candidate scores.</p>
+<p>If known histories conflict, or required recovery cannot complete, relinquish the lease and report blocked promotion.</p>
+<p>A newly started empty node must synchronize before becoming eligible. For an entirely new cluster, explicitly designate its initial-state bootstrap node.</p>
+<p>After preparation, perform the existing generation bump once for the acquired epoch. Then publish readiness while the permit remains valid.</p>
+<p>etcd cannot establish that the winner has every action from the previous leader. Those actions never passed through etcd.</p>
+<p>Keep the existing asynchronous replication loss boundary explicit. If no acceptable recovery source exists, require operator recovery rather than silently bootstrapping empty state.</p>
+<h3>Failure behavior</h3>
+<div class="table"><table><thead><tr><th>Failure</th><th>Behavior</th></tr></thead><tbody>
+<tr><td>Leader crashes</td><td>Its lease expires. An eligible replica acquires ownership, prepares state, and starts the existing replication path.</td></tr>
+<tr><td>Leader loses etcd access but retains peers</td><td>Its permit expires or is invalidated. It stops authority even if peer connections remain healthy.</td></tr>
+<tr><td>Follower cannot reach the leader</td><td>Try existing relays for the same validated epoch. Never override a live etcd owner.</td></tr>
+<tr><td>etcd loses quorum</td><td>No new leader can acquire ownership. Existing local reads continue; authority stops when its permit cannot remain valid.</td></tr>
+<tr><td>Old leader resumes</td><td>Discard its stale permit and feeds. Observe the current owner and use existing recovery before further participation.</td></tr>
+<tr><td>All nodes restart</td><td>Recover state through the existing application mechanism. The election record contains no shared-state backup.</td></tr>
+</tbody></table></div>
+</section>
+<section id="delivery"><h2>5. Implement as three focused changes</h2>
+<ol><li><strong>Add the election adapter.</strong> Implement the leased owner record, observation, session deadlines, and ownership status.</li><li><strong>Integrate ownership.</strong> Replace <code>LeaderTask</code>, add epoch-aware replication checks, and retain state preparation and recovery.</li><li><strong>Cut over and remove voting.</strong> Update configuration, port election tests, and delete obsolete voting and reachability logic.</li></ol>
+<p>Use one etcd client library behind the election module. Keep etcd calls out of <code>DeterministicState</code> and per-action processing.</p>
+<p>Use a single-node etcd instance for local development. Test production failure behavior against a three-member etcd cluster.</p>
+<h3>Required verification</h3>
+<ul><li>Simultaneous contenders produce one ready owner for an epoch.</li><li>Observers never acquire leadership.</li><li>Lost acquisition responses cannot create an unverified leader.</li><li>Lease loss stops authority while peer links remain connected.</li><li>A paused old leader cannot resume using its expired permit.</li><li>Epoch changes invalidate direct and relayed streams, including same-address restarts.</li><li>Compacted or silently stalled owner watches recover correctly.</li><li>A lagging candidate recovers before readiness; an empty candidate cannot bypass bootstrap rules.</li><li>Existing action replication, recovery, relay, and TCP failover scenarios continue to pass.</li></ul>
+<p>Update tests that expect the lowest node address to win. Assert one observed owner and working replication instead.</p>
+<h3>Deployment</h3>
+<p>Provision etcd endpoints, a cluster-specific election prefix, and scoped credentials. Point every participant at the same election configuration.</p>
+<p>Pause producers and stop all old election tasks before enabling the new protocol. Preserve node state through the existing recovery mechanism.</p>
+<p>Start the chosen prepared node first, then synchronize followers. Resume producers after one ready owner and converged participating replicas are observed.</p>
+<p>Do not run legacy voting and etcd ownership simultaneously in one logical cluster. They can authorize different leaders.</p>
+<p>Rollback requires stopping all etcd-controlled participants before restarting the legacy election path. Preserve current state using existing recovery procedures.</p>
+<p><strong>No shared-state migration into etcd is required.</strong> This deployment changes the authority mechanism and its wire metadata.</p>
+</section>
+<section><h2>6. Completion criteria</h2>
+<p>The custom voting algorithm is gone. etcd determines the owner, and lease validity controls local authority.</p>
+<p>The existing state API, local read path, action replication, relay support, snapshots, and recovery remain in use.</p>
+<p>The implementation contains no application snapshots, action log, or per-action writes in etcd.</p>
+<p class="meta">Based on the inspected leader, state-sync, RPC, protocol, discovery, and service modules. This is a plan; no project code was changed.</p>
+</section>
+</main></body></html>
