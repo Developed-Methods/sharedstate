@@ -6,7 +6,11 @@
 //! state when possible, resetting from a fresh snapshot otherwise) and
 //! forwards client actions to the leader. If the leader cannot be reached
 //! directly, the task relays through another peer after confirming over RPC
-//! that the peer follows the same leader.
+//! that the peer follows the same leader; the peer only accepts if it is fed
+//! directly by the leader, so relay chains never grow past one hop or loop.
+//!
+//! The task publishes its sync status on the node state so the rpc server
+//! knows when this node is a live source others may subscribe to.
 
 use std::{
     io::{Error, ErrorKind},
@@ -19,7 +23,10 @@ use message_encoding::MessageEncoding;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
-    cluster::{node_state::NodeState, peer_connections::PeerConnections},
+    cluster::{
+        node_state::{NodeState, SyncStatus},
+        peer_connections::PeerConnections,
+    },
     protocol::messages::{ElectionTerm, LeaderMode, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         deterministic_state::DeterministicState, recoverable_state::RecoverableStateAction,
@@ -125,6 +132,12 @@ where
     }
 
     async fn lead(&mut self, term: ElectionTerm) -> Flow {
+        let flow = self.lead_until_displaced(term).await;
+        self.set_sync_status(SyncStatus::NotSynced);
+        flow
+    }
+
+    async fn lead_until_displaced(&mut self, term: ElectionTerm) -> Flow {
         /* bump the recovery generation so followers of the previous leader
          * can recover from us without a full state transfer */
         let new_id = unique_state_id(&self.state.my_address);
@@ -133,6 +146,7 @@ where
             .update(iter::once(RecoverableStateAction::BumpGeneration { new_id }))
             .await;
         tracing::info!(%term, "leading, taking authority over shared state");
+        self.set_sync_status(SyncStatus::Leading);
 
         loop {
             tokio::select! {
@@ -264,7 +278,25 @@ where
             }
         };
 
-        self.stream(target, leader, next_seq, &mut read).await
+        self.set_sync_status(if target == leader {
+            SyncStatus::Direct { leader }
+        } else {
+            SyncStatus::Relayed { relay: target, leader }
+        });
+        let attempt = self.stream(target, leader, next_seq, &mut read).await;
+        self.set_sync_status(SyncStatus::NotSynced);
+        attempt
+    }
+
+    fn set_sync_status(&self, status: SyncStatus<I::Address>) {
+        self.state.sync_status.send_if_modified(|current| {
+            if *current == status {
+                return false;
+            }
+            tracing::info!(previous = ?*current, ?status, "sync status updated");
+            *current = status;
+            true
+        });
     }
 
     /// Handshakes and subscribes, recovering the local state when the target
@@ -313,9 +345,11 @@ where
                         tracing::info!(?target, next_seq, "reset local state from fresh snapshot");
                         Ok(next_seq)
                     }
+                    SyncResponse::NotSynced => Err(not_synced()),
                     response => Err(unexpected("FreshState", &response)),
                 }
             }
+            SyncResponse::NotSynced => Err(not_synced()),
             response => Err(unexpected("Accepted or RecoveryFailed", &response)),
         }
     }
@@ -433,6 +467,10 @@ fn unexpected<A: SyncIOAddress, D: DeterministicState>(expected: &str, response:
     Error::new(ErrorKind::InvalidData, format!("expected {expected}, got {}", response.name()))
 }
 
+fn not_synced() -> Error {
+    Error::new(ErrorKind::NotConnected, "target is not a live source for the state")
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -446,7 +484,7 @@ mod tests {
     use sequenced_broadcast::SequencedBroadcastSettings;
     use tokio::{
         io::{duplex, split, DuplexStream, ReadHalf, WriteHalf},
-        sync::{mpsc, Mutex, Notify},
+        sync::{mpsc, watch, Mutex, Notify},
     };
 
     use super::*;
@@ -514,6 +552,7 @@ mod tests {
                 term: ElectionTerm::from_term(0),
                 mode,
             }),
+            sync_status: watch::Sender::new(SyncStatus::NotSynced),
         })
     }
 

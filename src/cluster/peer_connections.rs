@@ -500,11 +500,12 @@ mod tests {
     use sequenced_broadcast::SequencedBroadcastSettings;
     use tokio::{
         io::{duplex, split, DuplexStream, ReadHalf, WriteHalf},
-        sync::{Mutex, Notify, Semaphore},
+        sync::{watch, Mutex, Notify, Semaphore},
     };
 
     use super::*;
     use crate::{
+        cluster::node_state::SyncStatus,
         protocol::messages::{ElectionTerm, LeaderMode},
         state::{recoverable_state::RecoverableState, subscribable_state::SubscribableState},
         transport::traits::SyncConnection,
@@ -638,6 +639,7 @@ mod tests {
                 term: ElectionTerm::from_term(0),
                 mode: LeaderMode::Following { leader: 2 },
             }),
+            sync_status: watch::Sender::new(SyncStatus::NotSynced),
         })
     }
 

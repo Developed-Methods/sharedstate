@@ -1,6 +1,6 @@
 use std::{collections::HashMap, num::NonZeroU64};
 
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 use crate::{
     protocol::messages::{LeaderInfo, LeaderState, SharePeerDetails},
@@ -15,6 +15,34 @@ pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
     pub peers: Mutex<HashMap<A, PeerState<A>>>,
     pub state: SubscribableState<D>,
     pub leader_state: Mutex<LeaderState<A>>,
+    /// Where the local state currently gets its updates from. Published by
+    /// the state sync task; the rpc server only serves subscriptions while
+    /// this says the node is a live source (see [`SyncStatus::can_relay`]).
+    pub sync_status: watch::Sender<SyncStatus<A>>,
+}
+
+/// How the local state is being kept up to date.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncStatus<A: SyncIOAddress> {
+    /// No live source: waiting for a leader, or between subscriptions.
+    NotSynced,
+    /// This node has authority over the state.
+    Leading,
+    /// Subscribed straight to the leader's feed.
+    Direct { leader: A },
+    /// Subscribed to a peer that is itself subscribed to the leader.
+    Relayed { relay: A, leader: A },
+}
+
+impl<A: SyncIOAddress> SyncStatus<A> {
+    /// Whether other nodes may subscribe to this node's feed. Relaying is
+    /// limited to one hop from the leader: a node fed through a relay never
+    /// serves subscriptions itself. Otherwise nodes that are cut off from the
+    /// leader can subscribe to each other and sit forever on silent feeds,
+    /// never retrying the leader once it is reachable again.
+    pub fn can_relay(&self) -> bool {
+        matches!(self, Self::Leading | Self::Direct { .. })
+    }
 }
 
 #[derive(Clone)]

@@ -143,6 +143,9 @@ pub enum SyncResponse<A: SyncIOAddress, D: DeterministicState> {
     ActionStreamClosed,
     UnexpectedRequest,
     LeaderState(LeaderState<A>),
+    /// The node is not a live source for the state (not leading and not
+    /// subscribed directly to the leader), so it won't serve subscriptions.
+    NotSynced,
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> SyncResponse<A, D> {
@@ -158,6 +161,7 @@ impl<A: SyncIOAddress, D: DeterministicState> SyncResponse<A, D> {
             SyncResponse::ActionStreamClosed => "ActionStreamClosed",
             SyncResponse::UnexpectedRequest => "UnexpectedRequest",
             SyncResponse::LeaderState(_) => "LeaderState",
+            SyncResponse::NotSynced => "NotSynced",
         }
     }
 }
@@ -369,6 +373,7 @@ where
                 sum += 9u16.write_to(out)?;
                 state.write_to(out)?
             }
+            Self::NotSynced => 10u16.write_to(out)?,
         };
 
         Ok(sum)
@@ -388,6 +393,7 @@ where
             7 => Self::ActionStreamClosed,
             8 => Self::UnexpectedRequest,
             9 => Self::LeaderState(MessageEncoding::read_from(read)?),
+            10 => Self::NotSynced,
             other => return Err(unknown_id_err(other, "SyncResponse")),
         })
     }
@@ -534,6 +540,7 @@ mod tests {
                 }),
                 9,
             ),
+            (SyncResponse::NotSynced, 10),
         ];
 
         for (response, tag) in cases {
