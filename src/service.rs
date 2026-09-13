@@ -9,7 +9,7 @@ use sequenced_broadcast::{SequencedBroadcastSettings, SettingsError};
 use tokio::{
     sync::{
         mpsc::{self, error::SendError},
-        Mutex,
+        watch, Mutex,
     },
     task::JoinHandle,
 };
@@ -17,7 +17,7 @@ use tokio::{
 use crate::{
     cluster::{
         leader::{LeaderTask, LeaderTiming},
-        node_state::{NodeState, PeerState},
+        node_state::{NodeState, PeerState, SyncStatus},
         peer_connections::PeerConnections,
         peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
         rpc_server::RpcServer,
@@ -121,6 +121,7 @@ where
                 term: ElectionTerm::default(),
                 mode: LeaderMode::NoLeader,
             }),
+            sync_status: watch::Sender::new(SyncStatus::NotSynced),
         });
 
         let peer_connections = Arc::new(PeerConnections::new(io.clone(), settings.net.clone(), node.clone()));
@@ -496,6 +497,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observers_resume_after_losing_every_voter() {
+        let net = SimulatedNet::new();
+        let node1 = start_node(&net, 1, true, &[2, 3, 4, 5]).await;
+        let node2 = start_node(&net, 2, true, &[1, 3, 4, 5]).await;
+        let node3 = start_node(&net, 3, true, &[1, 2, 4, 5]).await;
+        let node4 = start_node(&net, 4, false, &[1, 2, 3, 5]).await;
+        let node5 = start_node(&net, 5, false, &[1, 2, 3, 4]).await;
+
+        wait_for_leader(&[&node1, &node2, &node3, &node4, &node5], 1).await;
+        node1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&node4, 1, 1).await;
+        wait_for_value(&node5, 1, 1).await;
+
+        /* every voter loses the observers, like a datacenter link outage; the
+         * observers can still reach each other and must not lock onto one
+         * another as relays */
+        for voter in [1, 2, 3] {
+            for observer in [4, 5] {
+                net.set_edge_blocked(voter, observer, true).await;
+            }
+        }
+
+        node1.submit_action((2, 2)).await.unwrap();
+        wait_for_value(&node3, 2, 2).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        for voter in [1, 2, 3] {
+            for observer in [4, 5] {
+                net.set_edge_blocked(voter, observer, false).await;
+            }
+        }
+
+        wait_for_value(&node4, 2, 2).await;
+        wait_for_value(&node5, 2, 2).await;
+
+        node1.submit_action((3, 3)).await.unwrap();
+        wait_for_value(&node4, 3, 3).await;
+        wait_for_value(&node5, 3, 3).await;
+    }
+
+    #[tokio::test]
+    async fn relayed_observer_moves_when_its_relay_loses_the_leader() {
+        let net = SimulatedNet::new();
+        let node1 = start_node(&net, 1, true, &[2, 3, 4]).await;
+        let node2 = start_node(&net, 2, true, &[1, 3, 4]).await;
+        let node3 = start_node(&net, 3, true, &[1, 2, 4]).await;
+        let node4 = start_node(&net, 4, false, &[1, 2, 3]).await;
+
+        wait_for_leader(&[&node1, &node2, &node3, &node4], 1).await;
+        node1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&node4, 1, 1).await;
+
+        /* the observer can only reach the leader through voters 2 and 3 */
+        net.set_edge_blocked(1, 4, true).await;
+        node1.submit_action((2, 2)).await.unwrap();
+        wait_for_value(&node4, 2, 2).await;
+
+        let relay = match *node4.node().sync_status.borrow() {
+            SyncStatus::Relayed { relay, leader: 1 } => relay,
+            status => panic!("observer should be relayed from a voter, got {status:?}"),
+        };
+        let other_voter = if relay == 2 { 3 } else { 2 };
+
+        /* the relay loses its direct link to the leader; it is still vouched
+         * for by the rest of the cluster so it keeps following, but it must
+         * stop serving the observer, which then moves to the other voter */
+        net.set_edge_blocked(1, relay, true).await;
+        node1.submit_action((3, 3)).await.unwrap();
+        wait_for_value(&node4, 3, 3).await;
+        wait_for(&format!("observer to relay through voter {other_voter}"), || {
+            matches!(
+                *node4.node().sync_status.borrow(),
+                SyncStatus::Relayed { relay, leader: 1 } if relay == other_voter
+            )
+        })
+        .await;
+
+        /* healing the direct link lets the observer subscribe directly again
+         * once the relayed feed is disturbed; a further action still arrives */
+        net.set_edge_blocked(1, 4, false).await;
+        node1.submit_action((4, 4)).await.unwrap();
+        wait_for_value(&node4, 4, 4).await;
+    }
+
+    #[tokio::test]
     async fn old_leader_rejoins_as_follower_and_its_actions_apply() {
         let net = SimulatedNet::new();
         let node1 = start_node(&net, 1, true, &[2, 3]).await;
@@ -569,10 +655,10 @@ mod tests {
         let node3 = Arc::new(start_node(&net, 3, true, &[1, 2]).await);
 
         let old_leader = wait_for_common_leader(&[&node1, &node2, &node3]).await;
-        let (survivor_a, survivor_b, new_leader, moved_follower) = match old_leader {
-            1 => (node2.clone(), node3.clone(), 2, node3.clone()),
-            2 => (node1.clone(), node3.clone(), 1, node3.clone()),
-            3 => (node1.clone(), node2.clone(), 1, node2.clone()),
+        let (survivor_a, survivor_b) = match old_leader {
+            1 => (node2.clone(), node3.clone()),
+            2 => (node1.clone(), node3.clone()),
+            3 => (node1.clone(), node2.clone()),
             _ => unreachable!("test only starts nodes 1, 2, and 3"),
         };
 
@@ -597,7 +683,15 @@ mod tests {
         net.stop_node(old_leader).await;
         flood.abort();
 
-        wait_for_leader(&[&survivor_a, &survivor_b], new_leader).await;
+        /* the survivors have equal state, so the connectivity tiebreak
+         * decides between them; either may win */
+        let new_leader = wait_for_common_leader(&[&survivor_a, &survivor_b]).await;
+        assert_ne!(new_leader, old_leader);
+        let moved_follower = if survivor_a.my_address() == new_leader {
+            &survivor_b
+        } else {
+            &survivor_a
+        };
 
         /* after the failover flood, a fresh action from the moved follower
          * must not be wedged behind stale routing state */

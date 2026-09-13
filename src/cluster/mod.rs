@@ -14,12 +14,12 @@ mod tests {
 
     use message_encoding::MessageEncoding;
     use sequenced_broadcast::SequencedBroadcastSettings;
-    use tokio::sync::{mpsc, Mutex};
+    use tokio::sync::{mpsc, watch, Mutex};
 
     use crate::{
         cluster::{
             leader::{LeaderMode, LeaderTask, LeaderTiming},
-            node_state::{NodeState, PeerState},
+            node_state::{NodeState, PeerState, SyncStatus},
             peer_connections::PeerConnections,
             peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
             rpc_server::RpcServer,
@@ -95,6 +95,7 @@ mod tests {
                     term: ElectionTerm::from_term(0),
                     mode: LeaderMode::NoLeader,
                 }),
+                sync_status: watch::Sender::new(SyncStatus::NotSynced),
             });
 
             let connections = Arc::new(PeerConnections::new(io.clone(), settings.clone(), state.clone()));
