@@ -156,6 +156,22 @@ impl SimulatedNet {
         }
     }
 
+    /// Connections open on an edge, in either direction. A connection counts
+    /// while any of its stream halves is still alive.
+    pub async fn edge_connection_count(&self, a: u64, b: u64) -> usize {
+        let inner = self.inner.lock().await;
+        inner
+            .active_connection_edges
+            .get(&Self::edge_key(a, b))
+            .map(|handles| {
+                handles
+                    .chunks(HANDLES_PER_CONNECTION)
+                    .filter(|connection| connection.iter().any(KillHandle::is_live))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     pub fn edge_key(a: u64, b: u64) -> (u64, u64) {
         if a < b {
             (a, b)
@@ -275,7 +291,16 @@ impl KillHandle {
             let _ = tx.send(());
         }
     }
+
+    /// True until the stream half is killed or dropped.
+    fn is_live(&self) -> bool {
+        self.0.lock().unwrap().as_ref().is_some_and(|tx| !tx.is_closed())
+    }
 }
+
+/// Each connection registers one handle per stream half: client read and
+/// write, server read and write.
+const HANDLES_PER_CONNECTION: usize = 4;
 
 /// How often a blackholed stream re-checks whether the blackhole lifted.
 const BLACKHOLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
