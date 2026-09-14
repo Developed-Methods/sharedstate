@@ -351,6 +351,8 @@ mod dead_voter_expiry_tests {
     /// strict majority, so the election never completes.
     #[tokio::test]
     async fn rolling_voter_replacement_does_not_stall_election() {
+        let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+
         let net = SimulatedNet::new();
         let mut voters = vec![
             Voter::start(&net, 1, &[2, 3]).await,
