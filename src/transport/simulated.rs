@@ -27,6 +27,7 @@ struct SimulatedNetInner {
     listeners: HashMap<u64, mpsc::Sender<SimulatedIncoming>>,
     active_connections: HashMap<u64, Vec<KillHandle>>,
     active_connection_edges: HashMap<(u64, u64), Vec<KillHandle>>,
+    edge_connections_opened: HashMap<(u64, u64), usize>,
     blocked_nodes: HashSet<u64>,
     blocked_edges: HashSet<(u64, u64)>,
     edge_latencies: HashMap<(u64, u64), Duration>,
@@ -47,6 +48,7 @@ impl SimulatedNet {
                 listeners: HashMap::new(),
                 active_connections: HashMap::new(),
                 active_connection_edges: HashMap::new(),
+                edge_connections_opened: HashMap::new(),
                 blocked_nodes: HashSet::new(),
                 blocked_edges: HashSet::new(),
                 edge_latencies: HashMap::new(),
@@ -172,6 +174,18 @@ impl SimulatedNet {
             .unwrap_or(0)
     }
 
+    /// Connections ever opened on an edge, in either direction. Unlike
+    /// [`edge_connection_count`](Self::edge_connection_count) this never
+    /// decreases, so it also sees connections that closed between polls.
+    pub async fn edge_connections_opened(&self, a: u64, b: u64) -> usize {
+        let inner = self.inner.lock().await;
+        inner
+            .edge_connections_opened
+            .get(&Self::edge_key(a, b))
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn edge_key(a: u64, b: u64) -> (u64, u64) {
         if a < b {
             (a, b)
@@ -230,6 +244,7 @@ impl SyncIO for SimulatedIo {
             active.extend(handles.iter().map(|(handle, _)| handle.clone()));
             let active = net.active_connection_edges.entry(edge).or_default();
             active.extend(handles.iter().map(|(handle, _)| handle.clone()));
+            *net.edge_connections_opened.entry(edge).or_default() += 1;
             (tx, handles, latency, blackhole)
         };
 
