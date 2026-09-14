@@ -206,12 +206,16 @@ impl Cluster {
         }
     }
 
-    async fn tunnel_edge_connection_counts(&self) -> BTreeMap<(u64, u64), usize> {
+    /// Connections ever opened between tunnel servers, per edge. Cumulative
+    /// rather than live: since the relay fix a tunnel server that tries
+    /// another tunnel server as relay is told NotSynced and hangs up within
+    /// milliseconds, so a live count would miss the attempt between polls.
+    async fn tunnel_edge_connections_opened(&self) -> BTreeMap<(u64, u64), usize> {
         let mut counts = BTreeMap::new();
         for a in TUNNEL_SERVERS {
             for b in TUNNEL_SERVERS {
                 if a < b {
-                    counts.insert((a, b), self.net.edge_connection_count(a, b).await);
+                    counts.insert((a, b), self.net.edge_connections_opened(a, b).await);
                 }
             }
         }
@@ -225,7 +229,7 @@ impl Cluster {
     async fn wait_for_tunnel_relays(&self, baseline: &BTreeMap<(u64, u64), usize>) {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let counts = self.tunnel_edge_connection_counts().await;
+            let counts = self.tunnel_edge_connections_opened().await;
             let relaying = TUNNEL_SERVERS.iter().all(|tunnel| {
                 counts
                     .iter()
@@ -236,7 +240,7 @@ impl Cluster {
             }
             assert!(
                 Instant::now() < deadline,
-                "tunnel servers never relayed through each other, tunnel edge connections {counts:?} (baseline {baseline:?})"
+                "tunnel servers never tried relaying through each other, tunnel edge connections opened {counts:?} (baseline {baseline:?})"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -276,7 +280,7 @@ async fn cluster_after_core_blip() -> Cluster {
 
     /* the core WAN link saturates: nothing between the sync-servers and the
      * tunnel servers gets through, existing connections die */
-    let baseline = cluster.tunnel_edge_connection_counts().await;
+    let baseline = cluster.tunnel_edge_connections_opened().await;
     cluster.set_core_links_blocked(true).await;
 
     cluster.wait_for_tunnel_relays(&baseline).await;
