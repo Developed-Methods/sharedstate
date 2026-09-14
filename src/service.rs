@@ -16,7 +16,7 @@ use tokio::{
 
 use crate::{
     cluster::{
-        leader::{LeaderTask, LeaderTiming},
+        leader::{LeaderTask, LeaderTiming, PeerExpiry},
         node_state::{NodeState, PeerState, SyncStatus},
         peer_connections::PeerConnections,
         peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
@@ -58,6 +58,7 @@ pub struct SharedStateSettings {
     pub discovery_timing: PeerDiscoveryTiming,
     pub leader_timing: LeaderTiming,
     pub sync_timing: StateSyncTiming,
+    pub peer_expiry: PeerExpiry,
 }
 
 const ACTION_QUEUE_CAPACITY: usize = 512;
@@ -133,7 +134,7 @@ where
             tokio::spawn(
                 PeerDiscoveryTask::new(node.clone(), peer_connections.clone(), settings.discovery_timing).run(),
             ),
-            tokio::spawn(LeaderTask::new(node.clone(), settings.leader_timing).run()),
+            tokio::spawn(LeaderTask::new(node.clone(), settings.leader_timing, settings.peer_expiry).run()),
             tokio::spawn(
                 StateSyncTask::new(node.clone(), peer_connections, io, settings.net, actions_rx, settings.sync_timing)
                     .run(),
@@ -268,6 +269,7 @@ mod tests {
                 leader_poll_interval: Duration::from_millis(20),
                 retry_delay: Duration::from_millis(50),
             },
+            peer_expiry: Default::default(),
         }
     }
 

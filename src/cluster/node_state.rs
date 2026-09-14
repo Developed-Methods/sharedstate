@@ -1,4 +1,4 @@
-use std::{collections::HashMap, num::NonZeroU64};
+use std::{collections::HashMap, num::NonZeroU64, time::Duration};
 
 use tokio::sync::{watch, Mutex};
 
@@ -76,6 +76,24 @@ impl<A: SyncIOAddress> PeerState<A> {
             last_global_connectivity: None,
             leader_info: None,
         }
+    }
+
+    /// Whether nobody in the cluster has heard from this peer for longer
+    /// than `horizon` while our own dial to it fails. Such a peer is treated
+    /// as gone: it no longer counts toward the voter majority, so a cluster
+    /// whose voters were replaced one by one can still elect. The entry is
+    /// kept so discovery keeps retrying and a returning peer counts again as
+    /// soon as it is heard from.
+    ///
+    /// The failed-connect timestamp is refreshed on every retry, so the age
+    /// comes from `last_global_connectivity` instead. A peer nobody has ever
+    /// heard from has no age and never expires.
+    pub fn is_expired(&self, now_ms: u64, horizon: Duration) -> bool {
+        let Some(last_seen) = self.last_global_connectivity else {
+            return false;
+        };
+        matches!(self.connect_status, ConnectStatus::FailedToConnect { .. })
+            && duration_ms(horizon) < now_ms.saturating_sub(last_seen.get())
     }
 
     pub(crate) fn share_details(&self) -> SharePeerDetails<A> {
@@ -162,5 +180,60 @@ fn merge_last_activity(current: Option<NonZeroU64>, incoming: Option<NonZeroU64>
         (None, Some(activity)) | (Some(activity), None) => Some(activity),
         (Some(a), Some(b)) => Some(a.max(b)),
         (None, None) => None,
+    }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HORIZON: Duration = Duration::from_secs(60 * 60);
+    const NOW: u64 = 10 * 60 * 60 * 1000;
+
+    fn peer(connect_status: ConnectStatus, last_seen_ms: Option<u64>) -> PeerState<u16> {
+        PeerState {
+            addr: 1,
+            can_lead: Some(true),
+            connect_status,
+            last_global_connectivity: last_seen_ms.and_then(NonZeroU64::new),
+            leader_info: None,
+        }
+    }
+
+    fn ms(duration: Duration) -> u64 {
+        duration.as_millis() as u64
+    }
+
+    #[test]
+    fn expires_once_unheard_for_longer_than_horizon() {
+        let failed = ConnectStatus::FailedToConnect { epoch_ms: NOW };
+        assert!(peer(failed, Some(NOW - ms(HORIZON) - 1)).is_expired(NOW, HORIZON));
+        assert!(!peer(failed, Some(NOW - ms(HORIZON))).is_expired(NOW, HORIZON));
+        assert!(!peer(failed, Some(NOW)).is_expired(NOW, HORIZON));
+    }
+
+    #[test]
+    fn only_expires_while_dialing_fails() {
+        let long_ago = Some(NOW - 2 * ms(HORIZON));
+        assert!(!peer(ConnectStatus::Connected { epoch_ms: NOW }, long_ago).is_expired(NOW, HORIZON));
+        assert!(!peer(ConnectStatus::NotConnected, long_ago).is_expired(NOW, HORIZON));
+    }
+
+    #[test]
+    fn never_heard_from_does_not_expire() {
+        let failed = ConnectStatus::FailedToConnect { epoch_ms: 0 };
+        assert!(!peer(failed, None).is_expired(NOW, HORIZON));
+    }
+
+    #[test]
+    fn refreshed_failure_timestamp_does_not_reset_age() {
+        /* discovery redials and rewrites the failure epoch every retry; the
+         * peer must still count as expired */
+        let failed = ConnectStatus::FailedToConnect { epoch_ms: NOW };
+        assert!(peer(failed, Some(NOW - 2 * ms(HORIZON))).is_expired(NOW, HORIZON));
     }
 }

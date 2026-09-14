@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use message_encoding::MessageEncoding;
 use sequenced_broadcast::SequencedReceiver;
@@ -22,6 +22,9 @@ use crate::{
         traits::{SyncConnection, SyncIO, SyncIOAddress, SyncIOListener},
     },
 };
+
+const ACCEPT_RETRY_DELAY_MIN: Duration = Duration::from_millis(10);
+const ACCEPT_RETRY_DELAY_MAX: Duration = Duration::from_secs(1);
 
 pub struct RpcServer<A: SyncIOAddress, D: DeterministicState> {
     state: Arc<NodeState<A, D>>,
@@ -116,9 +119,11 @@ where
         I: SyncIOListener<Address = A>,
     {
         tokio::spawn(async move {
+            let mut retry_delay = ACCEPT_RETRY_DELAY_MIN;
             loop {
                 match io.next_client().await {
                     Ok(conn) => {
+                        retry_delay = ACCEPT_RETRY_DELAY_MIN;
                         let server = self.clone();
                         let settings = settings.clone();
                         tokio::spawn(async move {
@@ -126,8 +131,12 @@ where
                         });
                     }
                     Err(error) => {
-                        tracing::warn!(?error, "failed to accept client");
-                        continue;
+                        /* keep listening through transient failures like fd
+                         * exhaustion, but back off so a listener that is
+                         * gone for good doesn't spin and flood the logs */
+                        tracing::warn!(?error, retry_delay_ms = retry_delay.as_millis(), "failed to accept client");
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = (retry_delay * 2).min(ACCEPT_RETRY_DELAY_MAX);
                     }
                 }
             }
