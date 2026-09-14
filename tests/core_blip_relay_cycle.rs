@@ -115,6 +115,7 @@ fn fast_settings() -> SharedStateSettings {
             leader_poll_interval: Duration::from_millis(20),
             retry_delay: Duration::from_millis(50),
         },
+        peer_expiry: Default::default(),
     }
 }
 

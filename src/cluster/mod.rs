@@ -18,7 +18,7 @@ mod tests {
 
     use crate::{
         cluster::{
-            leader::{LeaderMode, LeaderTask, LeaderTiming},
+            leader::{LeaderMode, LeaderTask, LeaderTiming, PeerExpiry},
             node_state::{NodeState, PeerState, SyncStatus},
             peer_connections::PeerConnections,
             peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
@@ -106,7 +106,7 @@ mod tests {
             Self {
                 state: state.clone(),
                 discovery: PeerDiscoveryTask::new(state.clone(), connections, PeerDiscoveryTiming::default()),
-                leader: LeaderTask::new(state, LeaderTiming::default()),
+                leader: LeaderTask::new(state, LeaderTiming::default(), PeerExpiry::default()),
                 _actions_rx: actions_rx,
             }
         }
@@ -164,7 +164,7 @@ mod dead_voter_expiry_tests {
 
     use crate::{
         cluster::{
-            leader::{LeaderMode, LeaderTask, LeaderTiming},
+            leader::{LeaderMode, LeaderTask, LeaderTiming, PeerExpiry},
             node_state::{ConnectStatus, NodeState, PeerState, SyncStatus},
             peer_connections::PeerConnections,
             peer_discovery::{PeerDiscoveryTask, PeerDiscoveryTiming},
@@ -234,7 +234,7 @@ mod dead_voter_expiry_tests {
                 addr,
                 state: state.clone(),
                 discovery: PeerDiscoveryTask::new(state.clone(), connections, PeerDiscoveryTiming::default()),
-                leader: LeaderTask::new(state, LeaderTiming::default()),
+                leader: LeaderTask::new(state, LeaderTiming::default(), PeerExpiry::default()),
                 _actions_rx: actions_rx,
             }
         }
@@ -342,13 +342,54 @@ mod dead_voter_expiry_tests {
         voters.push(Voter::start(net, replacement, &survivors).await);
     }
 
+    /// A two voter cluster loses one voter. While the outage is shorter than
+    /// the horizon the survivor must keep waiting: one of two known voters is
+    /// not a majority, and the other side of a partition would look exactly
+    /// the same. Past the horizon the survivor leads alone, and when the
+    /// voter comes back it counts again and joins.
+    #[tokio::test]
+    async fn short_outage_blocks_election_and_long_outage_does_not() {
+        let horizon = PeerExpiry::default().voter_horizon;
+
+        let net = SimulatedNet::new();
+        let mut voters = vec![Voter::start(&net, 1, &[2]).await, Voter::start(&net, 2, &[1]).await];
+        assert_eq!(run_until_leader(&mut voters, "initial cluster").await, 1);
+
+        drop(voters.remove(1));
+        net.stop_node(2).await;
+        run_until_unreachable(&mut voters, 2).await;
+
+        age_unreachable_peers(&voters, horizon / 2).await;
+        for _ in 0..20 {
+            tick_all(&mut voters).await;
+        }
+        assert!(
+            matches!(voters[0].leader_state().await.mode, LeaderMode::Electing { .. }),
+            "survivor claimed leadership during a short outage, state {:?}",
+            voters[0].leader_state().await
+        );
+
+        age_unreachable_peers(&voters, horizon * 2).await;
+        assert_eq!(run_until_leader(&mut voters, "after the outage outlasts the horizon").await, 1);
+
+        voters.push(Voter::start(&net, 2, &[1]).await);
+        assert_eq!(run_until_leader(&mut voters, "after voter 2 returns").await, 1);
+
+        let peers = voters[0].state.peers.lock().await;
+        assert!(
+            !peers[&2].is_expired(now_ms(), horizon),
+            "returned voter is still treated as expired: {:?}",
+            peers[&2].connect_status
+        );
+    }
+
     /// Replacing every voter of a three node cluster one at a time, with a
     /// day between replacements, must leave a working cluster.
     ///
     /// Every voter that ever existed stays in the peer maps as a voter and
-    /// is gossiped to the replacements that never met it. After the third
-    /// replacement three live voters face six known voters, which is not a
-    /// strict majority, so the election never completes.
+    /// is gossiped to the replacements that never met it. Without expiry the
+    /// third replacement leaves three live voters facing six known voters,
+    /// which is not a strict majority, and the election never completes.
     #[tokio::test]
     async fn rolling_voter_replacement_does_not_stall_election() {
         let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();

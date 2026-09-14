@@ -10,6 +10,7 @@ use crate::{
     protocol::messages::{ElectionTerm, LeaderState},
     state::{deterministic_state::DeterministicState, recoverable_state::RecoverableStateDetails},
     transport::traits::SyncIOAddress,
+    utils::now_ms,
 };
 
 pub use crate::protocol::messages::LeaderMode;
@@ -27,6 +28,33 @@ impl Default for LeaderTiming {
     }
 }
 
+/// When to stop counting voters that have dropped out of the cluster.
+///
+/// Leadership needs a strict majority of every known voter, and unreachable
+/// voters keep counting so a partitioned minority can't elect its own leader.
+/// Without a bound that protection turns into a stall: voters replaced one by
+/// one stay in the count forever until the live set can no longer form a
+/// majority. The horizon is that bound.
+///
+/// A partition that outlasts the horizon lets both sides elect. When it heals
+/// the conflicting claims trigger a fresh election, but state written on the
+/// losing side in the meantime is lost, so keep the horizon well above any
+/// outage the cluster is expected to ride through.
+#[derive(Clone, Debug)]
+pub struct PeerExpiry {
+    /// A voter nobody has heard from for this long, while dialing it fails,
+    /// stops counting toward the majority.
+    pub voter_horizon: Duration,
+}
+
+impl Default for PeerExpiry {
+    fn default() -> Self {
+        Self {
+            voter_horizon: Duration::from_secs(6 * 60 * 60),
+        }
+    }
+}
+
 pub struct LeaderTask<A, D>
 where
     A: SyncIOAddress,
@@ -34,6 +62,7 @@ where
 {
     state: Arc<NodeState<A, D>>,
     timing: LeaderTiming,
+    expiry: PeerExpiry,
 }
 
 impl<A, D> LeaderTask<A, D>
@@ -41,8 +70,8 @@ where
     A: SyncIOAddress,
     D: DeterministicState,
 {
-    pub fn new(state: Arc<NodeState<A, D>>, timing: LeaderTiming) -> Self {
-        Self { state, timing }
+    pub fn new(state: Arc<NodeState<A, D>>, timing: LeaderTiming, expiry: PeerExpiry) -> Self {
+        Self { state, timing, expiry }
     }
 
     pub async fn run(mut self) {
@@ -74,13 +103,15 @@ where
                 });
 
             let report_threshold = reporter_count / 3;
+            let now = now_ms();
 
             let peer_views = peers
                 .values()
                 .map(|peer| {
                     let reported_reachable =
                         report_threshold < reach_table.get(&peer.addr).copied().unwrap_or(0);
-                    PeerView::new(peer, reported_reachable)
+                    let expired = peer.is_expired(now, self.expiry.voter_horizon);
+                    PeerView::new(peer, reported_reachable, expired)
                 })
                 .collect::<Vec<_>>();
 
@@ -131,7 +162,7 @@ struct PeerView<A: SyncIOAddress> {
 }
 
 impl<A: SyncIOAddress> PeerView<A> {
-    fn new(peer: &PeerState<A>, reported_reachable: bool) -> Self {
+    fn new(peer: &PeerState<A>, reported_reachable: bool, expired: bool) -> Self {
         /* a peer only counts as unreachable when our own dial failed and the
          * rest of the cluster doesn't vouch for it either */
         let unreachable =
@@ -144,8 +175,10 @@ impl<A: SyncIOAddress> PeerView<A> {
             addr: peer.addr,
             /* until we learn a peer's can_lead, assume it votes so we don't
              * claim leadership before discovery settles; unreachable peers
-             * with unknown status are excluded so they can't block elections */
-            is_voter: known_can_lead.unwrap_or(!unreachable),
+             * with unknown status are excluded so they can't block elections,
+             * and neither can voters that expired (see PeerExpiry) unless
+             * the rest of the cluster still reaches them */
+            is_voter: known_can_lead.unwrap_or(!unreachable) && !(expired && unreachable),
             connected: peer.connect_status.is_connected(),
             unreachable,
             leader_state: peer.leader_info.as_ref().map(|info| info.leader_state.clone()),
@@ -468,6 +501,36 @@ mod tests {
     fn assert_logical_state(actual: LeaderState<u16>, term: u64, mode: LeaderMode<u16>) {
         assert_eq!(actual.term.term(), term);
         assert_eq!(actual.mode, mode);
+    }
+
+    fn failed_peer(can_lead: Option<bool>) -> PeerState<u16> {
+        PeerState {
+            addr: 2,
+            can_lead,
+            connect_status: ConnectStatus::FailedToConnect { epoch_ms: 0 },
+            last_global_connectivity: None,
+            leader_info: None,
+        }
+    }
+
+    #[test]
+    fn expired_voter_is_not_counted() {
+        let view = PeerView::new(&failed_peer(Some(true)), false, true);
+        assert!(!view.is_voter);
+        assert!(view.unreachable);
+
+        /* not expired yet: still counts even though it can't be reached */
+        let view = PeerView::new(&failed_peer(Some(true)), false, false);
+        assert!(view.is_voter);
+    }
+
+    #[test]
+    fn expired_voter_still_counts_while_peers_reach_it() {
+        /* our dial fails but the cluster vouches for it: a local problem,
+         * not a dead voter */
+        let view = PeerView::new(&failed_peer(Some(true)), true, true);
+        assert!(view.is_voter);
+        assert!(!view.unreachable);
     }
 
     #[test]
