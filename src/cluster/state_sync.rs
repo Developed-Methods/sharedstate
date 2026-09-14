@@ -489,6 +489,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        cluster::node_state::PeerState,
         protocol::messages::LeaderState,
         state::{recoverable_state::RecoverableState, subscribable_state::SubscribableState},
         transport::traits::SyncConnection,
@@ -560,11 +561,18 @@ mod tests {
         state: &Arc<NodeState<u64, TestState>>,
         io: &Arc<I>,
     ) -> mpsc::Sender<(u64, u64)> {
-        let connections = Arc::new(PeerConnections::new(io.clone(), test_settings(), state.clone()));
+        start_task_with_settings(state, io, test_settings())
+    }
+
+    fn start_task_with_settings<I: SyncIO<Address = u64>>(
+        state: &Arc<NodeState<u64, TestState>>,
+        io: &Arc<I>,
+        settings: NetIoSettings,
+    ) -> mpsc::Sender<(u64, u64)> {
+        let connections = Arc::new(PeerConnections::new(io.clone(), settings.clone(), state.clone()));
         let (actions_tx, actions_rx) = mpsc::channel(16);
         tokio::spawn(
-            StateSyncTask::new(state.clone(), connections, io.clone(), test_settings(), actions_rx, test_timing())
-                .run(),
+            StateSyncTask::new(state.clone(), connections, io.clone(), settings, actions_rx, test_timing()).run(),
         );
         actions_tx
     }
@@ -625,6 +633,57 @@ mod tests {
             handle.read_with(|state| state.state().0) == 1
         })
         .await;
+    }
+
+    /// A follower that cannot reach its leader scans every known peer as a
+    /// relay candidate. Each candidate query dials through PeerConnections,
+    /// which retries several times with message_timeout-bounded connects, so
+    /// a handful of dead peers keeps the task away from `run()` for minutes.
+    /// Once the node is told to lead, it must take over within about one
+    /// bounded connect rather than finishing the whole relay scan first.
+    #[tokio::test(start_paused = true)]
+    async fn relay_scan_does_not_block_leader_takeover() {
+        let settings = NetIoSettings::default();
+        let state = node_state(1, LeaderMode::Following { leader: 2 });
+        for peer in 3..=7 {
+            state.peers.lock().await.insert(peer, PeerState::empty(peer));
+        }
+
+        let io = Arc::new(HangingIo::default());
+        let _actions_tx = start_task_with_settings(&state, &io, settings.clone());
+        let mut sync_status = state.sync_status.subscribe();
+
+        /* the direct attempt on the leader times out, then the relay scan
+         * starts dialing the first candidate */
+        tokio::time::timeout(settings.message_timeout * 2, async {
+            while io.connects.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for the relay scan to start dialing");
+
+        let decided_at = tokio::time::Instant::now();
+        *state.leader_state.lock().await = LeaderState {
+            term: ElectionTerm::from_term(1),
+            mode: LeaderMode::Leading,
+        };
+
+        sync_status
+            .wait_for(|status| *status == SyncStatus::Leading)
+            .await
+            .expect("sync task dropped its status before leading");
+        let took = decided_at.elapsed();
+
+        /* budget: the dial in flight when we decided may run to its timeout,
+         * plus one poll interval of slack */
+        let budget = settings.message_timeout + test_timing().leader_poll_interval;
+        assert!(
+            took <= budget,
+            "took {took:?} from the leading decision to actually leading (budget {budget:?}); \
+             connects={}",
+            io.connects.load(Ordering::SeqCst)
+        );
     }
 
     #[tokio::test(start_paused = true)]
