@@ -201,7 +201,17 @@ where
         tracing::warn!(?leader, "cannot subscribe to leader directly, looking for a relay peer");
 
         for relay in self.relay_candidates(leader).await {
-            match self.peer_connections.query_leader(relay).await {
+            /* each query can spend several bounded dials on a dead peer, so
+             * keep watching the leader state instead of finishing the scan */
+            let leader_changed = self.until_leader_changes(leader);
+            let queried = tokio::select! {
+                queried = self.peer_connections.query_leader(relay) => queried,
+                _ = leader_changed => {
+                    tracing::info!(?leader, "leader changed during relay scan");
+                    return Flow::Continue;
+                }
+            };
+            match queried {
                 Ok(state) if matches!(&state.mode, LeaderMode::Following { leader: relayed } if *relayed == leader) => {}
                 Ok(state) => {
                     tracing::debug!(?relay, ?state, "relay candidate does not follow our leader, skipping");
@@ -251,30 +261,40 @@ where
         candidates.into_iter().map(|(_, addr)| addr).collect()
     }
 
+    /// Resolves once the node's leader state no longer says to follow
+    /// `leader`. The future owns its state handle so it can be raced against
+    /// work that borrows the task.
+    fn until_leader_changes(&self, leader: I::Address) -> impl std::future::Future<Output = ()> + 'static {
+        let state = self.state.clone();
+        let poll_interval = self.timing.leader_poll_interval;
+        async move {
+            loop {
+                tokio::time::sleep(poll_interval).await;
+                let current = state.leader_state.lock().await.mode.clone();
+                if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
+                    return;
+                }
+            }
+        }
+    }
+
     async fn sync_from(&mut self, target: I::Address, leader: I::Address) -> SyncAttempt {
-        /* connect gives no timing guarantee, and an unbounded wait here would
-         * also stop the task from noticing leader changes */
-        let connection = match tokio::time::timeout(self.settings.message_timeout, self.io.connect(&target)).await {
-            Ok(Ok(connection)) => connection,
-            Ok(Err(error)) => {
-                tracing::debug!(?target, ?error, "failed to connect for state sync");
-                return SyncAttempt::Unreachable;
-            }
-            Err(_) => {
-                tracing::debug!(?target, "timed out connecting for state sync");
-                return SyncAttempt::Unreachable;
-            }
-        };
-
-        /* write must stay alive for the duration of the stream or the
-         * connection closes */
-        let (_remote, write, mut read) = connection.client_channels::<D>(self.settings.clone());
-
-        let next_seq = match self.subscribe(&write, &mut read, target).await {
-            Ok(next_seq) => next_seq,
-            Err(error) => {
-                tracing::warn!(?target, ?error, "state subscription failed");
-                return SyncAttempt::Unreachable;
+        /* the connect and handshake are each bounded by message_timeout, but
+         * together they can still hide a leader change for a long time */
+        let leader_changed = self.until_leader_changes(leader);
+        /* the write half is unused after the handshake but must stay alive
+         * for the duration of the stream or the connection closes */
+        let (_write, mut read, next_seq) = tokio::select! {
+            opened = self.open_subscription(target) => match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    tracing::warn!(?target, ?error, "state subscription failed");
+                    return SyncAttempt::Unreachable;
+                }
+            },
+            _ = leader_changed => {
+                tracing::info!(?target, ?leader, "leader changed while opening state subscription");
+                return SyncAttempt::LeaderChanged;
             }
         };
 
@@ -297,6 +317,21 @@ where
             *current = status;
             true
         });
+    }
+
+    /// Connects to the target and completes the subscription handshake.
+    async fn open_subscription(
+        &mut self,
+        target: I::Address,
+    ) -> std::io::Result<(Sender<SyncRequest<I::Address, D>>, Receiver<SyncResponse<I::Address, D>>, u64)> {
+        /* connect gives no timing guarantee, bound it like every other step */
+        let connection = tokio::time::timeout(self.settings.message_timeout, self.io.connect(&target))
+            .await
+            .map_err(|_| Error::new(ErrorKind::TimedOut, "timed out connecting for state sync"))??;
+
+        let (_remote, write, mut read) = connection.client_channels::<D>(self.settings.clone());
+        let next_seq = self.subscribe(&write, &mut read, target).await?;
+        Ok((write, read, next_seq))
     }
 
     /// Handshakes and subscribes, recovering the local state when the target
@@ -489,6 +524,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        cluster::node_state::PeerState,
         protocol::messages::LeaderState,
         state::{recoverable_state::RecoverableState, subscribable_state::SubscribableState},
         transport::traits::SyncConnection,
@@ -560,11 +596,18 @@ mod tests {
         state: &Arc<NodeState<u64, TestState>>,
         io: &Arc<I>,
     ) -> mpsc::Sender<(u64, u64)> {
-        let connections = Arc::new(PeerConnections::new(io.clone(), test_settings(), state.clone()));
+        start_task_with_settings(state, io, test_settings())
+    }
+
+    fn start_task_with_settings<I: SyncIO<Address = u64>>(
+        state: &Arc<NodeState<u64, TestState>>,
+        io: &Arc<I>,
+        settings: NetIoSettings,
+    ) -> mpsc::Sender<(u64, u64)> {
+        let connections = Arc::new(PeerConnections::new(io.clone(), settings.clone(), state.clone()));
         let (actions_tx, actions_rx) = mpsc::channel(16);
         tokio::spawn(
-            StateSyncTask::new(state.clone(), connections, io.clone(), test_settings(), actions_rx, test_timing())
-                .run(),
+            StateSyncTask::new(state.clone(), connections, io.clone(), settings, actions_rx, test_timing()).run(),
         );
         actions_tx
     }
@@ -625,6 +668,57 @@ mod tests {
             handle.read_with(|state| state.state().0) == 1
         })
         .await;
+    }
+
+    /// A follower that cannot reach its leader scans every known peer as a
+    /// relay candidate. Each candidate query dials through PeerConnections,
+    /// which retries several times with message_timeout-bounded connects, so
+    /// a handful of dead peers keeps the task away from `run()` for minutes.
+    /// Once the node is told to lead, it must take over within about one
+    /// bounded connect rather than finishing the whole relay scan first.
+    #[tokio::test(start_paused = true)]
+    async fn relay_scan_does_not_block_leader_takeover() {
+        let settings = NetIoSettings::default();
+        let state = node_state(1, LeaderMode::Following { leader: 2 });
+        for peer in 3..=7 {
+            state.peers.lock().await.insert(peer, PeerState::empty(peer));
+        }
+
+        let io = Arc::new(HangingIo::default());
+        let _actions_tx = start_task_with_settings(&state, &io, settings.clone());
+        let mut sync_status = state.sync_status.subscribe();
+
+        /* the direct attempt on the leader times out, then the relay scan
+         * starts dialing the first candidate */
+        tokio::time::timeout(settings.message_timeout * 2, async {
+            while io.connects.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for the relay scan to start dialing");
+
+        let decided_at = tokio::time::Instant::now();
+        *state.leader_state.lock().await = LeaderState {
+            term: ElectionTerm::from_term(1),
+            mode: LeaderMode::Leading,
+        };
+
+        sync_status
+            .wait_for(|status| *status == SyncStatus::Leading)
+            .await
+            .expect("sync task dropped its status before leading");
+        let took = decided_at.elapsed();
+
+        /* budget: the dial in flight when we decided may run to its timeout,
+         * plus one poll interval of slack */
+        let budget = settings.message_timeout + test_timing().leader_poll_interval;
+        assert!(
+            took <= budget,
+            "took {took:?} from the leading decision to actually leading (budget {budget:?}); \
+             connects={}",
+            io.connects.load(Ordering::SeqCst)
+        );
     }
 
     #[tokio::test(start_paused = true)]
