@@ -1,6 +1,14 @@
 //! High-level entry point that provisions everything a node needs to share
 //! state with a cluster: the RPC listener, peer discovery, leader election,
 //! and the state sync task.
+//!
+//! Set `pinned_leader: Some(address)` in either startup config to bypass consensus.
+//! Choose a voter (`can_lead = true`) and apply the same address on every node.
+//! The application coordinates this choice; pins are not propagated through gossip.
+//! Pinned leaders keep authority without quorum, and followers wait through leader outages.
+//! Use `set_pinned_leader(Some(address)).await` to change the choice at runtime.
+//! Use `set_pinned_leader(None).await` on every node to restore consensus.
+//! Existing callers can set `pinned_leader: None` to retain automatic elections.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -37,6 +45,9 @@ pub struct SharedStateConfig<I: SyncIOListener, D: DeterministicState> {
     pub io: Arc<I>,
     pub my_address: I::Address,
     pub can_lead: bool,
+    /// Bypasses consensus and pins a voter as leader. Use the same address on every node.
+    /// `None` enables normal elections. Pinned leaders do not require quorum or fail over automatically.
+    pub pinned_leader: Option<I::Address>,
     pub initial_peers: Vec<I::Address>,
     pub initial_state: D,
     pub settings: SharedStateSettings,
@@ -46,6 +57,9 @@ pub struct SharedStateRecoverableConfig<I: SyncIOListener, D: DeterministicState
     pub io: Arc<I>,
     pub my_address: I::Address,
     pub can_lead: bool,
+    /// Bypasses consensus and pins a voter as leader. Use the same address on every node.
+    /// `None` enables normal elections. Pinned leaders do not require quorum or fail over automatically.
+    pub pinned_leader: Option<I::Address>,
     pub initial_peers: Vec<I::Address>,
     pub initial_state: RecoverableState<D>,
     pub settings: SharedStateSettings,
@@ -82,6 +96,7 @@ where
             io,
             my_address,
             can_lead,
+            pinned_leader,
             initial_peers,
             initial_state,
             settings,
@@ -91,6 +106,7 @@ where
             io,
             my_address,
             can_lead,
+            pinned_leader,
             initial_peers,
             initial_state: RecoverableState::new(unique_state_id(&my_address), initial_state),
             settings,
@@ -102,6 +118,7 @@ where
             io,
             my_address,
             can_lead,
+            pinned_leader,
             initial_peers,
             initial_state,
             settings,
@@ -109,6 +126,7 @@ where
 
         let peers = initial_peers
             .into_iter()
+            .chain(pinned_leader)
             .filter(|peer| *peer != my_address)
             .map(|peer| (peer, PeerState::empty(peer)))
             .collect::<HashMap<_, _>>();
@@ -116,11 +134,16 @@ where
         let node = Arc::new(NodeState {
             my_address,
             can_lead,
+            pinned_leader: Mutex::new(pinned_leader),
             peers: Mutex::new(peers),
             state: SubscribableState::new(initial_state, settings.broadcast.clone())?,
             leader_state: Mutex::new(LeaderState {
                 term: ElectionTerm::default(),
-                mode: LeaderMode::NoLeader,
+                mode: match pinned_leader {
+                    Some(leader) if leader != my_address => LeaderMode::Following { leader },
+                    Some(_) if can_lead => LeaderMode::Leading,
+                    _ => LeaderMode::NoLeader,
+                },
             }),
             sync_status: watch::Sender::new(SyncStatus::NotSynced),
         });
@@ -168,6 +191,12 @@ where
 
     pub async fn leader_state(&self) -> LeaderState<I::Address> {
         self.node.leader_state.lock().await.clone()
+    }
+
+    /// Overrides elections locally. See [`NodeState::set_pinned_leader`] for cluster coordination requirements.
+    /// Pass `Some(voter_address)` to pin a leader, or `None` to restore consensus.
+    pub async fn set_pinned_leader(&self, leader: Option<I::Address>) {
+        self.node.set_pinned_leader(leader).await;
     }
 
     /// Queues an action originating from this node. The sync task applies it
@@ -279,11 +308,22 @@ mod tests {
         can_lead: bool,
         peers: &[u64],
     ) -> SharedState<SimulatedIo, KvState> {
+        start_pinned_node(net, address, can_lead, peers, None).await
+    }
+
+    async fn start_pinned_node(
+        net: &SimulatedNet,
+        address: u64,
+        can_lead: bool,
+        peers: &[u64],
+        pinned_leader: Option<u64>,
+    ) -> SharedState<SimulatedIo, KvState> {
         let io = net.start_io(address).await;
         SharedState::start(SharedStateConfig {
             io,
             my_address: address,
             can_lead,
+            pinned_leader,
             initial_peers: peers.to_vec(),
             initial_state: KvState::default(),
             settings: fast_settings(),
@@ -297,6 +337,112 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn pinned_leader_replicates_without_quorum_and_clear_restores_elections() {
+        let net = SimulatedNet::new();
+        let leader = start_pinned_node(&net, 2, true, &[1, 3], Some(2)).await;
+        let observer = start_pinned_node(&net, 4, false, &[], Some(2)).await;
+        for address in [1, 3] {
+            let mut peers = leader.node.peers.lock().await;
+            let peer = peers.get_mut(&address).unwrap();
+            peer.can_lead = Some(true);
+            peer.connect_status = crate::cluster::node_state::ConnectStatus::FailedToConnect { epoch_ms: 1 };
+        }
+
+        let initial = leader.leader_state().await;
+        for _ in 0..3 {
+            LeaderTask::new(leader.node.clone(), LeaderTiming::default())
+                .tick()
+                .await;
+        }
+        assert_eq!(leader.leader_state().await, initial);
+        assert_eq!(initial.mode, LeaderMode::Leading);
+        observer.submit_action((10, 20)).await.unwrap();
+        wait_for_value(&leader, 10, 20).await;
+        wait_for_value(&observer, 10, 20).await;
+
+        leader.set_pinned_leader(None).await;
+        LeaderTask::new(leader.node.clone(), LeaderTiming::default())
+            .tick()
+            .await;
+        assert!(matches!(leader.leader_state().await.mode, LeaderMode::Electing { .. }));
+        assert!(leader.leader_state().await.term > initial.term);
+    }
+
+    #[tokio::test]
+    async fn pin_can_move_between_voters_and_survives_leader_failure() {
+        let net = SimulatedNet::new();
+        let node1 = start_pinned_node(&net, 1, true, &[2, 3], Some(2)).await;
+        let node2 = start_pinned_node(&net, 2, true, &[1, 3], Some(2)).await;
+        let node3 = start_pinned_node(&net, 3, true, &[1, 2], Some(2)).await;
+        wait_for_leader(&[&node1, &node2, &node3], 2).await;
+        node3.submit_action((1, 10)).await.unwrap();
+        wait_for_cluster_state(&[&node1, &node2, &node3], &BTreeMap::from([(1, 10)])).await;
+
+        for node in [&node2, &node1, &node3] {
+            node.set_pinned_leader(Some(1)).await;
+        }
+        wait_for_leader(&[&node1, &node2, &node3], 1).await;
+        let pinned = node1.leader_state().await;
+        node1.set_pinned_leader(Some(1)).await;
+        assert_eq!(node1.leader_state().await, pinned);
+        node3.submit_action((2, 20)).await.unwrap();
+        wait_for_cluster_state(&[&node1, &node2, &node3], &BTreeMap::from([(1, 10), (2, 20)])).await;
+
+        net.set_node_blocked(1, true).await;
+        net.stop_node(1).await;
+        drop(node1);
+        node2.node.mark_peer_failed_to_connect(1).await;
+        for node in [&node2, &node3] {
+            LeaderTask::new(node.node.clone(), LeaderTiming::default()).tick().await;
+            assert_eq!(node.leader_state().await.mode, LeaderMode::Following { leader: 1 });
+            node.set_pinned_leader(None).await;
+        }
+        wait_for_leader(&[&node2, &node3], 2).await;
+        node3.submit_action((3, 30)).await.unwrap();
+        wait_for_value(&node2, 3, 30).await;
+        wait_for_value(&node3, 3, 30).await;
+    }
+
+    #[tokio::test]
+    async fn pin_ignores_election_claims_and_never_promotes_observers() {
+        let net = SimulatedNet::new();
+        let node = start_pinned_node(&net, 2, true, &[1], Some(2)).await;
+        let initial = node.leader_state().await;
+        {
+            let mut peers = node.node.peers.lock().await;
+            let peer = peers.get_mut(&1).unwrap();
+            peer.can_lead = Some(true);
+            peer.connect_status = crate::cluster::node_state::ConnectStatus::Connected { epoch_ms: 1 };
+            peer.leader_info = Some(crate::protocol::messages::LeaderInfo {
+                leader_state: LeaderState {
+                    term: ElectionTerm::from_term(100),
+                    mode: LeaderMode::Leading,
+                },
+                can_lead: true,
+                reachable_voters: vec![1, 2],
+                recovery_details: node.node.state.recovery_details().await,
+            });
+        }
+        LeaderTask::new(node.node.clone(), LeaderTiming::default()).tick().await;
+        assert_eq!(node.leader_state().await, initial);
+
+        node.set_pinned_leader(Some(9)).await;
+        assert!(node.node.peers.lock().await.contains_key(&9));
+        node.node.peers.lock().await.get_mut(&9).unwrap().can_lead = Some(false);
+        LeaderTask::new(node.node.clone(), LeaderTiming::default()).tick().await;
+        assert_eq!(node.leader_state().await.mode, LeaderMode::NoLeader);
+
+        let observer = start_pinned_node(&net, 9, false, &[], Some(9)).await;
+        LeaderTask::new(observer.node.clone(), LeaderTiming::default())
+            .tick()
+            .await;
+        assert_eq!(observer.leader_state().await.mode, LeaderMode::NoLeader);
+        observer.set_pinned_leader(None).await;
+        observer.set_pinned_leader(Some(9)).await;
+        assert_eq!(observer.leader_state().await.mode, LeaderMode::NoLeader);
     }
 
     async fn wait_for_value(node: &SharedState<SimulatedIo, KvState>, key: u64, value: u64) {
@@ -435,6 +581,7 @@ mod tests {
             io,
             my_address: 1,
             can_lead: true,
+            pinned_leader: None,
             initial_peers: Vec::new(),
             initial_state,
             settings: fast_settings(),

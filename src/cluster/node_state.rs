@@ -3,7 +3,7 @@ use std::{collections::HashMap, num::NonZeroU64, time::Duration};
 use tokio::sync::{watch, Mutex};
 
 use crate::{
-    protocol::messages::{LeaderInfo, LeaderState, SharePeerDetails},
+    protocol::messages::{LeaderInfo, LeaderMode, LeaderState, SharePeerDetails},
     state::{deterministic_state::DeterministicState, subscribable_state::SubscribableState},
     transport::traits::SyncIOAddress,
     utils::now_ms,
@@ -12,6 +12,8 @@ use crate::{
 pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
     pub my_address: A,
     pub can_lead: bool,
+    /// The local election override. Use [`Self::set_pinned_leader`] to change it at runtime.
+    pub pinned_leader: Mutex<Option<A>>,
     pub peers: Mutex<HashMap<A, PeerState<A>>>,
     pub state: SubscribableState<D>,
     pub leader_state: Mutex<LeaderState<A>>,
@@ -110,6 +112,56 @@ where
     A: SyncIOAddress,
     D: DeterministicState,
 {
+    /// Overrides elections locally. Apply the same pin to every node in the cluster.
+    /// The selected address must belong to a voter (`can_lead = true`).
+    /// Unknown addresses are discovered automatically; known observers cannot become leaders.
+    /// A pin disables quorum checks and automatic failover, even if the leader becomes unreachable.
+    /// Conflicting pins can create independent leaders and divergent state.
+    /// Clearing an existing pin with `None` starts a new consensus election.
+    pub async fn set_pinned_leader(&self, leader: Option<A>) {
+        let mut pinned = self.pinned_leader.lock().await;
+        if *pinned == leader {
+            return;
+        }
+        if let Some(address) = leader.filter(|address| *address != self.my_address) {
+            self.peers
+                .lock()
+                .await
+                .entry(address)
+                .or_insert_with(|| PeerState::empty(address));
+        }
+        let mode = match leader {
+            Some(address) => self.pinned_leader_mode(address).await,
+            None if self.can_lead => LeaderMode::Electing { vote: None },
+            None => LeaderMode::NoLeader,
+        };
+        let mut state = self.leader_state.lock().await;
+        *pinned = leader;
+        state.term = state.term.bump();
+        state.mode = mode;
+        tracing::info!(?leader, state = ?*state, "leader pin updated");
+    }
+
+    pub(crate) async fn pinned_leader_mode(&self, leader: A) -> LeaderMode<A> {
+        if leader == self.my_address {
+            return if self.can_lead {
+                LeaderMode::Leading
+            } else {
+                LeaderMode::NoLeader
+            };
+        }
+        let peers = self.peers.lock().await;
+        let can_lead = peers.get(&leader).and_then(|peer| {
+            peer.can_lead
+                .or_else(|| peer.leader_info.as_ref().map(|info| info.can_lead))
+        });
+        if can_lead == Some(false) {
+            LeaderMode::NoLeader
+        } else {
+            LeaderMode::Following { leader }
+        }
+    }
+
     pub(crate) async fn merge_peer_details(&self, shared_peers: Vec<SharePeerDetails<A>>) {
         let mut peers = self.peers.lock().await;
 

@@ -85,6 +85,7 @@ mod tests {
             let state = Arc::new(NodeState {
                 my_address: addr,
                 can_lead,
+                pinned_leader: Mutex::new(None),
                 peers: Mutex::new(peers),
                 state: SubscribableState::new(
                     RecoverableState::new(addr, TestState(0)),
