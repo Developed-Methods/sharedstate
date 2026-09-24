@@ -28,10 +28,25 @@ struct SimulatedNetInner {
     active_connections: HashMap<u64, Vec<KillHandle>>,
     active_connection_edges: HashMap<(u64, u64), Vec<KillHandle>>,
     edge_connections_opened: HashMap<(u64, u64), usize>,
+    /// Connections opened by dialer, keyed by what was dialed (a node or a
+    /// gateway address), so tests can tell direct dials from routed ones.
+    dials: HashMap<(u64, u64), usize>,
     blocked_nodes: HashSet<u64>,
     blocked_edges: HashSet<(u64, u64)>,
+    /// One-way blocks: `(from, to)` means `from` cannot dial `to`, while
+    /// `to` may still dial `from`. Models voters without egress to observers.
+    blocked_dials: HashSet<(u64, u64)>,
     edge_latencies: HashMap<(u64, u64), Duration>,
     blackholed_edges: HashMap<(u64, u64), StdArc<AtomicBool>>,
+    /// Load balancers: a dial to the gateway address lands on one of its
+    /// members, round robin over the ones currently reachable.
+    gateways: HashMap<u64, SimulatedGateway>,
+    gateway_connections_opened: HashMap<(u64, u64), usize>,
+}
+
+struct SimulatedGateway {
+    members: Vec<u64>,
+    next: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,10 +64,14 @@ impl SimulatedNet {
                 active_connections: HashMap::new(),
                 active_connection_edges: HashMap::new(),
                 edge_connections_opened: HashMap::new(),
+                dials: HashMap::new(),
                 blocked_nodes: HashSet::new(),
                 blocked_edges: HashSet::new(),
+                blocked_dials: HashSet::new(),
                 edge_latencies: HashMap::new(),
                 blackholed_edges: HashMap::new(),
+                gateways: HashMap::new(),
+                gateway_connections_opened: HashMap::new(),
             })),
         }
     }
@@ -99,6 +118,47 @@ impl SimulatedNet {
 
     pub async fn clear_edge_blocks(&self) {
         self.inner.lock().await.blocked_edges.clear();
+    }
+
+    /// Blocks dials from `from` to `to` only; the other direction still
+    /// works. Existing connections are left alone.
+    pub async fn set_dial_blocked(&self, from: u64, to: u64, blocked: bool) {
+        let mut inner = self.inner.lock().await;
+        if blocked {
+            inner.blocked_dials.insert((from, to));
+        } else {
+            inner.blocked_dials.remove(&(from, to));
+        }
+    }
+
+    /// Registers a load balancer at `address` in front of `members`. Dials
+    /// to `address` land on members in round robin order, skipping members
+    /// that are offline, blocked, or cut off from the dialer. The dialer's
+    /// edge to the gateway is what tests block or count; the member edge
+    /// only tracks the node so stopping a member still kills its
+    /// connections.
+    pub async fn add_gateway(&self, address: u64, members: Vec<u64>) {
+        let mut inner = self.inner.lock().await;
+        assert!(!inner.listeners.contains_key(&address), "gateway address {address} is a node");
+        inner.gateways.insert(address, SimulatedGateway { members, next: 0 });
+    }
+
+    /// Connections ever routed through `gateway` to `member`.
+    pub async fn gateway_connections_opened(&self, gateway: u64, member: u64) -> usize {
+        let inner = self.inner.lock().await;
+        inner
+            .gateway_connections_opened
+            .get(&(gateway, member))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Connections `from` ever opened by dialing `to`, where `to` is the
+    /// address dialed: a gateway address for routed connections, the node
+    /// itself for direct ones.
+    pub async fn dials(&self, from: u64, to: u64) -> usize {
+        let inner = self.inner.lock().await;
+        inner.dials.get(&(from, to)).copied().unwrap_or(0)
     }
 
     /// Silently stalls all traffic on an edge without closing connections,
@@ -226,10 +286,43 @@ impl SyncIO for SimulatedIo {
             if net.blocked_nodes.contains(&self.address)
                 || net.blocked_nodes.contains(remote)
                 || net.blocked_edges.contains(&edge)
+                || net.blocked_dials.contains(&(self.address, *remote))
             {
                 return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "connection blocked"));
             }
-            let tx = net.listeners.get(remote).cloned();
+            *net.dials.entry((self.address, *remote)).or_default() += 1;
+
+            /* a gateway dial lands on a member; from here on the connection
+             * belongs to that member node, but the dialer's edge stays the
+             * gateway edge so blocking or counting it covers routed traffic */
+            let target = match net.gateways.get_mut(remote) {
+                Some(gateway) => {
+                    let candidates = gateway.members.clone();
+                    let start = gateway.next;
+                    gateway.next = gateway.next.wrapping_add(1);
+                    let dialer = self.address;
+                    let reachable = |net: &SimulatedNetInner, member: u64| {
+                        net.listeners.contains_key(&member)
+                            && !net.blocked_nodes.contains(&member)
+                            && !net.blocked_edges.contains(&SimulatedNet::edge_key(dialer, member))
+                            && !net.blocked_dials.contains(&(dialer, member))
+                    };
+                    let Some(member) = (0..candidates.len())
+                        .map(|offset| candidates[(start + offset) % candidates.len()])
+                        .find(|member| reachable(&net, *member))
+                    else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotConnected,
+                            "no gateway member reachable",
+                        ));
+                    };
+                    *net.gateway_connections_opened.entry((*remote, member)).or_default() += 1;
+                    member
+                }
+                None => *remote,
+            };
+
+            let tx = net.listeners.get(&target).cloned();
             let latency = net.edge_latencies.get(&edge).copied().unwrap_or_default();
             let blackhole = net.blackholed_edges.entry(edge).or_default().clone();
             let handles = [
@@ -240,7 +333,7 @@ impl SyncIO for SimulatedIo {
             ];
             let active = net.active_connections.entry(self.address).or_default();
             active.extend(handles.iter().map(|(handle, _)| handle.clone()));
-            let active = net.active_connections.entry(*remote).or_default();
+            let active = net.active_connections.entry(target).or_default();
             active.extend(handles.iter().map(|(handle, _)| handle.clone()));
             let active = net.active_connection_edges.entry(edge).or_default();
             active.extend(handles.iter().map(|(handle, _)| handle.clone()));
@@ -454,6 +547,43 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for KillableIo<I> {
 mod test {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn gateway_dials_round_robin_over_reachable_members() {
+        let net = SimulatedNet::new();
+        let observer = net.start_io(9).await;
+        let members = [net.start_io(1).await, net.start_io(2).await, net.start_io(3).await];
+        net.add_gateway(100, vec![1, 2, 3]).await;
+
+        /* the server side sees the dialer, the dialer sees the gateway */
+        let mut landed = Vec::new();
+        for _ in 0..3 {
+            let conn = observer.connect(&100).await.unwrap();
+            assert_eq!(conn.remote, 100);
+            for member in &members {
+                if let Ok(incoming) = tokio::time::timeout(Duration::from_millis(10), member.next_client()).await {
+                    assert_eq!(incoming.unwrap().remote, 9);
+                    landed.push(member.address);
+                }
+            }
+        }
+        assert_eq!(landed, vec![1, 2, 3]);
+
+        net.set_node_blocked(2, true).await;
+        let _ = observer.connect(&100).await.unwrap();
+        let _ = observer.connect(&100).await.unwrap();
+        assert_eq!(net.gateway_connections_opened(100, 2).await, 1);
+        assert_eq!(net.gateway_connections_opened(100, 1).await, 2);
+        assert_eq!(net.gateway_connections_opened(100, 3).await, 2);
+
+        /* direct dials and routed dials are counted apart */
+        assert_eq!(net.dials(9, 100).await, 5);
+        assert_eq!(net.dials(9, 1).await, 0);
+        assert_eq!(net.edge_connections_opened(9, 1).await, 0);
+
+        net.set_edge_blocked(9, 100, true).await;
+        assert!(observer.connect(&100).await.is_err());
+    }
 
     #[tokio::test]
     async fn edge_latency_delays_reads() {
