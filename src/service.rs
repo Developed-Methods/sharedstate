@@ -1,6 +1,12 @@
 //! High-level entry point that provisions everything a node needs to share
 //! state with a cluster: the RPC listener, peer discovery, leader election,
 //! and the state sync task.
+//!
+//! Voters are configured with each other's addresses. Observers that can
+//! reach the voters individually are configured the same way; observers
+//! that can only reach them through a shared address set
+//! [`SharedStateConfig::voter_gateway`] instead and need no voter
+//! addresses at all.
 
 use std::{collections::HashMap, sync::Arc};
 

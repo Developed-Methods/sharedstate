@@ -1,5 +1,17 @@
 //! Cluster coordination: peer discovery, leader election, and the RPC
 //! server/client tasks that keep nodes in sync.
+//!
+//! # Addresses
+//!
+//! A node's address is both its identity (peer map key, election
+//! tiebreak, who a follower follows) and how peers dial it. Voters must
+//! have distinct, mutually reachable addresses. Observers may instead be
+//! given a *voter gateway* (see [`node_state::NodeState::voter_gateway`]):
+//! an address such as a load balancer that reaches some voter. The gateway
+//! is a dial target only. It never enters the peer map or gossip, and an
+//! observer using it never dials voters directly; it pulls the election
+//! state through the gateway, follows the gateway address as its leader,
+//! and subscribes to whichever voter answers.
 
 pub mod leader;
 pub mod node_state;
