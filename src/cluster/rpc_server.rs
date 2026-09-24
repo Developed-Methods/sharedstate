@@ -361,7 +361,11 @@ mod tests {
             );
         }
 
-        for status in [SyncStatus::Leading, SyncStatus::Direct { leader: 3 }] {
+        for status in [
+            SyncStatus::Leading,
+            SyncStatus::Direct { leader: 3 },
+            SyncStatus::Gateway { gateway: 3 },
+        ] {
             let (server, state) = server(status);
 
             let response = server.handle(9, SyncRequest::SubscribeRecovery(matching_details(&state))).await;
