@@ -118,6 +118,73 @@ mod tests {
         }
     }
 
+    /// Nine voters; our dials to five of them fail but the other three
+    /// vouch for them, which keeps us leading. A crowd of observers that
+    /// can't name any voter they reach must not dilute that vouching into a
+    /// step-down.
+    #[tokio::test]
+    async fn observers_do_not_dilute_voter_reachability_vouching() {
+        use crate::{
+            cluster::node_state::ConnectStatus,
+            protocol::messages::LeaderInfo,
+            state::recoverable_state::RecoverableStateDetails,
+            utils::now_ms,
+        };
+
+        let term = ElectionTerm::from_term(2);
+        let info = |can_lead: bool, reachable_voters: Vec<u64>| LeaderInfo {
+            leader_state: LeaderState {
+                term,
+                mode: LeaderMode::Following { leader: 1 },
+            },
+            can_lead,
+            reachable_voters,
+            recovery_details: RecoverableStateDetails::new(1, 1),
+        };
+
+        let mut peers = HashMap::new();
+        for voter in 2..=9u64 {
+            let mut peer = PeerState::empty(voter);
+            peer.can_lead = Some(true);
+            if voter <= 6 {
+                peer.connect_status = ConnectStatus::FailedToConnect { epoch_ms: now_ms() };
+            } else {
+                peer.connect_status = ConnectStatus::Connected { epoch_ms: now_ms() };
+                peer.leader_info = Some(info(true, (2..=9).collect()));
+            }
+            peers.insert(voter, peer);
+        }
+        for observer in 100..110u64 {
+            let mut peer = PeerState::empty(observer);
+            peer.can_lead = Some(false);
+            peer.connect_status = ConnectStatus::Connected { epoch_ms: now_ms() };
+            peer.leader_info = Some(info(false, Vec::new()));
+            peers.insert(observer, peer);
+        }
+
+        let state = Arc::new(NodeState {
+            my_address: 1,
+            can_lead: true,
+            voter_gateway: None,
+            gateway_view: Mutex::new(None),
+            peers: Mutex::new(peers),
+            state: SubscribableState::new(
+                RecoverableState::new(1, TestState(0)),
+                SequencedBroadcastSettings::default(),
+            )
+            .unwrap(),
+            leader_state: Mutex::new(LeaderState {
+                term,
+                mode: LeaderMode::Leading,
+            }),
+            sync_status: watch::Sender::new(SyncStatus::Leading),
+        });
+
+        let mut leader = LeaderTask::new(state.clone(), LeaderTiming::default(), PeerExpiry::default());
+        leader.tick().await;
+        assert_eq!(*state.leader_state.lock().await, LeaderState { term, mode: LeaderMode::Leading });
+    }
+
     #[tokio::test]
     async fn observer_leader_tick_uses_the_gateway_view() {
         use crate::{cluster::node_state::GatewayView, utils::now_ms};

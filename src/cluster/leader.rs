@@ -87,14 +87,18 @@ where
         let (me, peer_views) = {
             let peers = self.state.peers.lock().await;
 
-            /* count, per address, how many connected peers report reaching
+            /* count, per address, how many connected voters report reaching
              * it; a peer that over a third of reporters can reach is treated
              * as reachable even when our own dial to it failed, so a local
-             * connectivity problem doesn't trigger a cluster-wide election */
+             * connectivity problem doesn't trigger a cluster-wide election.
+             * Observers don't report: those behind a gateway cannot name any
+             * voter they reach, and enough of them would raise the threshold
+             * until voters stop covering for each other */
             let (reporter_count, reach_table) = peers
                 .values()
                 .filter(|peer| peer.connect_status.is_connected())
                 .filter_map(|peer| peer.leader_info.as_ref())
+                .filter(|info| info.can_lead)
                 .fold((0u32, HashMap::<A, u32>::new()), |(count, mut table), info| {
                     for addr in &info.reachable_voters {
                         *table.entry(*addr).or_insert(0) += 1;
