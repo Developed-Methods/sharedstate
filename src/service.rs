@@ -8,8 +8,9 @@ use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedBroadcastSettings, SettingsError};
 use tokio::{
     sync::{
+        Mutex,
         mpsc::{self, error::SendError},
-        watch, Mutex,
+        watch,
     },
     task::JoinHandle,
 };
@@ -37,6 +38,10 @@ pub struct SharedStateConfig<I: SyncIOListener, D: DeterministicState> {
     pub io: Arc<I>,
     pub my_address: I::Address,
     pub can_lead: bool,
+    /// For observers that cannot dial voters individually: an address (such
+    /// as a load balancer) that reaches some voter. See
+    /// [`NodeState::voter_gateway`]. Must be `None` when `can_lead` is set.
+    pub voter_gateway: Option<I::Address>,
     pub initial_peers: Vec<I::Address>,
     pub initial_state: D,
     pub settings: SharedStateSettings,
@@ -46,9 +51,41 @@ pub struct SharedStateRecoverableConfig<I: SyncIOListener, D: DeterministicState
     pub io: Arc<I>,
     pub my_address: I::Address,
     pub can_lead: bool,
+    /// See [`SharedStateConfig::voter_gateway`].
+    pub voter_gateway: Option<I::Address>,
     pub initial_peers: Vec<I::Address>,
     pub initial_state: RecoverableState<D>,
     pub settings: SharedStateSettings,
+}
+
+#[derive(Debug)]
+pub enum ConfigError {
+    Broadcast(SettingsError),
+    /// Voters reach each other directly; a gateway only makes sense for
+    /// observers. Refusing it avoids a voter dialing itself through the
+    /// load balancer.
+    VoterWithGateway,
+    /// The gateway is a dial target for other nodes, so it can never be
+    /// this node's own address.
+    GatewayIsSelf,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Broadcast(error) => write!(f, "invalid broadcast settings: {error:?}"),
+            Self::VoterWithGateway => write!(f, "voter_gateway is only valid when can_lead is false"),
+            Self::GatewayIsSelf => write!(f, "voter_gateway cannot be this node's own address"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl From<SettingsError> for ConfigError {
+    fn from(error: SettingsError) -> Self {
+        Self::Broadcast(error)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -77,11 +114,12 @@ where
     D::Action: MessageEncoding,
     D::AuthorityAction: MessageEncoding,
 {
-    pub fn start(config: SharedStateConfig<I, D>) -> Result<Self, SettingsError> {
+    pub fn start(config: SharedStateConfig<I, D>) -> Result<Self, ConfigError> {
         let SharedStateConfig {
             io,
             my_address,
             can_lead,
+            voter_gateway,
             initial_peers,
             initial_state,
             settings,
@@ -91,31 +129,42 @@ where
             io,
             my_address,
             can_lead,
+            voter_gateway,
             initial_peers,
             initial_state: RecoverableState::new(unique_state_id(&my_address), initial_state),
             settings,
         })
     }
 
-    pub fn start_recoverable(config: SharedStateRecoverableConfig<I, D>) -> Result<Self, SettingsError> {
+    pub fn start_recoverable(config: SharedStateRecoverableConfig<I, D>) -> Result<Self, ConfigError> {
         let SharedStateRecoverableConfig {
             io,
             my_address,
             can_lead,
+            voter_gateway,
             initial_peers,
             initial_state,
             settings,
         } = config;
 
+        if can_lead && voter_gateway.is_some() {
+            return Err(ConfigError::VoterWithGateway);
+        }
+        if voter_gateway == Some(my_address) {
+            return Err(ConfigError::GatewayIsSelf);
+        }
+
         let peers = initial_peers
             .into_iter()
-            .filter(|peer| *peer != my_address)
+            .filter(|peer| *peer != my_address && Some(*peer) != voter_gateway)
             .map(|peer| (peer, PeerState::empty(peer)))
             .collect::<HashMap<_, _>>();
 
         let node = Arc::new(NodeState {
             my_address,
             can_lead,
+            voter_gateway,
+            gateway_view: Mutex::new(None),
             peers: Mutex::new(peers),
             state: SubscribableState::new(initial_state, settings.broadcast.clone())?,
             leader_state: Mutex::new(LeaderState {
@@ -154,6 +203,10 @@ where
 
     pub fn can_lead(&self) -> bool {
         self.node.can_lead
+    }
+
+    pub fn voter_gateway(&self) -> Option<I::Address> {
+        self.node.voter_gateway
     }
 
     /// The underlying node state, for inspecting peers or leader details.
@@ -284,6 +337,7 @@ mod tests {
             io,
             my_address: address,
             can_lead,
+            voter_gateway: None,
             initial_peers: peers.to_vec(),
             initial_state: KvState::default(),
             settings: fast_settings(),
@@ -421,6 +475,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_is_rejected_for_voters_and_for_self() {
+        let net = SimulatedNet::new();
+
+        let result = SharedState::start(SharedStateConfig {
+            io: net.start_io(1).await,
+            my_address: 1,
+            can_lead: true,
+            voter_gateway: Some(100),
+            initial_peers: Vec::new(),
+            initial_state: KvState::default(),
+            settings: fast_settings(),
+        });
+        assert!(matches!(result, Err(ConfigError::VoterWithGateway)));
+
+        let result = SharedState::start(SharedStateConfig {
+            io: net.start_io(2).await,
+            my_address: 2,
+            can_lead: false,
+            voter_gateway: Some(2),
+            initial_peers: Vec::new(),
+            initial_state: KvState::default(),
+            settings: fast_settings(),
+        });
+        assert!(matches!(result, Err(ConfigError::GatewayIsSelf)));
+    }
+
+    #[tokio::test]
+    async fn gateway_is_never_a_peer() {
+        let net = SimulatedNet::new();
+        let node = SharedState::start(SharedStateConfig {
+            io: net.start_io(1).await,
+            my_address: 1,
+            can_lead: false,
+            voter_gateway: Some(100),
+            initial_peers: vec![100, 2],
+            initial_state: KvState::default(),
+            settings: fast_settings(),
+        })
+        .unwrap();
+
+        let peers = node.node().peers.lock().await;
+        assert!(!peers.contains_key(&100), "gateway seeded as a peer");
+        assert!(peers.contains_key(&2));
+    }
+
+    #[tokio::test]
     async fn start_recoverable_preserves_initial_recovery_details() {
         let net = SimulatedNet::new();
         let io = net.start_io(1).await;
@@ -435,6 +535,7 @@ mod tests {
             io,
             my_address: 1,
             can_lead: true,
+            voter_gateway: None,
             initial_peers: Vec::new(),
             initial_state,
             settings: fast_settings(),

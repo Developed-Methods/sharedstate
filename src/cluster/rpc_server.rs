@@ -317,6 +317,8 @@ mod tests {
         let state = Arc::new(NodeState {
             my_address: 1,
             can_lead: true,
+            voter_gateway: None,
+            gateway_view: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
             state: SubscribableState::new(
                 RecoverableState::new(1, TestState(0)),

@@ -395,6 +395,7 @@ async fn main() -> io::Result<()> {
         io,
         my_address: local_address,
         can_lead: args.can_lead,
+        voter_gateway: None,
         initial_peers: args.peers.clone(),
         initial_state: KvStore::new(),
         settings: SharedStateSettings::default(),

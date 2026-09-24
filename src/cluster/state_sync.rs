@@ -578,6 +578,8 @@ mod tests {
         Arc::new(NodeState {
             my_address: addr,
             can_lead: true,
+            voter_gateway: None,
+            gateway_view: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
             state: SubscribableState::new(
                 RecoverableState::new(addr, TestState(0)),
