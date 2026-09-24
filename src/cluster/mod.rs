@@ -119,6 +119,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observer_leader_tick_uses_the_gateway_view() {
+        use crate::{cluster::node_state::GatewayView, utils::now_ms};
+
+        let state = Arc::new(NodeState {
+            my_address: 9,
+            can_lead: false,
+            voter_gateway: Some(100),
+            gateway_view: Mutex::new(None),
+            peers: Mutex::new(HashMap::new()),
+            state: SubscribableState::new(
+                RecoverableState::new(9, TestState(0)),
+                SequencedBroadcastSettings::default(),
+            )
+            .unwrap(),
+            leader_state: Mutex::new(LeaderState {
+                term: ElectionTerm::from_term(0),
+                mode: LeaderMode::NoLeader,
+            }),
+            sync_status: watch::Sender::new(SyncStatus::NotSynced),
+        });
+        let mut leader = LeaderTask::new(state.clone(), LeaderTiming::default(), PeerExpiry::default());
+
+        /* nothing heard from the gateway yet */
+        leader.tick().await;
+        assert_eq!(state.leader_state.lock().await.mode, LeaderMode::NoLeader);
+
+        let leading = LeaderState::<u64> {
+            term: ElectionTerm::from_term(3),
+            mode: LeaderMode::Following { leader: 2 },
+        };
+        *state.gateway_view.lock().await = Some(GatewayView::from_voter_state(&leading, now_ms() + 60_000));
+        leader.tick().await;
+        assert_eq!(state.leader_state.lock().await.mode, LeaderMode::Following { leader: 100 });
+
+        /* an expired view is a disconnected voter: keep following */
+        *state.gateway_view.lock().await = Some(GatewayView::from_voter_state(&leading, now_ms() - 1));
+        leader.tick().await;
+        assert_eq!(state.leader_state.lock().await.mode, LeaderMode::Following { leader: 100 });
+
+        let electing = LeaderState::<u64> {
+            term: ElectionTerm::from_term(4),
+            mode: LeaderMode::Electing { vote: None },
+        };
+        *state.gateway_view.lock().await = Some(GatewayView::from_voter_state(&electing, now_ms() + 60_000));
+        leader.tick().await;
+        assert_eq!(state.leader_state.lock().await.mode, LeaderMode::NoLeader);
+    }
+
+    #[tokio::test]
     async fn observer_discovers_cluster_and_leader_through_single_seed_peer() {
         let net = SimulatedNet::new();
 

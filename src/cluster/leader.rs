@@ -135,6 +135,24 @@ where
             (me, peer_views)
         };
 
+        let mut peer_views = peer_views;
+        if let Some(gateway) = self.state.voter_gateway {
+            /* the voter set behind the gateway acts as one virtual voter at
+             * the gateway address; the observer rules only look at connected
+             * voters, so a stale or missing view is a disconnected one */
+            let view = self.state.gateway_view.lock().await.clone();
+            let fresh = view.as_ref().is_some_and(|view| view.is_fresh(now_ms()));
+            peer_views.push(PeerView {
+                addr: gateway,
+                is_voter: true,
+                connected: fresh,
+                unreachable: !fresh,
+                leader_state: view.map(|view| view.as_leader_state()),
+                recovery: None,
+                reachable: Vec::new(),
+            });
+        }
+
         let mut leader_state = self.state.leader_state.lock().await;
 
         let next = if self.state.can_lead {
@@ -970,6 +988,41 @@ mod tests {
 
         run_rounds(&mut nodes, &[], 8);
         assert_all_agree(&nodes, 3, 4, &[]);
+    }
+
+    #[test]
+    fn observer_follows_the_gateway_when_the_voter_set_has_a_leader() {
+        /* a gateway view is a synthetic connected voter that reports Leading
+         * whenever the answering voter leads or follows, so the observer
+         * ends up following the gateway address itself */
+        let gateway = voter(100, Some(ls(4, LeaderMode::Leading)));
+        let next = next_observer_state(&ls(0, LeaderMode::NoLeader), &[gateway]);
+        assert_eq!(next, ls(4, following(100)));
+
+        /* voters gossiped to the observer are never connected (they sit
+         * behind the gateway) and must not pull the observer elsewhere */
+        let lan_voter = unreachable(voter(1, Some(ls(4, LeaderMode::Leading))));
+        let gateway = voter(100, Some(ls(4, LeaderMode::Leading)));
+        let next = next_observer_state(&ls(0, LeaderMode::NoLeader), &[lan_voter, gateway]);
+        assert_eq!(next, ls(4, following(100)));
+    }
+
+    #[test]
+    fn observer_drops_to_no_leader_while_the_voter_set_elects() {
+        let gateway = voter(100, Some(ls(5, LeaderMode::Electing { vote: None })));
+        let next = next_observer_state(&ls(4, following(100)), &[gateway]);
+        assert_eq!(next, ls(5, LeaderMode::NoLeader));
+    }
+
+    #[test]
+    fn observer_keeps_following_the_gateway_while_its_view_is_stale() {
+        let current = ls(4, following(100));
+        let gateway = unreachable(voter(100, Some(ls(4, LeaderMode::Leading))));
+        assert_eq!(next_observer_state(&current, &[gateway]), current);
+
+        let mut gateway = unreachable(voter(100, None));
+        gateway.leader_state = None;
+        assert_eq!(next_observer_state(&current, &[gateway]), current);
     }
 
     #[test]
