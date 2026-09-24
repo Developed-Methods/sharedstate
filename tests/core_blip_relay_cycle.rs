@@ -107,6 +107,7 @@ fn fast_settings() -> SharedStateSettings {
         discovery_timing: PeerDiscoveryTiming {
             observation_interval: Duration::from_millis(50),
             max_concurrent_observations: 8,
+            gateway_view_ttl: Duration::from_secs(2),
         },
         leader_timing: LeaderTiming {
             tick_interval: Duration::from_millis(25),
