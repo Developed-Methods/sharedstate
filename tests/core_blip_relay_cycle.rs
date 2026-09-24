@@ -107,6 +107,7 @@ fn fast_settings() -> SharedStateSettings {
         discovery_timing: PeerDiscoveryTiming {
             observation_interval: Duration::from_millis(50),
             max_concurrent_observations: 8,
+            gateway_view_ttl: Duration::from_secs(2),
         },
         leader_timing: LeaderTiming {
             tick_interval: Duration::from_millis(25),
@@ -131,6 +132,7 @@ async fn start_node(net: &SimulatedNet, address: u64, can_lead: bool) -> Node {
         io,
         my_address: address,
         can_lead,
+        voter_gateway: None,
         initial_peers: peers,
         initial_state: KvState::default(),
         settings: fast_settings(),

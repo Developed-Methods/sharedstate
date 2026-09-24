@@ -317,6 +317,8 @@ mod tests {
         let state = Arc::new(NodeState {
             my_address: 1,
             can_lead: true,
+            voter_gateway: None,
+            gateway_view: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
             state: SubscribableState::new(
                 RecoverableState::new(1, TestState(0)),
@@ -359,7 +361,11 @@ mod tests {
             );
         }
 
-        for status in [SyncStatus::Leading, SyncStatus::Direct { leader: 3 }] {
+        for status in [
+            SyncStatus::Leading,
+            SyncStatus::Direct { leader: 3 },
+            SyncStatus::Gateway { gateway: 3 },
+        ] {
             let (server, state) = server(status);
 
             let response = server.handle(9, SyncRequest::SubscribeRecovery(matching_details(&state))).await;

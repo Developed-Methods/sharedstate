@@ -1,6 +1,12 @@
 //! High-level entry point that provisions everything a node needs to share
 //! state with a cluster: the RPC listener, peer discovery, leader election,
 //! and the state sync task.
+//!
+//! Voters are configured with each other's addresses. Observers that can
+//! reach the voters individually are configured the same way; observers
+//! that can only reach them through a shared address set
+//! [`SharedStateConfig::voter_gateway`] instead and need no voter
+//! addresses at all.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -8,8 +14,9 @@ use message_encoding::MessageEncoding;
 use sequenced_broadcast::{SequencedBroadcastSettings, SettingsError};
 use tokio::{
     sync::{
+        Mutex,
         mpsc::{self, error::SendError},
-        watch, Mutex,
+        watch,
     },
     task::JoinHandle,
 };
@@ -37,6 +44,10 @@ pub struct SharedStateConfig<I: SyncIOListener, D: DeterministicState> {
     pub io: Arc<I>,
     pub my_address: I::Address,
     pub can_lead: bool,
+    /// For observers that cannot dial voters individually: an address (such
+    /// as a load balancer) that reaches some voter. See
+    /// [`NodeState::voter_gateway`]. Must be `None` when `can_lead` is set.
+    pub voter_gateway: Option<I::Address>,
     pub initial_peers: Vec<I::Address>,
     pub initial_state: D,
     pub settings: SharedStateSettings,
@@ -46,9 +57,41 @@ pub struct SharedStateRecoverableConfig<I: SyncIOListener, D: DeterministicState
     pub io: Arc<I>,
     pub my_address: I::Address,
     pub can_lead: bool,
+    /// See [`SharedStateConfig::voter_gateway`].
+    pub voter_gateway: Option<I::Address>,
     pub initial_peers: Vec<I::Address>,
     pub initial_state: RecoverableState<D>,
     pub settings: SharedStateSettings,
+}
+
+#[derive(Debug)]
+pub enum ConfigError {
+    Broadcast(SettingsError),
+    /// Voters reach each other directly; a gateway only makes sense for
+    /// observers. Refusing it avoids a voter dialing itself through the
+    /// load balancer.
+    VoterWithGateway,
+    /// The gateway is a dial target for other nodes, so it can never be
+    /// this node's own address.
+    GatewayIsSelf,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Broadcast(error) => write!(f, "invalid broadcast settings: {error:?}"),
+            Self::VoterWithGateway => write!(f, "voter_gateway is only valid when can_lead is false"),
+            Self::GatewayIsSelf => write!(f, "voter_gateway cannot be this node's own address"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl From<SettingsError> for ConfigError {
+    fn from(error: SettingsError) -> Self {
+        Self::Broadcast(error)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -77,11 +120,12 @@ where
     D::Action: MessageEncoding,
     D::AuthorityAction: MessageEncoding,
 {
-    pub fn start(config: SharedStateConfig<I, D>) -> Result<Self, SettingsError> {
+    pub fn start(config: SharedStateConfig<I, D>) -> Result<Self, ConfigError> {
         let SharedStateConfig {
             io,
             my_address,
             can_lead,
+            voter_gateway,
             initial_peers,
             initial_state,
             settings,
@@ -91,31 +135,42 @@ where
             io,
             my_address,
             can_lead,
+            voter_gateway,
             initial_peers,
             initial_state: RecoverableState::new(unique_state_id(&my_address), initial_state),
             settings,
         })
     }
 
-    pub fn start_recoverable(config: SharedStateRecoverableConfig<I, D>) -> Result<Self, SettingsError> {
+    pub fn start_recoverable(config: SharedStateRecoverableConfig<I, D>) -> Result<Self, ConfigError> {
         let SharedStateRecoverableConfig {
             io,
             my_address,
             can_lead,
+            voter_gateway,
             initial_peers,
             initial_state,
             settings,
         } = config;
 
+        if can_lead && voter_gateway.is_some() {
+            return Err(ConfigError::VoterWithGateway);
+        }
+        if voter_gateway == Some(my_address) {
+            return Err(ConfigError::GatewayIsSelf);
+        }
+
         let peers = initial_peers
             .into_iter()
-            .filter(|peer| *peer != my_address)
+            .filter(|peer| *peer != my_address && Some(*peer) != voter_gateway)
             .map(|peer| (peer, PeerState::empty(peer)))
             .collect::<HashMap<_, _>>();
 
         let node = Arc::new(NodeState {
             my_address,
             can_lead,
+            voter_gateway,
+            gateway_view: Mutex::new(None),
             peers: Mutex::new(peers),
             state: SubscribableState::new(initial_state, settings.broadcast.clone())?,
             leader_state: Mutex::new(LeaderState {
@@ -154,6 +209,10 @@ where
 
     pub fn can_lead(&self) -> bool {
         self.node.can_lead
+    }
+
+    pub fn voter_gateway(&self) -> Option<I::Address> {
+        self.node.voter_gateway
     }
 
     /// The underlying node state, for inspecting peers or leader details.
@@ -261,6 +320,7 @@ mod tests {
             discovery_timing: PeerDiscoveryTiming {
                 observation_interval: Duration::from_millis(50),
                 max_concurrent_observations: 8,
+                gateway_view_ttl: Duration::from_secs(2),
             },
             leader_timing: LeaderTiming {
                 tick_interval: Duration::from_millis(25),
@@ -284,11 +344,55 @@ mod tests {
             io,
             my_address: address,
             can_lead,
+            voter_gateway: None,
             initial_peers: peers.to_vec(),
             initial_state: KvState::default(),
             settings: fast_settings(),
         })
         .unwrap()
+    }
+
+    /// An observer that only knows the voter set through `gateway`.
+    async fn start_observer_via_gateway(
+        net: &SimulatedNet,
+        address: u64,
+        gateway: u64,
+        peers: &[u64],
+    ) -> SharedState<SimulatedIo, KvState> {
+        let io = net.start_io(address).await;
+        SharedState::start(SharedStateConfig {
+            io,
+            my_address: address,
+            can_lead: false,
+            voter_gateway: Some(gateway),
+            initial_peers: peers.to_vec(),
+            initial_state: KvState::default(),
+            settings: fast_settings(),
+        })
+        .unwrap()
+    }
+
+    const GATEWAY: u64 = 100;
+
+    /// Three voters behind a gateway that cannot dial back out to observers,
+    /// already agreed on voter 1 as leader.
+    async fn start_voters_behind_gateway(net: &SimulatedNet) -> [SharedState<SimulatedIo, KvState>; 3] {
+        let voters = [
+            start_node(net, 1, true, &[2, 3]).await,
+            start_node(net, 2, true, &[1, 3]).await,
+            start_node(net, 3, true, &[1, 2]).await,
+        ];
+        net.add_gateway(GATEWAY, vec![1, 2, 3]).await;
+        wait_for_leader(&[&voters[0], &voters[1], &voters[2]], 1).await;
+        voters
+    }
+
+    async fn block_dials_to_observers(net: &SimulatedNet, observers: &[u64]) {
+        for voter in [1, 2, 3] {
+            for observer in observers {
+                net.set_dial_blocked(voter, *observer, true).await;
+            }
+        }
     }
 
     async fn wait_for<F: FnMut() -> bool>(what: &str, mut check: F) {
@@ -421,6 +525,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_is_rejected_for_voters_and_for_self() {
+        let net = SimulatedNet::new();
+
+        let result = SharedState::start(SharedStateConfig {
+            io: net.start_io(1).await,
+            my_address: 1,
+            can_lead: true,
+            voter_gateway: Some(100),
+            initial_peers: Vec::new(),
+            initial_state: KvState::default(),
+            settings: fast_settings(),
+        });
+        assert!(matches!(result, Err(ConfigError::VoterWithGateway)));
+
+        let result = SharedState::start(SharedStateConfig {
+            io: net.start_io(2).await,
+            my_address: 2,
+            can_lead: false,
+            voter_gateway: Some(2),
+            initial_peers: Vec::new(),
+            initial_state: KvState::default(),
+            settings: fast_settings(),
+        });
+        assert!(matches!(result, Err(ConfigError::GatewayIsSelf)));
+    }
+
+    #[tokio::test]
+    async fn gateway_is_never_a_peer() {
+        let net = SimulatedNet::new();
+        let node = SharedState::start(SharedStateConfig {
+            io: net.start_io(1).await,
+            my_address: 1,
+            can_lead: false,
+            voter_gateway: Some(100),
+            initial_peers: vec![100, 2],
+            initial_state: KvState::default(),
+            settings: fast_settings(),
+        })
+        .unwrap();
+
+        let peers = node.node().peers.lock().await;
+        assert!(!peers.contains_key(&100), "gateway seeded as a peer");
+        assert!(peers.contains_key(&2));
+    }
+
+    #[tokio::test]
     async fn start_recoverable_preserves_initial_recovery_details() {
         let net = SimulatedNet::new();
         let io = net.start_io(1).await;
@@ -435,6 +585,7 @@ mod tests {
             io,
             my_address: 1,
             can_lead: true,
+            voter_gateway: None,
             initial_peers: Vec::new(),
             initial_state,
             settings: fast_settings(),
@@ -581,6 +732,137 @@ mod tests {
         net.set_edge_blocked(1, 4, false).await;
         node1.submit_action((4, 4)).await.unwrap();
         wait_for_value(&node4, 4, 4).await;
+    }
+
+    #[tokio::test]
+    async fn observers_behind_gateway_sync_and_forward_actions() {
+        let net = SimulatedNet::new();
+        let [voter1, voter2, voter3] = start_voters_behind_gateway(&net).await;
+        block_dials_to_observers(&net, &[4, 5]).await;
+        let observer4 = start_observer_via_gateway(&net, 4, GATEWAY, &[]).await;
+        let observer5 = start_observer_via_gateway(&net, 5, GATEWAY, &[]).await;
+
+        /* observers follow the gateway address, never a voter */
+        wait_for_leader(&[&observer4, &observer5], GATEWAY).await;
+
+        voter1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&observer4, 1, 1).await;
+        wait_for_value(&observer5, 1, 1).await;
+        assert_eq!(*observer4.node().sync_status.borrow(), SyncStatus::Gateway { gateway: GATEWAY });
+
+        /* actions forwarded through whichever voter answers still reach
+         * the leader and replicate everywhere */
+        observer4.submit_action((2, 2)).await.unwrap();
+        for node in [&voter1, &voter2, &voter3, &observer4, &observer5] {
+            wait_for_value(node, 2, 2).await;
+        }
+
+        /* the gateway is not a node: no voter may have learned it as a peer */
+        for voter in [&voter1, &voter2, &voter3] {
+            let peers = voter.node().peers.lock().await;
+            assert!(!peers.contains_key(&GATEWAY), "voter {} learned the gateway as a peer", voter.my_address());
+            assert_eq!(peers.get(&4).and_then(|peer| peer.can_lead), Some(false));
+        }
+
+        /* observers only ever dial the gateway, and learn about each other
+         * through it */
+        for voter in [1, 2, 3] {
+            assert_eq!(net.dials(4, voter).await, 0, "observer dialed voter {voter} directly");
+        }
+        assert!(0 < net.dials(4, GATEWAY).await);
+        wait_for("observer 4 to learn observer 5 through the gateway", || {
+            observer4
+                .node()
+                .peers
+                .try_lock()
+                .map(|peers| peers.get(&5).and_then(|peer| peer.can_lead) == Some(false))
+                .unwrap_or(false)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn observer_behind_gateway_survives_leader_failure() {
+        let net = SimulatedNet::new();
+        let [voter1, voter2, voter3] = start_voters_behind_gateway(&net).await;
+        block_dials_to_observers(&net, &[4]).await;
+        let observer = start_observer_via_gateway(&net, 4, GATEWAY, &[]).await;
+
+        wait_for_leader(&[&observer], GATEWAY).await;
+        voter1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&observer, 1, 1).await;
+
+        net.set_node_blocked(1, true).await;
+        net.stop_node(1).await;
+        drop(voter1);
+        wait_for_leader(&[&voter2, &voter3], 2).await;
+
+        voter2.submit_action((2, 2)).await.unwrap();
+        wait_for_value(&observer, 2, 2).await;
+
+        observer.submit_action((3, 3)).await.unwrap();
+        wait_for_value(&voter2, 3, 3).await;
+        wait_for_value(&voter3, 3, 3).await;
+        wait_for_value(&observer, 3, 3).await;
+    }
+
+    /// The gateway's first pick is a voter cut off from the others, stuck
+    /// electing and refusing subscriptions. The observer must move on to
+    /// a live voter instead of pinning to that one.
+    #[tokio::test]
+    async fn observer_moves_past_an_unsynced_voter_behind_the_gateway() {
+        let net = SimulatedNet::new();
+        net.set_edge_blocked(3, 1, true).await;
+        net.set_edge_blocked(3, 2, true).await;
+        let voter1 = start_node(&net, 1, true, &[2, 3]).await;
+        let voter2 = start_node(&net, 2, true, &[1, 3]).await;
+        let _voter3 = start_node(&net, 3, true, &[1, 2]).await;
+        net.add_gateway(GATEWAY, vec![3, 1, 2]).await;
+        wait_for_leader(&[&voter1, &voter2], 1).await;
+        block_dials_to_observers(&net, &[4]).await;
+
+        let observer = start_observer_via_gateway(&net, 4, GATEWAY, &[]).await;
+        wait_for_leader(&[&observer], GATEWAY).await;
+        voter1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&observer, 1, 1).await;
+
+        assert!(0 < net.gateway_connections_opened(GATEWAY, 3).await, "test never exercised the stuck voter");
+        assert_eq!(*observer.node().sync_status.borrow(), SyncStatus::Gateway { gateway: GATEWAY });
+    }
+
+    #[tokio::test]
+    async fn observer_relays_through_another_observer_when_the_gateway_is_lost() {
+        let net = SimulatedNet::new();
+        let [voter1, _voter2, _voter3] = start_voters_behind_gateway(&net).await;
+        block_dials_to_observers(&net, &[4, 5]).await;
+        let observer4 = start_observer_via_gateway(&net, 4, GATEWAY, &[]).await;
+        let observer5 = start_observer_via_gateway(&net, 5, GATEWAY, &[4]).await;
+
+        wait_for_leader(&[&observer4, &observer5], GATEWAY).await;
+        voter1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&observer4, 1, 1).await;
+        wait_for_value(&observer5, 1, 1).await;
+
+        /* observer 5 loses the gateway; it keeps following it and must be
+         * fed by observer 4, which is a live source through the gateway */
+        net.set_edge_blocked(5, GATEWAY, true).await;
+        voter1.submit_action((2, 2)).await.unwrap();
+        wait_for_value(&observer5, 2, 2).await;
+        wait_for("observer 5 to relay through observer 4", || {
+            matches!(
+                *observer5.node().sync_status.borrow(),
+                SyncStatus::Relayed { relay: 4, leader: GATEWAY }
+            )
+        })
+        .await;
+
+        observer5.submit_action((3, 3)).await.unwrap();
+        wait_for_value(&voter1, 3, 3).await;
+
+        /* the gateway comes back; a further action still arrives */
+        net.set_edge_blocked(5, GATEWAY, false).await;
+        voter1.submit_action((4, 4)).await.unwrap();
+        wait_for_value(&observer5, 4, 4).await;
     }
 
     #[tokio::test]

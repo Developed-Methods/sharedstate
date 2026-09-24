@@ -9,6 +9,11 @@
 //! that the peer follows the same leader; the peer only accepts if it is fed
 //! directly by the leader, so relay chains never grow past one hop or loop.
 //!
+//! An observer behind a voter gateway follows the gateway address itself:
+//! whichever voter answers is the leader or fed directly by it, serves the
+//! feed, and forwards actions on. Such an observer is a live source too, so
+//! observers that cannot reach the gateway may relay through it.
+//!
 //! The task publishes its sync status on the node state so the rpc server
 //! knows when this node is a live source others may subscribe to.
 
@@ -247,12 +252,16 @@ where
         Flow::Continue
     }
 
-    /// Peers that could relay the leader's feed, most recently connected first.
+    /// Peers that could relay the leader's feed, most recently connected
+    /// first. Behind a gateway the voters cannot be dialed, so only other
+    /// observers qualify; each dead candidate costs several bounded dials.
     async fn relay_candidates(&self, leader: I::Address) -> Vec<I::Address> {
+        let behind_gateway = self.state.voter_gateway.is_some();
         let peers = self.state.peers.lock().await;
         let mut candidates = peers
             .values()
             .filter(|peer| peer.addr != leader && peer.addr != self.state.my_address)
+            .filter(|peer| !(behind_gateway && peer.can_lead == Some(true)))
             .map(|peer| (peer.connect_status.is_connected(), peer.addr))
             .collect::<Vec<_>>();
         drop(peers);
@@ -298,7 +307,9 @@ where
             }
         };
 
-        self.set_sync_status(if target == leader {
+        self.set_sync_status(if self.state.is_gateway(target) {
+            SyncStatus::Gateway { gateway: target }
+        } else if target == leader {
             SyncStatus::Direct { leader }
         } else {
             SyncStatus::Relayed { relay: target, leader }
@@ -578,6 +589,8 @@ mod tests {
         Arc::new(NodeState {
             my_address: addr,
             can_lead: true,
+            voter_gateway: None,
+            gateway_view: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
             state: SubscribableState::new(
                 RecoverableState::new(addr, TestState(0)),
@@ -719,6 +732,54 @@ mod tests {
              connects={}",
             io.connects.load(Ordering::SeqCst)
         );
+    }
+
+    /// Behind a gateway the observer must not spend its relay scan dialing
+    /// voters it can never reach: only other observers are candidates.
+    #[tokio::test(start_paused = true)]
+    async fn relay_scan_behind_gateway_skips_voters() {
+        let state = Arc::new(NodeState {
+            my_address: 1,
+            can_lead: false,
+            voter_gateway: Some(100),
+            gateway_view: Mutex::new(None),
+            peers: Mutex::new(HashMap::new()),
+            state: SubscribableState::new(
+                RecoverableState::new(1, TestState(0)),
+                SequencedBroadcastSettings::default(),
+            )
+            .unwrap(),
+            leader_state: Mutex::new(LeaderState {
+                term: ElectionTerm::from_term(0),
+                mode: LeaderMode::Following { leader: 100 },
+            }),
+            sync_status: watch::Sender::new(SyncStatus::NotSynced),
+        });
+        {
+            let mut peers = state.peers.lock().await;
+            for voter in 2..=4 {
+                let mut peer = PeerState::empty(voter);
+                peer.can_lead = Some(true);
+                peers.insert(voter, peer);
+            }
+            let mut observer = PeerState::empty(7);
+            observer.can_lead = Some(false);
+            peers.insert(7, observer);
+        }
+
+        let io = Arc::new(HangingIo::default());
+        let connections = Arc::new(PeerConnections::new(io.clone(), test_settings(), state.clone()));
+        let (_actions_tx, actions_rx) = mpsc::channel(16);
+        let task = StateSyncTask::new(
+            state.clone(),
+            connections,
+            io.clone(),
+            test_settings(),
+            actions_rx,
+            test_timing(),
+        );
+
+        assert_eq!(task.relay_candidates(100).await, vec![7]);
     }
 
     #[tokio::test(start_paused = true)]
