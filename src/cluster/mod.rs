@@ -97,6 +97,7 @@ mod tests {
             let state = Arc::new(NodeState {
                 my_address: addr,
                 can_lead,
+                accessible: true,
                 voter_gateway: None,
                 gateway_view: Mutex::new(None),
                 peers: Mutex::new(peers),
@@ -177,6 +178,7 @@ mod tests {
         let state = Arc::new(NodeState {
             my_address: 1,
             can_lead: true,
+            accessible: true,
             voter_gateway: None,
             gateway_view: Mutex::new(None),
             peers: Mutex::new(peers),
@@ -204,6 +206,7 @@ mod tests {
         let state = Arc::new(NodeState {
             my_address: 9,
             can_lead: false,
+            accessible: true,
             voter_gateway: Some(100),
             gateway_view: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
@@ -342,6 +345,7 @@ mod dead_voter_expiry_tests {
             let state = Arc::new(NodeState {
                 my_address: addr,
                 can_lead: true,
+                accessible: true,
                 voter_gateway: None,
                 gateway_view: Mutex::new(None),
                 peers: Mutex::new(peers),

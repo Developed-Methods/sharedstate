@@ -132,6 +132,7 @@ async fn start_node(net: &SimulatedNet, address: u64, can_lead: bool) -> Node {
         io,
         my_address: address,
         can_lead,
+        accessible: true,
         voter_gateway: None,
         initial_peers: peers,
         initial_state: KvState::default(),

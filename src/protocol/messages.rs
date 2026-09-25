@@ -23,6 +23,14 @@ pub enum SyncRequest<A: SyncIOAddress, D: DeterministicState> {
     SubscribeRecovery(RecoverableStateDetails),
     Action { source: A, action: D::Action },
     LeaderQuery,
+    /// Handshake alternative to `MyAddress` for a node other nodes must not
+    /// dial: the server treats the address as the client's identity only and
+    /// never records it as a peer, so it is never gossiped or used as a
+    /// relay.
+    MyInaccessibleAddress(A),
+    /// Asks for the `LeaderInfo` the server would push to its peers. Nodes
+    /// that cannot be dialed never receive those pushes and pull instead.
+    LeaderInfoQuery,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,6 +136,8 @@ impl<A: SyncIOAddress, D: DeterministicState> Debug for SyncRequest<A, D> {
             Self::SubscribeRecovery(details) => write!(f, "SubscribeRecovery({details:?})"),
             Self::Action { source, .. } => write!(f, "Action(source: {source:?})"),
             Self::LeaderQuery => write!(f, "LeaderQuery"),
+            Self::MyInaccessibleAddress(address) => write!(f, "MyInaccessibleAddress({address:?})"),
+            Self::LeaderInfoQuery => write!(f, "LeaderInfoQuery"),
         }
     }
 }
@@ -146,6 +156,7 @@ pub enum SyncResponse<A: SyncIOAddress, D: DeterministicState> {
     /// The node is not a live source for the state (not leading and not
     /// subscribed directly to the leader), so it won't serve subscriptions.
     NotSynced,
+    LeaderInformation(LeaderInfo<A>),
 }
 
 impl<A: SyncIOAddress, D: DeterministicState> SyncResponse<A, D> {
@@ -162,6 +173,7 @@ impl<A: SyncIOAddress, D: DeterministicState> SyncResponse<A, D> {
             SyncResponse::UnexpectedRequest => "UnexpectedRequest",
             SyncResponse::LeaderState(_) => "LeaderState",
             SyncResponse::NotSynced => "NotSynced",
+            SyncResponse::LeaderInformation(_) => "LeaderInformation",
         }
     }
 }
@@ -200,6 +212,11 @@ where
                 action.write_to(out)?
             }
             Self::LeaderQuery => 7u16.write_to(out)?,
+            Self::MyInaccessibleAddress(addr) => {
+                sum += 8u16.write_to(out)?;
+                addr.write_to(out)?
+            }
+            Self::LeaderInfoQuery => 9u16.write_to(out)?,
         };
 
         Ok(sum)
@@ -218,6 +235,8 @@ where
                 action: MessageEncoding::read_from(read)?,
             },
             7 => Self::LeaderQuery,
+            8 => Self::MyInaccessibleAddress(MessageEncoding::read_from(read)?),
+            9 => Self::LeaderInfoQuery,
             other => return Err(unknown_id_err(other, "SyncRequest")),
         })
     }
@@ -374,6 +393,10 @@ where
                 state.write_to(out)?
             }
             Self::NotSynced => 10u16.write_to(out)?,
+            Self::LeaderInformation(info) => {
+                sum += 11u16.write_to(out)?;
+                info.write_to(out)?
+            }
         };
 
         Ok(sum)
@@ -394,6 +417,7 @@ where
             8 => Self::UnexpectedRequest,
             9 => Self::LeaderState(MessageEncoding::read_from(read)?),
             10 => Self::NotSynced,
+            11 => Self::LeaderInformation(MessageEncoding::read_from(read)?),
             other => return Err(unknown_id_err(other, "SyncResponse")),
         })
     }
@@ -514,6 +538,8 @@ mod tests {
                 6,
             ),
             (SyncRequest::LeaderQuery, 7),
+            (SyncRequest::MyInaccessibleAddress(8), 8),
+            (SyncRequest::LeaderInfoQuery, 9),
         ];
 
         for (request, tag) in cases {
@@ -541,6 +567,7 @@ mod tests {
                 9,
             ),
             (SyncResponse::NotSynced, 10),
+            (SyncResponse::LeaderInformation(leader_info()), 11),
         ];
 
         for (response, tag) in cases {

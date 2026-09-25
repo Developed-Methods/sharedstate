@@ -183,7 +183,6 @@ where
                 hash_map::Entry::Vacant(entry) => {
                     let conn = Connection::create(
                         peer,
-                        self.state.my_address,
                         self.state.clone(),
                         self.io.clone(),
                         self.conn_settings.clone(),
@@ -230,6 +229,14 @@ where
         }
     }
 
+    pub async fn query_leader_info(&self, peer: I::Address) -> Result<LeaderInfo<I::Address>, PeerRpcError> {
+        let response = self.send_rpc(peer, SyncRequest::LeaderInfoQuery).await?;
+        match response {
+            SyncResponse::LeaderInformation(info) => Ok(info),
+            response => self.unexpected_response(peer, "LeaderInformation", response).await,
+        }
+    }
+
     async fn unexpected_response<T>(
         &self,
         peer: I::Address,
@@ -261,7 +268,6 @@ where
 {
     pub fn create<I>(
         remote_addr: A,
-        local_addr: A,
         state: Arc<NodeState<A, D>>,
         io: Arc<I>,
         settings: NetIoSettings,
@@ -277,7 +283,6 @@ where
                 rx,
                 cancel: cancel.clone(),
                 remote_addr,
-                local_addr,
                 state,
             }
             .run(io, settings),
@@ -311,7 +316,6 @@ struct ConnectionWorker<A: SyncIOAddress, D: DeterministicState> {
     rx: Receiver<RpcMessage<A, D>>,
     cancel: CancellationToken,
     remote_addr: A,
-    local_addr: A,
     state: Arc<NodeState<A, D>>,
 }
 
@@ -421,7 +425,7 @@ where
         require_ok(read_response(read, timeout).await?)?;
 
         write
-            .send(SyncRequest::MyAddress(self.local_addr))
+            .send(self.state.handshake_address())
             .await
             .map_err(|_| PeerRpcError::FailedToSendRequest)?;
         require_ok(read_response(read, timeout).await?)?;
@@ -632,6 +636,7 @@ mod tests {
         Arc::new(NodeState {
             my_address: 1,
             can_lead: true,
+            accessible: true,
             voter_gateway: None,
             gateway_view: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),

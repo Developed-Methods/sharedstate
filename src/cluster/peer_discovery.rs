@@ -16,7 +16,6 @@ use crate::{
         node_state::{ConnectStatus, GatewayView, NodeState, PeerState},
         peer_connections::{PeerConnections, PeerRpcError},
     },
-    protocol::messages::{LeaderInfo, LeaderState, SharePeerDetails},
     state::deterministic_state::DeterministicState,
     transport::traits::{SyncIO, SyncIOAddress},
     utils::now_ms,
@@ -98,10 +97,16 @@ where
     }
 
     pub async fn tick(&self) {
-        if self.state.can_lead {
+        /* nobody dials an inaccessible node to push peers or leader info,
+         * so it pulls both itself */
+        if self.state.can_lead || !self.state.accessible {
             self.broadcast_peer_details().await;
         }
-        self.share_leader_info().await;
+        if self.state.accessible {
+            self.share_leader_info().await;
+        } else {
+            self.pull_leader_info().await;
+        }
         if let Some(gateway) = self.state.voter_gateway {
             self.observe_gateway(gateway).await;
         }
@@ -121,19 +126,18 @@ where
         let peers = { self.state.peers.lock().await.values().cloned().collect::<Vec<_>>() };
 
         let mut details = peers.iter().map(PeerState::share_details).collect::<Vec<_>>();
-        details.push(SharePeerDetails {
-            address: self.state.my_address,
-            can_be_leader: Some(self.state.can_lead),
-            last_global_activity: NonZeroU64::new(now_ms()),
-        });
+        details.extend(self.state.my_peer_details());
         match self.peer_connections.send_peers_info(gateway, details).await {
             Ok(shared) => self.state.merge_peer_details(shared).await,
             Err(error) => return self.lose_gateway(gateway, "share peers", error).await,
         }
 
-        let info = self.leader_info(&peers).await;
-        if let Err(error) = self.peer_connections.send_leader_info(gateway, info).await {
-            return self.lose_gateway(gateway, "share leader info", error).await;
+        /* voters drop leader info from inaccessible clients unread */
+        if self.state.accessible {
+            let info = self.state.leader_info().await;
+            if let Err(error) = self.peer_connections.send_leader_info(gateway, info).await {
+                return self.lose_gateway(gateway, "share leader info", error).await;
+            }
         }
 
         let answer = match self.peer_connections.query_leader(gateway).await {
@@ -163,35 +167,11 @@ where
         *self.state.gateway_view.lock().await = None;
     }
 
-    async fn leader_info(&self, peers: &[PeerState<I::Address>]) -> LeaderInfo<I::Address> {
-        let mut reachable_voters = peers
-            .iter()
-            .filter_map(|peer| peer.connect_status.is_connected().then_some(peer.addr))
-            .collect::<Vec<_>>();
-        if self.state.can_lead {
-            reachable_voters.push(self.state.my_address);
-        }
-
-        LeaderInfo {
-            can_lead: self.state.can_lead,
-            leader_state: {
-                let lock = self.state.leader_state.lock().await;
-                LeaderState::clone(&*lock)
-            },
-            reachable_voters,
-            recovery_details: self.state.state.recovery_details().await,
-        }
-    }
-
     async fn broadcast_peer_details(&self) {
         self.process_data_for_peers(
             |peers| async move {
                 let mut details = peers.iter().map(PeerState::share_details).collect::<Vec<_>>();
-                details.push(SharePeerDetails {
-                    address: self.state.my_address,
-                    can_be_leader: Some(self.state.can_lead),
-                    last_global_activity: NonZeroU64::new(now_ms()),
-                });
+                details.extend(self.state.my_peer_details());
                 details
             },
             |peer, details| {
@@ -210,7 +190,7 @@ where
 
     async fn share_leader_info(&self) {
         self.process_data_for_peers(
-            |peers| async move { self.leader_info(&peers).await },
+            |_| async move { self.state.leader_info().await },
             |peer, leader_info| {
                 let conn = self.peer_connections.clone();
                 let leader_info = leader_info.clone();
@@ -225,6 +205,29 @@ where
                     }
 
                     let _ = conn.send_leader_info(peer.addr, leader_info).await;
+                }
+            },
+        )
+        .await;
+    }
+
+    /// The pull counterpart of the leader info voters push to everyone they
+    /// dial. Only voters' info matters to an observer's election rules, and
+    /// a peer whose role is unknown is asked in case it is one.
+    async fn pull_leader_info(&self) {
+        self.process_data_for_peers(
+            |_| async {},
+            |peer, _| {
+                let conn = self.peer_connections.clone();
+
+                async move {
+                    if !peer.can_lead.unwrap_or(true) {
+                        return;
+                    }
+
+                    if let Ok(info) = conn.query_leader_info(peer.addr).await {
+                        self.state.record_leader_info(peer.addr, info).await;
+                    }
                 }
             },
         )
