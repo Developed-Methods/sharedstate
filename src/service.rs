@@ -6,7 +6,8 @@
 //! reach the voters individually are configured the same way; observers
 //! that can only reach them through a shared address set
 //! [`SharedStateConfig::voter_gateway`] instead and need no voter
-//! addresses at all.
+//! addresses at all. Observers that other nodes must never dial or use as
+//! a relay clear [`SharedStateConfig::accessible`].
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -44,6 +45,9 @@ pub struct SharedStateConfig<I: SyncIOListener, D: DeterministicState> {
     pub io: Arc<I>,
     pub my_address: I::Address,
     pub can_lead: bool,
+    /// Whether other nodes may dial this node and use it as a relay. See
+    /// [`NodeState::accessible`]. Must be `true` when `can_lead` is set.
+    pub accessible: bool,
     /// For observers that cannot dial voters individually: an address (such
     /// as a load balancer) that reaches some voter. See
     /// [`NodeState::voter_gateway`]. Must be `None` when `can_lead` is set.
@@ -57,6 +61,8 @@ pub struct SharedStateRecoverableConfig<I: SyncIOListener, D: DeterministicState
     pub io: Arc<I>,
     pub my_address: I::Address,
     pub can_lead: bool,
+    /// See [`SharedStateConfig::accessible`].
+    pub accessible: bool,
     /// See [`SharedStateConfig::voter_gateway`].
     pub voter_gateway: Option<I::Address>,
     pub initial_peers: Vec<I::Address>,
@@ -74,6 +80,9 @@ pub enum ConfigError {
     /// The gateway is a dial target for other nodes, so it can never be
     /// this node's own address.
     GatewayIsSelf,
+    /// Voters must be able to dial each other to elect a leader and feed
+    /// the rest of the cluster.
+    VoterNotAccessible,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -82,6 +91,7 @@ impl std::fmt::Display for ConfigError {
             Self::Broadcast(error) => write!(f, "invalid broadcast settings: {error:?}"),
             Self::VoterWithGateway => write!(f, "voter_gateway is only valid when can_lead is false"),
             Self::GatewayIsSelf => write!(f, "voter_gateway cannot be this node's own address"),
+            Self::VoterNotAccessible => write!(f, "accessible must be true when can_lead is true"),
         }
     }
 }
@@ -125,6 +135,7 @@ where
             io,
             my_address,
             can_lead,
+            accessible,
             voter_gateway,
             initial_peers,
             initial_state,
@@ -135,6 +146,7 @@ where
             io,
             my_address,
             can_lead,
+            accessible,
             voter_gateway,
             initial_peers,
             initial_state: RecoverableState::new(unique_state_id(&my_address), initial_state),
@@ -147,6 +159,7 @@ where
             io,
             my_address,
             can_lead,
+            accessible,
             voter_gateway,
             initial_peers,
             initial_state,
@@ -155,6 +168,9 @@ where
 
         if can_lead && voter_gateway.is_some() {
             return Err(ConfigError::VoterWithGateway);
+        }
+        if can_lead && !accessible {
+            return Err(ConfigError::VoterNotAccessible);
         }
         if voter_gateway == Some(my_address) {
             return Err(ConfigError::GatewayIsSelf);
@@ -169,6 +185,7 @@ where
         let node = Arc::new(NodeState {
             my_address,
             can_lead,
+            accessible,
             voter_gateway,
             gateway_view: Mutex::new(None),
             peers: Mutex::new(peers),
@@ -209,6 +226,10 @@ where
 
     pub fn can_lead(&self) -> bool {
         self.node.can_lead
+    }
+
+    pub fn accessible(&self) -> bool {
+        self.node.accessible
     }
 
     pub fn voter_gateway(&self) -> Option<I::Address> {
@@ -344,6 +365,7 @@ mod tests {
             io,
             my_address: address,
             can_lead,
+            accessible: true,
             voter_gateway: None,
             initial_peers: peers.to_vec(),
             initial_state: KvState::default(),
@@ -364,12 +386,47 @@ mod tests {
             io,
             my_address: address,
             can_lead: false,
+            accessible: true,
             voter_gateway: Some(gateway),
             initial_peers: peers.to_vec(),
             initial_state: KvState::default(),
             settings: fast_settings(),
         })
         .unwrap()
+    }
+
+    /// An observer other nodes must never dial or relay through.
+    async fn start_inaccessible_node(
+        net: &SimulatedNet,
+        address: u64,
+        voter_gateway: Option<u64>,
+        peers: &[u64],
+    ) -> SharedState<SimulatedIo, KvState> {
+        let io = net.start_io(address).await;
+        SharedState::start(SharedStateConfig {
+            io,
+            my_address: address,
+            can_lead: false,
+            accessible: false,
+            voter_gateway,
+            initial_peers: peers.to_vec(),
+            initial_state: KvState::default(),
+            settings: fast_settings(),
+        })
+        .unwrap()
+    }
+
+    async fn assert_never_learned(nodes: &[&SharedState<SimulatedIo, KvState>], net: &SimulatedNet, hidden: u64) {
+        for node in nodes {
+            let peers = node.node().peers.lock().await;
+            assert!(!peers.contains_key(&hidden), "node {} learned the inaccessible node", node.my_address());
+            assert_eq!(
+                net.dials(node.my_address(), hidden).await,
+                0,
+                "node {} dialed the inaccessible node",
+                node.my_address()
+            );
+        }
     }
 
     const GATEWAY: u64 = 100;
@@ -532,6 +589,7 @@ mod tests {
             io: net.start_io(1).await,
             my_address: 1,
             can_lead: true,
+            accessible: true,
             voter_gateway: Some(100),
             initial_peers: Vec::new(),
             initial_state: KvState::default(),
@@ -543,6 +601,7 @@ mod tests {
             io: net.start_io(2).await,
             my_address: 2,
             can_lead: false,
+            accessible: true,
             voter_gateway: Some(2),
             initial_peers: Vec::new(),
             initial_state: KvState::default(),
@@ -552,12 +611,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn voters_must_be_accessible() {
+        let net = SimulatedNet::new();
+        let result = SharedState::start(SharedStateConfig {
+            io: net.start_io(1).await,
+            my_address: 1,
+            can_lead: true,
+            accessible: false,
+            voter_gateway: None,
+            initial_peers: Vec::new(),
+            initial_state: KvState::default(),
+            settings: fast_settings(),
+        });
+        assert!(matches!(result, Err(ConfigError::VoterNotAccessible)));
+    }
+
+    #[tokio::test]
+    async fn inaccessible_observer_syncs_without_being_learned() {
+        let net = SimulatedNet::new();
+        let voter1 = start_node(&net, 1, true, &[2, 3]).await;
+        let voter2 = start_node(&net, 2, true, &[1, 3]).await;
+        let voter3 = start_node(&net, 3, true, &[1, 2]).await;
+        let observer = start_node(&net, 4, false, &[1, 2, 3]).await;
+        /* seeded with one voter only: nobody dials it, so the rest of the
+         * cluster and the election state must be pulled */
+        let hidden = start_inaccessible_node(&net, 5, None, &[2]).await;
+
+        wait_for_leader(&[&voter1, &voter2, &voter3, &observer, &hidden], 1).await;
+        wait_for("inaccessible node to learn the cluster", || {
+            hidden
+                .node()
+                .peers
+                .try_lock()
+                .map(|peers| [1, 2, 3, 4].iter().all(|addr| peers.contains_key(addr)))
+                .unwrap_or(false)
+        })
+        .await;
+
+        voter1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&hidden, 1, 1).await;
+
+        hidden.submit_action((2, 2)).await.unwrap();
+        for node in [&voter1, &voter2, &voter3, &observer, &hidden] {
+            wait_for_value(node, 2, 2).await;
+        }
+
+        assert_never_learned(&[&voter1, &voter2, &voter3, &observer], &net, 5).await;
+    }
+
+    #[tokio::test]
+    async fn inaccessible_node_is_never_a_relay() {
+        let net = SimulatedNet::new();
+        let voter1 = start_node(&net, 1, true, &[2, 3]).await;
+        let voter2 = start_node(&net, 2, true, &[1, 3]).await;
+        let voter3 = start_node(&net, 3, true, &[1, 2]).await;
+        /* misconfigured to know the inaccessible node, so it dials it and
+         * gossips it on; the inaccessible node must still refuse to feed
+         * anyone */
+        let observer = start_node(&net, 4, false, &[1, 2, 3, 5]).await;
+        let hidden = start_inaccessible_node(&net, 5, None, &[1, 2, 3]).await;
+
+        wait_for_leader(&[&voter1, &voter2, &voter3, &observer, &hidden], 1).await;
+        voter1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&observer, 1, 1).await;
+        wait_for_value(&hidden, 1, 1).await;
+
+        /* the observer loses every voter; the inaccessible node is the only
+         * live source it can still reach */
+        for voter in [1, 2, 3] {
+            net.set_edge_blocked(voter, 4, true).await;
+        }
+        voter1.submit_action((2, 2)).await.unwrap();
+        wait_for_value(&hidden, 2, 2).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            observer
+                .state_handle()
+                .read_with(|state| !state.state().values.contains_key(&2)),
+            "observer was fed by the inaccessible node"
+        );
+        assert!(
+            !matches!(*observer.node().sync_status.borrow(), SyncStatus::Relayed { relay: 5, .. }),
+            "observer relays through the inaccessible node"
+        );
+
+        for voter in [1, 2, 3] {
+            net.set_edge_blocked(voter, 4, false).await;
+        }
+        wait_for_value(&observer, 2, 2).await;
+    }
+
+    #[tokio::test]
+    async fn inaccessible_observer_behind_gateway_is_never_learned() {
+        let net = SimulatedNet::new();
+        let [voter1, voter2, voter3] = start_voters_behind_gateway(&net).await;
+        block_dials_to_observers(&net, &[4, 5]).await;
+        let observer = start_observer_via_gateway(&net, 4, GATEWAY, &[]).await;
+        let hidden = start_inaccessible_node(&net, 5, Some(GATEWAY), &[]).await;
+
+        wait_for_leader(&[&observer, &hidden], GATEWAY).await;
+        voter1.submit_action((1, 1)).await.unwrap();
+        wait_for_value(&hidden, 1, 1).await;
+
+        hidden.submit_action((2, 2)).await.unwrap();
+        for node in [&voter1, &voter2, &voter3, &observer, &hidden] {
+            wait_for_value(node, 2, 2).await;
+        }
+
+        /* the hidden node still learns the accessible observer through the
+         * gateway, but nothing learns it back */
+        wait_for("inaccessible node to learn observer 4", || {
+            hidden
+                .node()
+                .peers
+                .try_lock()
+                .map(|peers| peers.contains_key(&4))
+                .unwrap_or(false)
+        })
+        .await;
+        assert_never_learned(&[&voter1, &voter2, &voter3, &observer], &net, 5).await;
+    }
+
+    #[tokio::test]
     async fn gateway_is_never_a_peer() {
         let net = SimulatedNet::new();
         let node = SharedState::start(SharedStateConfig {
             io: net.start_io(1).await,
             my_address: 1,
             can_lead: false,
+            accessible: true,
             voter_gateway: Some(100),
             initial_peers: vec![100, 2],
             initial_state: KvState::default(),
@@ -585,6 +767,7 @@ mod tests {
             io,
             my_address: 1,
             can_lead: true,
+            accessible: true,
             voter_gateway: None,
             initial_peers: Vec::new(),
             initial_state,

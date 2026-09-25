@@ -11,7 +11,7 @@ use tokio::{
 };
 
 use crate::{
-    cluster::node_state::{NodeState, PeerState, SyncStatus},
+    cluster::node_state::{NodeState, SyncStatus},
     protocol::messages::{SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         deterministic_state::DeterministicState,
@@ -36,14 +36,24 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
         RpcServer { state, actions_tx }
     }
 
-    pub async fn handle(&self, peer_addr: A, request: SyncRequest<A, D>) -> ResponseOrFeed<A, D> {
-        if !self.state.note_known_peer_activity(peer_addr).await {
+    /// Handles one request from `peer_addr`. A client that is not
+    /// `peer_accessible` said so in the handshake: it must never enter the
+    /// peer map, since anything there is gossiped, dialed, and tried as a
+    /// relay.
+    pub async fn handle(
+        &self,
+        peer_addr: A,
+        peer_accessible: bool,
+        request: SyncRequest<A, D>,
+    ) -> ResponseOrFeed<A, D> {
+        if peer_accessible && !self.state.note_known_peer_activity(peer_addr).await {
             tracing::debug!(?peer_addr, "learned about new peer from inbound connection");
         }
 
         let resp = match request {
             SyncRequest::ProtocolVersion(_) => SyncResponse::UnexpectedRequest,
             SyncRequest::MyAddress(_) => SyncResponse::UnexpectedRequest,
+            SyncRequest::MyInaccessibleAddress(_) => SyncResponse::UnexpectedRequest,
 
             SyncRequest::Action { source, action } => {
                 if self.actions_tx.send((source, action)).await.is_ok() {
@@ -53,11 +63,9 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
                 }
             }
             SyncRequest::LeaderInformation(info) => {
-                let mut lock = self.state.peers.lock().await;
-                let peer = lock.entry(peer_addr).or_insert_with(|| PeerState::empty(peer_addr));
-                peer.can_lead = Some(info.can_lead);
-                peer.leader_info = Some(info);
-
+                if peer_accessible {
+                    self.state.record_leader_info(peer_addr, info).await;
+                }
                 SyncResponse::Ok
             }
             SyncRequest::SubscribeRecovery(details) => match self.live_source(peer_addr) {
@@ -81,6 +89,7 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
                 let leader_state = self.state.leader_state.lock().await.clone();
                 SyncResponse::LeaderState(leader_state)
             }
+            SyncRequest::LeaderInfoQuery => SyncResponse::LeaderInformation(self.state.leader_info().await),
             SyncRequest::SharePeers(shared_peers) => {
                 self.state.merge_peer_details(shared_peers).await;
                 let share_peer_details = self.state.known_peer_details().await;
@@ -94,8 +103,13 @@ impl<A: SyncIOAddress, D: DeterministicState> RpcServer<A, D> {
     /// A watch on our sync status, only if we are currently a live source
     /// (leading or fed directly by the leader). Subscribing before checking
     /// means a status change right after the check still shows up as a
-    /// change on the returned watch.
+    /// change on the returned watch. An inaccessible node is never a source,
+    /// even for a client that dialed it anyway.
     fn live_source(&self, peer_addr: A) -> Option<watch::Receiver<SyncStatus<A>>> {
+        if !self.state.accessible {
+            tracing::info!(?peer_addr, "refusing subscription, this node is not accessible");
+            return None;
+        }
         let source = self.state.sync_status.subscribe();
         let status = *source.borrow();
         if status.can_relay() {
@@ -148,13 +162,14 @@ where
         I: SyncIO<Address = A>,
     {
         let (transport_addr, write, mut read) = conn.server_channels::<D>(settings.clone());
-        let Some(peer_addr) = handshake_client(&write, &mut read, settings.message_timeout).await else {
+        let Some((peer_addr, peer_accessible)) = handshake_client(&write, &mut read, settings.message_timeout).await
+        else {
             tracing::debug!(?transport_addr, "rpc client handshake failed");
             return;
         };
 
         while let Some(request) = read.recv().await {
-            match self.handle(peer_addr, request).await {
+            match self.handle(peer_addr, peer_accessible, request).await {
                 ResponseOrFeed::Response(response) => {
                     if write.send(response).await.is_err() {
                         break;
@@ -183,7 +198,7 @@ async fn handshake_client<A, D>(
     write: &Sender<SyncResponse<A, D>>,
     read: &mut Receiver<SyncRequest<A, D>>,
     timeout: std::time::Duration,
-) -> Option<A>
+) -> Option<(A, bool)>
 where
     A: SyncIOAddress,
     D: DeterministicState,
@@ -203,7 +218,11 @@ where
     match address {
         SyncRequest::MyAddress(address) => {
             write.send(SyncResponse::Ok).await.ok()?;
-            Some(address)
+            Some((address, true))
+        }
+        SyncRequest::MyInaccessibleAddress(address) => {
+            write.send(SyncResponse::Ok).await.ok()?;
+            Some((address, false))
         }
         _ => {
             let _ = write.send(SyncResponse::UnexpectedRequest).await;
@@ -317,6 +336,7 @@ mod tests {
         let state = Arc::new(NodeState {
             my_address: 1,
             can_lead: true,
+            accessible: true,
             voter_gateway: None,
             gateway_view: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
@@ -348,13 +368,13 @@ mod tests {
         ] {
             let (server, state) = server(status);
 
-            let response = server.handle(9, SyncRequest::SubscribeRecovery(matching_details(&state))).await;
+            let response = server.handle(9, true, SyncRequest::SubscribeRecovery(matching_details(&state))).await;
             assert!(
                 matches!(response, ResponseOrFeed::Response(SyncResponse::NotSynced)),
                 "recovery subscription must be refused while {status:?}"
             );
 
-            let response = server.handle(9, SyncRequest::SubscribeFresh).await;
+            let response = server.handle(9, true, SyncRequest::SubscribeFresh).await;
             assert!(
                 matches!(response, ResponseOrFeed::Response(SyncResponse::NotSynced)),
                 "fresh subscription must be refused while {status:?}"
@@ -368,13 +388,13 @@ mod tests {
         ] {
             let (server, state) = server(status);
 
-            let response = server.handle(9, SyncRequest::SubscribeRecovery(matching_details(&state))).await;
+            let response = server.handle(9, true, SyncRequest::SubscribeRecovery(matching_details(&state))).await;
             assert!(
                 matches!(response, ResponseOrFeed::Subscription { .. }),
                 "recovery subscription must be served while {status:?}"
             );
 
-            let response = server.handle(9, SyncRequest::SubscribeFresh).await;
+            let response = server.handle(9, true, SyncRequest::SubscribeFresh).await;
             assert!(
                 matches!(response, ResponseOrFeed::FreshState { .. }),
                 "fresh subscription must be served while {status:?}"
@@ -386,8 +406,9 @@ mod tests {
     async fn feed_closes_when_the_node_stops_being_a_live_source() {
         let (server, state) = server(SyncStatus::Direct { leader: 3 });
 
-        let ResponseOrFeed::Subscription { feed, source } =
-            server.handle(9, SyncRequest::SubscribeRecovery(matching_details(&state))).await
+        let ResponseOrFeed::Subscription { feed, source } = server
+            .handle(9, true, SyncRequest::SubscribeRecovery(matching_details(&state)))
+            .await
         else {
             panic!("expected a subscription");
         };
@@ -424,7 +445,7 @@ mod tests {
     async fn feed_ends_when_the_subscriber_disconnects() {
         let (server, _state) = server(SyncStatus::Leading);
 
-        let ResponseOrFeed::FreshState { feed, source, .. } = server.handle(9, SyncRequest::SubscribeFresh).await
+        let ResponseOrFeed::FreshState { feed, source, .. } = server.handle(9, true, SyncRequest::SubscribeFresh).await
         else {
             panic!("expected a fresh subscription");
         };

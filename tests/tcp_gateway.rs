@@ -72,6 +72,7 @@ async fn observer_behind_tcp_proxy_syncs_and_survives_leader_change() {
             io: Arc::new(leader_io),
             my_address,
             can_lead: true,
+            accessible: true,
             voter_gateway: None,
             initial_peers: leader_peers,
             initial_state: KvState::default(),

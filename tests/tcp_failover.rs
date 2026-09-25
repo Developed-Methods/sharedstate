@@ -35,6 +35,7 @@ async fn follower_actions_apply_after_leader_change_over_tcp() {
             my_address: leader_io.address,
             io: Arc::new(leader_io),
             can_lead: true,
+            accessible: true,
             voter_gateway: None,
             initial_peers: leader_peers,
             initial_state: KvState::default(),

@@ -360,7 +360,7 @@ where
         send(write, SyncRequest::ProtocolVersion(PROTOCOL_VERSION)).await?;
         expect_ok(recv(read, timeout).await?, "protocol version")?;
 
-        send(write, SyncRequest::MyAddress(self.state.my_address)).await?;
+        send(write, self.state.handshake_address()).await?;
         expect_ok(recv(read, timeout).await?, "my address")?;
 
         tracing::info!(?target, "sync trace: handshake done, settling recovery details");
@@ -589,6 +589,7 @@ mod tests {
         Arc::new(NodeState {
             my_address: addr,
             can_lead: true,
+            accessible: true,
             voter_gateway: None,
             gateway_view: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
@@ -741,6 +742,7 @@ mod tests {
         let state = Arc::new(NodeState {
             my_address: 1,
             can_lead: false,
+            accessible: true,
             voter_gateway: Some(100),
             gateway_view: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),

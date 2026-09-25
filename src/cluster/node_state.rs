@@ -3,7 +3,7 @@ use std::{collections::HashMap, num::NonZeroU64, time::Duration};
 use tokio::sync::{Mutex, watch};
 
 use crate::{
-    protocol::messages::{ElectionTerm, LeaderInfo, LeaderMode, LeaderState, SharePeerDetails},
+    protocol::messages::{ElectionTerm, LeaderInfo, LeaderMode, LeaderState, SharePeerDetails, SyncRequest},
     state::{deterministic_state::DeterministicState, subscribable_state::SubscribableState},
     transport::traits::SyncIOAddress,
     utils::now_ms,
@@ -12,6 +12,12 @@ use crate::{
 pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
     pub my_address: A,
     pub can_lead: bool,
+    /// Whether other nodes may dial this node. An inaccessible node only
+    /// ever dials out: it tells peers so in the handshake, they never record
+    /// it as a peer, and so it is never gossiped, dialed, or picked as a
+    /// relay. It never serves subscriptions either. Voters must be
+    /// accessible.
+    pub accessible: bool,
     /// An address that reaches some voter, for observers that cannot dial
     /// voters individually (a load balancer in front of the voter set). It
     /// is a dial target only: never a peer identity, never stored in
@@ -196,6 +202,60 @@ where
 
     pub(crate) async fn known_peer_details(&self) -> Vec<SharePeerDetails<A>> {
         self.peers.lock().await.values().map(PeerState::share_details).collect()
+    }
+
+    /// How we introduce ourselves after the protocol version in every
+    /// connection we open.
+    pub(crate) fn handshake_address(&self) -> SyncRequest<A, D> {
+        if self.accessible {
+            SyncRequest::MyAddress(self.my_address)
+        } else {
+            SyncRequest::MyInaccessibleAddress(self.my_address)
+        }
+    }
+
+    /// Our own entry for a `SharePeers` exchange, if other nodes may learn
+    /// about us.
+    pub(crate) fn my_peer_details(&self) -> Option<SharePeerDetails<A>> {
+        self.accessible.then(|| SharePeerDetails {
+            address: self.my_address,
+            can_be_leader: Some(self.can_lead),
+            last_global_activity: NonZeroU64::new(now_ms()),
+        })
+    }
+
+    /// What we tell peers about our election state and reach.
+    pub(crate) async fn leader_info(&self) -> LeaderInfo<A> {
+        let mut reachable_voters = self
+            .peers
+            .lock()
+            .await
+            .values()
+            .filter_map(|peer| peer.connect_status.is_connected().then_some(peer.addr))
+            .collect::<Vec<_>>();
+        if self.can_lead {
+            reachable_voters.push(self.my_address);
+        }
+
+        let leader_state = self.leader_state.lock().await.clone();
+        LeaderInfo {
+            can_lead: self.can_lead,
+            leader_state,
+            reachable_voters,
+            recovery_details: self.state.recovery_details().await,
+        }
+    }
+
+    /// Stores a peer's `LeaderInfo`, whether it pushed it to us or we
+    /// pulled it.
+    pub(crate) async fn record_leader_info(&self, peer: A, info: LeaderInfo<A>) {
+        if self.is_gateway(peer) {
+            return;
+        }
+        let mut peers = self.peers.lock().await;
+        let peer_state = peers.entry(peer).or_insert_with(|| PeerState::empty(peer));
+        peer_state.can_lead = Some(info.can_lead);
+        peer_state.leader_info = Some(info);
     }
 
     /// Records activity from a peer, registering it if this is first contact.

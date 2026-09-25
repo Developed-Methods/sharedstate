@@ -128,6 +128,7 @@ pub async fn start_node_with_gateway(
         io: Arc::new(io),
         my_address,
         can_lead,
+        accessible: true,
         voter_gateway,
         initial_peers: peers.to_vec(),
         initial_state: KvState::default(),
