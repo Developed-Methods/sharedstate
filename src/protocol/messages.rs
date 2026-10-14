@@ -431,8 +431,15 @@ fn write_vec<T: MessageEncoding, W: std::io::Write>(v: &[T], out: &mut W) -> std
     Ok(sum)
 }
 
+/// Peer and reachable voter lists hold one entry per node, so counts above
+/// this are logged before the list is sized to them.
+const OVERSIZED_LIST_COUNT: usize = 4096;
+
 fn read_vec<T: MessageEncoding, R: std::io::Read>(read: &mut R) -> std::io::Result<Vec<T>> {
     let count = u64::read_from(read)? as usize;
+    if count > OVERSIZED_LIST_COUNT {
+        tracing::warn!(count, item = std::any::type_name::<T>(), "oversized list count read from the wire");
+    }
     let mut vec = Vec::with_capacity(count);
     for _ in 0..count {
         vec.push(MessageEncoding::read_from(read)?);
