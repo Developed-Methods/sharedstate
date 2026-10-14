@@ -105,7 +105,16 @@ async fn observer_behind_tcp_proxy_syncs_and_survives_leader_change() {
         .await
         .unwrap();
     wait_for_value(&observer, "before", "1", Duration::from_secs(30)).await;
-    assert_eq!(*observer.node().sync_status.borrow(), SyncStatus::Gateway { gateway: proxy });
+    /* the subscription applies the state before it publishes the sync
+     * status, so the value can be visible a moment before the status */
+    let mut sync_status = observer.node().sync_status.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        sync_status.wait_for(|status| *status == SyncStatus::Gateway { gateway: proxy }),
+    )
+    .await
+    .expect("observer never reported syncing through the gateway")
+    .unwrap();
 
     observer
         .submit_action(("from-observer".to_owned(), "1".to_owned()))
