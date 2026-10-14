@@ -4,6 +4,10 @@ use message_encoding::{m_opt_sum, MessageEncoding};
 use serde::Serialize;
 use std::{collections::VecDeque, fmt::Debug};
 
+/// Generation ends kept for recovering followers. A generation bump drops the
+/// oldest once the history is this long.
+const MAX_HISTORY: usize = 2048;
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct RecoverableState<D: DeterministicState> {
     details: RecoverableStateDetails,
@@ -76,7 +80,7 @@ impl RecoverableStateDetails {
     pub fn apply_generation_bump(&mut self, new_id: u64) {
         self.outer_state_next_seq += 1;
 
-        if 2048 <= self.history.len() {
+        if MAX_HISTORY <= self.history.len() {
             let _ = self.history.pop_front();
         }
 
@@ -229,6 +233,9 @@ impl MessageEncoding for RecoverableStateDetails {
             inner_state_next_seq: MessageEncoding::read_from(read)?,
             history: {
                 let len = u64::read_from(read)? as usize;
+                if len > MAX_HISTORY {
+                    tracing::warn!(len, "recovery history longer than any node keeps, read from the wire");
+                }
                 let mut history = VecDeque::with_capacity(len);
 
                 for _ in 0..len {
