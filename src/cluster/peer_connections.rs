@@ -115,20 +115,43 @@ where
         Ok(rx)
     }
 
-    pub async fn enqueue_forwarded_action(
+    /// Queues a forwarded action without waiting for room. The caller is the
+    /// state sync task, which also reads the action feed; if it waited on a
+    /// target that accepts the connection but never answers, the queue would
+    /// stay full for good and the feed would stop being read. A full queue
+    /// drops the action instead. Forwarded actions are best effort anyway:
+    /// a failed send or response is only logged.
+    pub async fn try_enqueue_forwarded_action(
         &self,
         peer: I::Address,
         source: I::Address,
         action: D::Action,
     ) -> Result<(), PeerRpcError> {
-        self.enqueue_message(
-            peer,
-            RpcMessage {
-                request: SyncRequest::Action { source, action },
-                response: RpcResponseHandler::ForwardedAction { target: peer, source },
-            },
-        )
-        .await
+        let msg = RpcMessage {
+            request: SyncRequest::Action { source, action },
+            response: RpcResponseHandler::ForwardedAction { target: peer, source },
+        };
+
+        let mut connections = self.connections.lock().await;
+        if connections
+            .get(&peer)
+            .is_some_and(|conn| conn.tx.is_closed() || conn.cancel.is_cancelled())
+        {
+            /* the worker exits on its own once cancelled; waiting for it
+             * here is what this path must avoid */
+            if let Some(connection) = connections.remove(&peer) {
+                connection.cancel.cancel();
+            }
+        }
+
+        let connection = connections.entry(peer).or_insert_with(|| {
+            Connection::create(peer, self.state.clone(), self.io.clone(), self.conn_settings.clone())
+        });
+        match connection.tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(PeerRpcError::QueueFull),
+            Err(TrySendError::Closed(_)) => Err(PeerRpcError::FailedToSendRequest),
+        }
     }
 
     async fn enqueue_message(
@@ -302,6 +325,9 @@ pub enum PeerRpcError {
     RequestNotAllowedOverRpc,
     FailedToConnectToPeer,
     FailedToSendRequest,
+    /// The connection already holds `RPC_QUEUE_CAPACITY` requests waiting
+    /// to be sent or answered.
+    QueueFull,
     FailedToReceiveResponse,
     HandshakeRejected,
     ResponseTimedOut,
@@ -671,5 +697,28 @@ mod tests {
         io.release_responses.add_permits(2);
         assert!(matches!(first.await.unwrap().unwrap(), SyncResponse::Ok));
         assert!(matches!(second.await.unwrap().unwrap(), SyncResponse::Ok));
+    }
+
+    /// A target that accepts requests but never answers fills the queue.
+    /// Forwarding must then fail fast instead of waiting for room, because
+    /// the caller is also the task reading the action feed.
+    #[tokio::test]
+    async fn forwarding_to_unresponsive_target_fails_fast_when_queue_is_full() {
+        let io = Arc::new(DelayedResponseIo::new());
+        let connections = PeerConnections::new(io.clone(), test_settings(), node_state());
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), async {
+            for action in 0..(8 * RPC_QUEUE_CAPACITY as u64) {
+                match connections.try_enqueue_forwarded_action(2, 1, action).await {
+                    Ok(()) => tokio::task::yield_now().await,
+                    Err(error) => return Some(error),
+                }
+            }
+            None
+        })
+        .await
+        .expect("forwarding blocked on a full queue");
+
+        assert_eq!(outcome, Some(PeerRpcError::QueueFull));
     }
 }

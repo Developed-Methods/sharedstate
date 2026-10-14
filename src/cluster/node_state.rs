@@ -158,6 +158,18 @@ impl<A: SyncIOAddress> PeerState<A> {
             && duration_ms(horizon) < now_ms.saturating_sub(last_seen.get())
     }
 
+    /// Whether nobody in the cluster has heard from this peer for longer
+    /// than `horizon` and we are not connected to it. Unlike
+    /// [`PeerState::is_expired`] this does not need a failed dial of our
+    /// own: an entry re-added by gossip starts out not connected and should
+    /// be dropped again without being dialed first.
+    pub fn is_departed(&self, now_ms: u64, horizon: Duration) -> bool {
+        let Some(last_seen) = self.last_global_connectivity else {
+            return false;
+        };
+        !self.connect_status.is_connected() && duration_ms(horizon) < now_ms.saturating_sub(last_seen.get())
+    }
+
     pub(crate) fn share_details(&self) -> SharePeerDetails<A> {
         SharePeerDetails {
             address: self.addr,
@@ -198,6 +210,17 @@ where
             peer_state.last_global_connectivity =
                 merge_last_activity(peer_state.last_global_connectivity, shared.last_global_activity);
         }
+    }
+
+    /// Removes every peer that [`PeerState::is_departed`] for `horizon`.
+    pub(crate) async fn forget_departed_peers(&self, now_ms: u64, horizon: Duration) {
+        self.peers.lock().await.retain(|addr, peer| {
+            let departed = peer.is_departed(now_ms, horizon);
+            if departed {
+                tracing::info!(?addr, last_seen_ms = ?peer.last_global_connectivity, "forgetting departed peer");
+            }
+            !departed
+        });
     }
 
     pub(crate) async fn known_peer_details(&self) -> Vec<SharePeerDetails<A>> {
@@ -356,6 +379,17 @@ mod tests {
     fn never_heard_from_does_not_expire() {
         let failed = ConnectStatus::FailedToConnect { epoch_ms: 0 };
         assert!(!peer(failed, None).is_expired(NOW, HORIZON));
+    }
+
+    #[test]
+    fn departs_once_unheard_for_longer_than_horizon_while_not_connected() {
+        let long_ago = Some(NOW - ms(HORIZON) - 1);
+        let failed = ConnectStatus::FailedToConnect { epoch_ms: NOW };
+        assert!(peer(failed, long_ago).is_departed(NOW, HORIZON));
+        assert!(peer(ConnectStatus::NotConnected, long_ago).is_departed(NOW, HORIZON));
+        assert!(!peer(ConnectStatus::Connected { epoch_ms: NOW }, long_ago).is_departed(NOW, HORIZON));
+        assert!(!peer(failed, Some(NOW - ms(HORIZON))).is_departed(NOW, HORIZON));
+        assert!(!peer(failed, None).is_departed(NOW, HORIZON));
     }
 
     #[test]

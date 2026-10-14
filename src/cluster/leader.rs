@@ -45,12 +45,21 @@ pub struct PeerExpiry {
     /// A voter nobody has heard from for this long, while dialing it fails,
     /// stops counting toward the majority.
     pub voter_horizon: Duration,
+    /// A peer nobody has heard from for this long, that we are not
+    /// connected to, is removed from the peer map. Without it decommissioned
+    /// hosts are dialed by discovery and tried as relays forever. Gossip
+    /// re-adds such a peer with its old activity time, so it is removed
+    /// again on the next tick until every node has forgotten it. Never
+    /// shorter than `voter_horizon` in effect, so a voter is forgotten only
+    /// after it already stopped counting.
+    pub forget_horizon: Duration,
 }
 
 impl Default for PeerExpiry {
     fn default() -> Self {
         Self {
             voter_horizon: Duration::from_secs(6 * 60 * 60),
+            forget_horizon: Duration::from_secs(7 * 24 * 60 * 60),
         }
     }
 }
@@ -82,6 +91,9 @@ where
     }
 
     pub async fn tick(&mut self) {
+        self.state
+            .forget_departed_peers(now_ms(), self.expiry.forget_horizon.max(self.expiry.voter_horizon))
+            .await;
         let my_recovery = self.state.state.recovery_details().await;
 
         let (me, peer_views) = {

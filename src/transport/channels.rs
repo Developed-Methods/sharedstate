@@ -127,26 +127,21 @@ impl<I: SyncIO, M: MessageEncoding + Send + Sync + 'static> WriteChannel<I, M> {
             };
 
             let send_res = match msg {
-                Some(msg) => {
-                    tokio::time::timeout(
-                        self.settings.process_timeout,
-                        send_message(&mut buffer, &msg, &mut self.output, self.settings.process_timeout),
-                    )
+                /* send_message bounds every write by process_timeout, so a
+                 * large message (a full state snapshot) only fails when the
+                 * connection stops making progress, not when the whole
+                 * transfer takes longer than one process_timeout */
+                Some(msg) => send_message(&mut buffer, &msg, &mut self.output, self.settings.process_timeout).await,
+                None => tokio::time::timeout(self.settings.process_timeout, send_zero_message(&mut self.output))
                     .await
-                }
-                None => tokio::time::timeout(self.settings.process_timeout, send_zero_message(&mut self.output)).await,
+                    .unwrap_or_else(|_| {
+                        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out sending keepalive"))
+                    }),
             };
 
-            match send_res {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::error!(remote = ?self.remote, ?error, "failed to send message, closing write");
-                    break;
-                }
-                Err(error) => {
-                    tracing::error!(remote = ?self.remote, ?error, "timed out sending message, closing write");
-                    break;
-                }
+            if let Err(error) = send_res {
+                tracing::error!(remote = ?self.remote, ?error, "failed to send message, closing write");
+                break;
             }
         }
 
@@ -214,6 +209,54 @@ mod tests {
         handle.await.unwrap();
 
         assert_eq!(header, MessageSizeHeader::MAX.to_be_bytes());
+    }
+
+    /// A message that takes several process_timeouts to drain must still
+    /// go through as long as every write makes progress, like a full state
+    /// snapshot over a slow link.
+    #[tokio::test(start_paused = true)]
+    async fn write_channel_sends_message_slower_than_process_timeout() {
+        let settings = test_settings();
+        let (output, mut peer_read) = duplex(1024);
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+
+        let handle = tokio::spawn(
+            WriteChannel::<DuplexSyncIo, Vec<u8>> {
+                remote: 1,
+                input: rx,
+                output,
+                settings: settings.clone(),
+            }
+            .start(),
+        );
+
+        let message = vec![7u8; 64 * 1024];
+        tx.send(message.clone()).await.unwrap();
+
+        /* drain 1 KiB per half process_timeout: about 32 process_timeouts in total */
+        let mut received = Vec::new();
+        let mut chunk = vec![0u8; 1024];
+        let started = tokio::time::Instant::now();
+        while received.len() < message.len() + std::mem::size_of::<MessageSizeHeader>() {
+            tokio::time::sleep(settings.process_timeout / 2).await;
+            let read = peer_read.read(&mut chunk).await.unwrap();
+            assert_ne!(read, 0, "write channel closed mid message");
+            received.extend_from_slice(&chunk[..read]);
+        }
+        assert!(settings.process_timeout * 4 < started.elapsed());
+
+        let mut reader = &received[..];
+        let ReadMessageResult::Message(decoded) =
+            read_message_opt::<Vec<u8>, _>(&mut Vec::new(), &mut reader, settings.process_timeout, None)
+                .await
+                .unwrap()
+        else {
+            panic!("expected a message frame");
+        };
+        assert_eq!(decoded, message);
+
+        drop(tx);
+        handle.await.unwrap();
     }
 
     #[tokio::test]

@@ -349,6 +349,7 @@ mod tests {
             sync_timing: StateSyncTiming {
                 leader_poll_interval: Duration::from_millis(20),
                 retry_delay: Duration::from_millis(50),
+                ..Default::default()
             },
             peer_expiry: Default::default(),
         }

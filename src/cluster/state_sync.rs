@@ -16,10 +16,20 @@
 //!
 //! The task publishes its sync status on the node state so the rpc server
 //! knows when this node is a live source others may subscribe to.
+//!
+//! A subscription can stay open on keepalives while delivering nothing, for
+//! example when the target's own feed froze. When the feed has been quiet
+//! for a while the task asks the target over RPC how far its state has
+//! advanced, and drops the subscription if the target does not answer or
+//! the feed fails to catch up to what it reported. A node fed directly by
+//! the leader drops out of `SyncStatus::Direct` this way, which closes the
+//! feeds of everyone relaying through it.
 
 use std::{
+    future::Future,
     io::{Error, ErrorKind},
     iter,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -29,8 +39,8 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{
     cluster::{
-        node_state::{NodeState, SyncStatus},
-        peer_connections::PeerConnections,
+        node_state::{ConnectStatus, NodeState, SyncStatus},
+        peer_connections::{PeerConnections, PeerRpcError},
     },
     protocol::messages::{ElectionTerm, LeaderMode, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
@@ -50,6 +60,17 @@ pub struct StateSyncTiming {
     pub leader_poll_interval: Duration,
     /// How long to wait before retrying when no sync source is available.
     pub retry_delay: Duration,
+    /// How long the action feed may go without delivering an action before
+    /// the task checks over RPC that the sync target is still advancing. A
+    /// subscription is dropped after one check where the target does not
+    /// answer, or two quiet periods in a row where the target reports a
+    /// state ahead of ours.
+    pub feed_idle_timeout: Duration,
+    /// How long a full state snapshot may take to arrive once requested.
+    /// The transfer itself fails as soon as the connection stops making
+    /// progress, so this only needs to cover a large snapshot over a slow
+    /// link.
+    pub snapshot_timeout: Duration,
 }
 
 impl Default for StateSyncTiming {
@@ -57,9 +78,13 @@ impl Default for StateSyncTiming {
         Self {
             leader_poll_interval: Duration::from_millis(100),
             retry_delay: Duration::from_millis(500),
+            feed_idle_timeout: Duration::from_secs(10),
+            snapshot_timeout: Duration::from_secs(120),
         }
     }
 }
+
+type SeqProbe = Pin<Box<dyn Future<Output = Result<u64, PeerRpcError>> + Send>>;
 
 pub struct StateSyncTask<I: SyncIO, D: DeterministicState> {
     state: Arc<NodeState<I::Address, D>>,
@@ -252,9 +277,10 @@ where
         Flow::Continue
     }
 
-    /// Peers that could relay the leader's feed, most recently connected
-    /// first. Behind a gateway the voters cannot be dialed, so only other
-    /// observers qualify; each dead candidate costs several bounded dials.
+    /// Peers that could relay the leader's feed: connected peers first,
+    /// then peers we have not dialed, and peers whose last dial failed
+    /// last. Each dead candidate costs several bounded dials. Behind a
+    /// gateway the voters cannot be dialed, so only other observers qualify.
     async fn relay_candidates(&self, leader: I::Address) -> Vec<I::Address> {
         let behind_gateway = self.state.voter_gateway.is_some();
         let peers = self.state.peers.lock().await;
@@ -262,11 +288,18 @@ where
             .values()
             .filter(|peer| peer.addr != leader && peer.addr != self.state.my_address)
             .filter(|peer| !(behind_gateway && peer.can_lead == Some(true)))
-            .map(|peer| (peer.connect_status.is_connected(), peer.addr))
+            .map(|peer| {
+                let rank = match peer.connect_status {
+                    ConnectStatus::Connected { .. } => 0,
+                    ConnectStatus::NotConnected => 1,
+                    ConnectStatus::FailedToConnect { .. } => 2,
+                };
+                (rank, peer.addr)
+            })
             .collect::<Vec<_>>();
         drop(peers);
 
-        candidates.sort_by_key(|(connected, addr)| (std::cmp::Reverse(*connected), *addr));
+        candidates.sort();
         candidates.into_iter().map(|(_, addr)| addr).collect()
     }
 
@@ -384,7 +417,7 @@ where
                 tracing::info!(?target, "state recovery not possible, subscribing fresh");
                 send(write, SyncRequest::SubscribeFresh).await?;
 
-                match recv(read, timeout).await? {
+                match recv(read, self.timing.snapshot_timeout).await? {
                     SyncResponse::FreshState(fresh) => {
                         let next_seq = fresh.details().next_seq();
                         self.state.state.reset(fresh).await;
@@ -401,8 +434,8 @@ where
     }
 
     /// Applies the authority action feed to the local state until the stream
-    /// closes or the leader changes. Client actions received while streaming
-    /// are forwarded to the sync target.
+    /// closes, stalls, or the leader changes. Client actions received while
+    /// streaming are forwarded to the sync target.
     async fn stream(
         &mut self,
         target: I::Address,
@@ -410,7 +443,13 @@ where
         mut expected_seq: u64,
         read: &mut Receiver<SyncResponse<I::Address, D>>,
     ) -> SyncAttempt {
+        let idle_timeout = self.timing.feed_idle_timeout;
         let mut applied_actions = false;
+        let mut idle_deadline = tokio::time::Instant::now() + idle_timeout;
+        /* set when a probe showed the target ahead of us; if the feed is
+         * still quiet at the next deadline, it is stalled */
+        let mut behind_target: Option<u64> = None;
+        let mut probe: Option<SeqProbe> = None;
 
         loop {
             tokio::select! {
@@ -423,6 +462,8 @@ where
                         expected_seq += 1;
                         self.state.state.update(iter::once(action)).await;
                         applied_actions = true;
+                        idle_deadline = tokio::time::Instant::now() + idle_timeout;
+                        behind_target = None;
                     }
                     Some(SyncResponse::ActionStreamClosed) | None => {
                         tracing::info!(?target, "state subscription closed");
@@ -445,6 +486,31 @@ where
                     }
                     self.forward_action(target, source, action).await;
                 }
+                _ = tokio::time::sleep_until(idle_deadline), if probe.is_none() => {
+                    if let Some(target_seq) = behind_target {
+                        tracing::warn!(
+                            ?target, expected_seq, target_seq,
+                            "action feed stalled behind sync target, dropping subscription"
+                        );
+                        return SyncAttempt::Finished { applied_actions };
+                    }
+                    probe = Some(self.probe_next_seq(target, leader));
+                }
+                probed = async { probe.as_mut().expect("probe branch polled without a probe").await }, if probe.is_some() => {
+                    probe = None;
+                    match probed {
+                        Ok(target_seq) if expected_seq < target_seq => {
+                            tracing::info!(?target, expected_seq, target_seq, "action feed quiet while sync target is ahead");
+                            behind_target = Some(target_seq);
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(?target, ?error, "sync target did not answer while the feed was quiet, dropping subscription");
+                            return SyncAttempt::Finished { applied_actions };
+                        }
+                    }
+                    idle_deadline = tokio::time::Instant::now() + idle_timeout;
+                }
                 _ = tokio::time::sleep(self.timing.leader_poll_interval) => {
                     let current = self.state.leader_state.lock().await.mode.clone();
                     if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
@@ -457,6 +523,33 @@ where
         }
     }
 
+    /// Asks the sync target for the sequence its state has reached. Through
+    /// a relay, the leader's last reported sequence counts too: a relay
+    /// whose own feed froze still reports itself as live and its frozen
+    /// sequence as current.
+    fn probe_next_seq(&self, target: I::Address, leader: I::Address) -> SeqProbe {
+        let state = self.state.clone();
+        let peer_connections = self.peer_connections.clone();
+        Box::pin(async move {
+            let target_seq = peer_connections
+                .query_leader_info(target)
+                .await?
+                .recovery_details
+                .next_seq();
+            if target == leader {
+                return Ok(target_seq);
+            }
+            let leader_seq = state
+                .peers
+                .lock()
+                .await
+                .get(&leader)
+                .and_then(|peer| peer.leader_info.as_ref())
+                .map(|info| info.recovery_details.next_seq());
+            Ok(target_seq.max(leader_seq.unwrap_or(0)))
+        })
+    }
+
     fn drop_queued_actions(&mut self) {
         while self.actions_rx.try_recv().is_ok() {}
     }
@@ -464,7 +557,7 @@ where
     async fn forward_action(&self, target: I::Address, source: I::Address, action: D::Action) {
         match self
             .peer_connections
-            .enqueue_forwarded_action(target, source, action)
+            .try_enqueue_forwarded_action(target, source, action)
             .await
         {
             Ok(()) => {}
@@ -582,6 +675,8 @@ mod tests {
         StateSyncTiming {
             leader_poll_interval: Duration::from_millis(20),
             retry_delay: Duration::from_millis(50),
+            feed_idle_timeout: Duration::from_millis(500),
+            snapshot_timeout: Duration::from_secs(5),
         }
     }
 
@@ -879,6 +974,180 @@ mod tests {
                 return;
             }
         }
+    }
+
+    /// Settings where keepalives hold an idle connection open, unlike
+    /// `test_settings` whose read timeout is shorter than the keepalive
+    /// interval.
+    fn keepalive_settings() -> NetIoSettings {
+        NetIoSettings {
+            process_timeout: Duration::from_millis(100),
+            message_timeout: Duration::from_secs(2),
+        }
+    }
+
+    /// Accepts the recovery subscription and then keeps the feed open on
+    /// keepalives without ever streaming an action, like a relay whose own
+    /// feed froze. RPC connections answer leader info queries with
+    /// `source`'s state, or never answer at all.
+    struct QuietFeedIo {
+        settings: NetIoSettings,
+        source: Arc<NodeState<u64, TestState>>,
+        answers_rpc: bool,
+        subscriptions: Arc<AtomicU32>,
+    }
+
+    impl QuietFeedIo {
+        fn new(source: Arc<NodeState<u64, TestState>>, answers_rpc: bool) -> Self {
+            Self {
+                settings: keepalive_settings(),
+                source,
+                answers_rpc,
+                subscriptions: Arc::new(AtomicU32::new(0)),
+            }
+        }
+    }
+
+    impl SyncIO for QuietFeedIo {
+        type Address = u64;
+        type Read = ReadHalf<DuplexStream>;
+        type Write = WriteHalf<DuplexStream>;
+
+        async fn connect(&self, remote: &u64) -> std::io::Result<SyncConnection<Self>> {
+            let (client, server) = duplex(64 * 1024);
+            let (client_read, client_write) = split(client);
+            let (server_read, server_write) = split(server);
+
+            let (_, write, read) = SyncConnection::<Self> {
+                remote: *remote,
+                read: server_read,
+                write: server_write,
+            }
+            .server_channels::<TestState>(self.settings.clone());
+            tokio::spawn(serve_quiet_feed(
+                write,
+                read,
+                self.source.clone(),
+                self.answers_rpc,
+                self.subscriptions.clone(),
+            ));
+
+            Ok(SyncConnection {
+                remote: *remote,
+                read: client_read,
+                write: client_write,
+            })
+        }
+    }
+
+    async fn serve_quiet_feed(
+        write: Sender<SyncResponse<u64, TestState>>,
+        mut read: Receiver<SyncRequest<u64, TestState>>,
+        source: Arc<NodeState<u64, TestState>>,
+        answers_rpc: bool,
+        subscriptions: Arc<AtomicU32>,
+    ) {
+        while let Some(request) = read.recv().await {
+            let response = match request {
+                SyncRequest::ProtocolVersion(_) | SyncRequest::MyAddress(_) => SyncResponse::Ok,
+                SyncRequest::SubscribeRecovery(details) => {
+                    subscriptions.fetch_add(1, Ordering::SeqCst);
+                    SyncResponse::Accepted(details.next_seq())
+                }
+                SyncRequest::LeaderInfoQuery if answers_rpc => SyncResponse::LeaderInformation(source.leader_info().await),
+                SyncRequest::Action { .. } if answers_rpc => SyncResponse::Ok,
+                SyncRequest::LeaderInfoQuery | SyncRequest::Action { .. } => continue,
+                _ => SyncResponse::UnexpectedRequest,
+            };
+            if write.send(response).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Advances `node`'s state by `count` actions.
+    async fn advance(node: &NodeState<u64, TestState>, count: u64) {
+        node.state
+            .update((0..count).map(|action| RecoverableStateAction::StateAction { action }))
+            .await;
+    }
+
+    async fn quiet_feed_resubscribes(source_ahead_by: u64, answers_rpc: bool) -> (u32, Duration) {
+        let state = node_state(1, LeaderMode::Following { leader: 2 });
+        let source = node_state(2, LeaderMode::Leading);
+        advance(&source, source_ahead_by).await;
+        let io = Arc::new(QuietFeedIo::new(source, answers_rpc));
+        let _actions_tx = start_task_with_settings(&state, &io, keepalive_settings());
+
+        wait_until("the first subscription", || 1 <= io.subscriptions.load(Ordering::SeqCst)).await;
+        let subscribed_at = tokio::time::Instant::now();
+        let window = test_timing().feed_idle_timeout * 2 + keepalive_settings().message_timeout * 3;
+        let resubscribed = tokio::time::timeout(window, async {
+            while io.subscriptions.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let took = if resubscribed.is_ok() { subscribed_at.elapsed() } else { window };
+        (io.subscriptions.load(Ordering::SeqCst), took)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_feed_is_dropped_when_target_is_ahead() {
+        let (subscriptions, took) = quiet_feed_resubscribes(3, true).await;
+        assert!(2 <= subscriptions, "a feed stuck behind its target must be dropped");
+
+        /* one quiet period to probe, one more to confirm the stall, plus
+         * the rpc round trip and the resubscribe pacing */
+        let timing = test_timing();
+        let budget = timing.feed_idle_timeout * 2 + keepalive_settings().message_timeout + timing.retry_delay;
+        assert!(took <= budget, "took {took:?} to drop a stalled feed (budget {budget:?})");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_feed_is_dropped_when_target_does_not_answer() {
+        let (subscriptions, took) = quiet_feed_resubscribes(0, false).await;
+        assert!(2 <= subscriptions, "a feed whose target stopped answering must be dropped");
+
+        let timing = test_timing();
+        let budget = timing.feed_idle_timeout + keepalive_settings().message_timeout + timing.retry_delay;
+        assert!(took <= budget, "took {took:?} to drop an unresponsive target (budget {budget:?})");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_feed_is_kept_while_target_is_also_quiet() {
+        let (subscriptions, _) = quiet_feed_resubscribes(0, true).await;
+        assert_eq!(subscriptions, 1, "a quiet feed from a target with nothing new must be kept");
+    }
+
+    /// Through a relay, a frozen relay reports its own frozen sequence. The
+    /// leader's last reported sequence must count as well.
+    #[tokio::test(start_paused = true)]
+    async fn quiet_relay_feed_is_dropped_when_leader_is_ahead() {
+        let state = node_state(1, LeaderMode::Following { leader: 2 });
+        let leader = node_state(2, LeaderMode::Leading);
+        advance(&leader, 3).await;
+        let mut leader_peer = PeerState::empty(2);
+        leader_peer.leader_info = Some(leader.leader_info().await);
+        state.peers.lock().await.insert(2, leader_peer);
+
+        let relay = node_state(3, LeaderMode::Following { leader: 2 });
+        let io = Arc::new(QuietFeedIo::new(relay, true));
+        let connections = Arc::new(PeerConnections::new(io.clone(), keepalive_settings(), state.clone()));
+        let (_actions_tx, actions_rx) = mpsc::channel(16);
+        let mut task = StateSyncTask::new(
+            state.clone(),
+            connections,
+            io.clone(),
+            keepalive_settings(),
+            actions_rx,
+            test_timing(),
+        );
+
+        let attempt = tokio::time::timeout(test_timing().feed_idle_timeout * 6, task.sync_from(3, 2))
+            .await
+            .expect("a relay feed stuck behind the leader must be dropped");
+        assert!(matches!(attempt, SyncAttempt::Finished { applied_actions: false }));
     }
 
     #[tokio::test(start_paused = true)]
