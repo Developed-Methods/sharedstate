@@ -193,7 +193,9 @@ pub async fn send_message<M: MessageEncoding, W: AsyncWrite + Unpin>(
         }
     }
 
-    out.flush().await
+    tokio::time::timeout(progress_timeout, out.flush())
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout flushing data"))?
 }
 
 #[cfg(test)]
