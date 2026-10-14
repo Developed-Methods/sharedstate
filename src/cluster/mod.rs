@@ -252,6 +252,57 @@ mod tests {
         assert_eq!(state.leader_state.lock().await.mode, LeaderMode::NoLeader);
     }
 
+    /// Voters behind a gateway can still open connections to an observer,
+    /// and the observer's relay scan can dial a voter back before learning
+    /// it is one. A leading voter it ends up connected to must not take the
+    /// observer off the gateway, even when its address sorts lower.
+    #[tokio::test]
+    async fn observer_behind_gateway_ignores_directly_connected_leader() {
+        use crate::{
+            cluster::node_state::{ConnectStatus, GatewayView},
+            protocol::messages::LeaderInfo,
+            state::recoverable_state::RecoverableStateDetails,
+            utils::now_ms,
+        };
+
+        let term = ElectionTerm::from_term(3);
+        let mut voter = PeerState::empty(2);
+        voter.connect_status = ConnectStatus::Connected { epoch_ms: now_ms() };
+        voter.leader_info = Some(LeaderInfo {
+            leader_state: LeaderState { term, mode: LeaderMode::Leading },
+            can_lead: true,
+            reachable_voters: Vec::new(),
+            recovery_details: RecoverableStateDetails::new(2, 1),
+        });
+
+        let state = Arc::new(NodeState {
+            my_address: 9,
+            can_lead: false,
+            accessible: true,
+            voter_gateway: Some(100),
+            gateway_view: Mutex::new(Some(GatewayView::from_voter_state(
+                &LeaderState::<u64> { term, mode: LeaderMode::Following { leader: 2 } },
+                now_ms() + 60_000,
+            ))),
+            peers: Mutex::new(HashMap::from([(2, voter)])),
+            state: SubscribableState::new(
+                RecoverableState::new(9, TestState(0)),
+                SequencedBroadcastSettings::default(),
+            )
+            .unwrap(),
+            leader_state: Mutex::new(LeaderState {
+                term,
+                mode: LeaderMode::Following { leader: 100 },
+            }),
+            sync_status: watch::Sender::new(SyncStatus::NotSynced),
+            counters: Default::default(),
+        });
+
+        let mut leader = LeaderTask::new(state.clone(), LeaderTiming::default(), PeerExpiry::default());
+        leader.tick().await;
+        assert_eq!(state.leader_state.lock().await.mode, LeaderMode::Following { leader: 100 });
+    }
+
     #[tokio::test]
     async fn observer_discovers_cluster_and_leader_through_single_seed_peer() {
         let net = SimulatedNet::new();
