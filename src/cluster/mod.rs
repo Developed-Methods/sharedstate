@@ -111,6 +111,7 @@ mod tests {
                     mode: LeaderMode::NoLeader,
                 }),
                 sync_status: watch::Sender::new(SyncStatus::NotSynced),
+                counters: Default::default(),
             });
 
             let connections = Arc::new(PeerConnections::new(io.clone(), settings.clone(), state.clone()));
@@ -192,6 +193,7 @@ mod tests {
                 mode: LeaderMode::Leading,
             }),
             sync_status: watch::Sender::new(SyncStatus::Leading),
+            counters: Default::default(),
         });
 
         let mut leader = LeaderTask::new(state.clone(), LeaderTiming::default(), PeerExpiry::default());
@@ -220,6 +222,7 @@ mod tests {
                 mode: LeaderMode::NoLeader,
             }),
             sync_status: watch::Sender::new(SyncStatus::NotSynced),
+            counters: Default::default(),
         });
         let mut leader = LeaderTask::new(state.clone(), LeaderTiming::default(), PeerExpiry::default());
 
@@ -359,6 +362,7 @@ mod dead_voter_expiry_tests {
                     mode: LeaderMode::NoLeader,
                 }),
                 sync_status: watch::Sender::new(SyncStatus::NotSynced),
+                counters: Default::default(),
             });
 
             let connections = Arc::new(PeerConnections::new(io.clone(), settings.clone(), state.clone()));

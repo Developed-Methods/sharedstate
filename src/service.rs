@@ -195,6 +195,7 @@ where
                 mode: LeaderMode::NoLeader,
             }),
             sync_status: watch::Sender::new(SyncStatus::NotSynced),
+            counters: Default::default(),
         });
 
         let peer_connections = Arc::new(PeerConnections::new(io.clone(), settings.net.clone(), node.clone()));

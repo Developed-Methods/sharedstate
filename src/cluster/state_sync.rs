@@ -30,7 +30,7 @@ use std::{
     io::{Error, ErrorKind},
     iter,
     pin::Pin,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 
@@ -94,7 +94,13 @@ pub struct StateSyncTask<I: SyncIO, D: DeterministicState> {
     actions_rx: Receiver<(I::Address, D::Action)>,
     handle: StateHandle<D>,
     timing: StateSyncTiming,
+    last_drop_warning: Option<tokio::time::Instant>,
 }
+
+/// Dropped forwarded actions are counted every time but logged at most this
+/// often. A target that stopped answering drops every action the node
+/// produces, and a warning per action would crowd out every other warning.
+const DROP_WARNING_INTERVAL: Duration = Duration::from_secs(1);
 
 enum Flow {
     Continue,
@@ -135,6 +141,7 @@ where
             actions_rx,
             handle,
             timing,
+            last_drop_warning: None,
         }
     }
 
@@ -492,6 +499,7 @@ where
                             ?target, expected_seq, target_seq,
                             "action feed stalled behind sync target, dropping subscription"
                         );
+                        self.state.counters.stalled_feeds_dropped.fetch_add(1, Ordering::Relaxed);
                         return SyncAttempt::Finished { applied_actions };
                     }
                     probe = Some(self.probe_next_seq(target, leader));
@@ -506,6 +514,7 @@ where
                         Ok(_) => {}
                         Err(error) => {
                             tracing::warn!(?target, ?error, "sync target did not answer while the feed was quiet, dropping subscription");
+                            self.state.counters.stalled_feeds_dropped.fetch_add(1, Ordering::Relaxed);
                             return SyncAttempt::Finished { applied_actions };
                         }
                     }
@@ -554,16 +563,23 @@ where
         while self.actions_rx.try_recv().is_ok() {}
     }
 
-    async fn forward_action(&self, target: I::Address, source: I::Address, action: D::Action) {
-        match self
+    async fn forward_action(&mut self, target: I::Address, source: I::Address, action: D::Action) {
+        let Err(error) = self
             .peer_connections
             .try_enqueue_forwarded_action(target, source, action)
             .await
+        else {
+            return;
+        };
+
+        let counter = &self.state.counters.forwarded_actions_dropped;
+        let dropped = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if self
+            .last_drop_warning
+            .is_none_or(|at| DROP_WARNING_INTERVAL <= at.elapsed())
         {
-            Ok(()) => {}
-            Err(error) => {
-                tracing::warn!(?target, ?source, ?error, "failed to forward action to sync target");
-            }
+            tracing::warn!(?target, ?source, ?error, dropped, "failed to forward action to sync target");
+            self.last_drop_warning = Some(tokio::time::Instant::now());
         }
     }
 }
@@ -698,6 +714,7 @@ mod tests {
                 mode,
             }),
             sync_status: watch::Sender::new(SyncStatus::NotSynced),
+            counters: Default::default(),
         })
     }
 
@@ -851,6 +868,7 @@ mod tests {
                 mode: LeaderMode::Following { leader: 100 },
             }),
             sync_status: watch::Sender::new(SyncStatus::NotSynced),
+            counters: Default::default(),
         });
         {
             let mut peers = state.peers.lock().await;
@@ -1072,7 +1090,13 @@ mod tests {
             .await;
     }
 
-    async fn quiet_feed_resubscribes(source_ahead_by: u64, answers_rpc: bool) -> (u32, Duration) {
+    struct QuietFeedOutcome {
+        subscriptions: u32,
+        took: Duration,
+        stalled_feeds_dropped: u64,
+    }
+
+    async fn quiet_feed_resubscribes(source_ahead_by: u64, answers_rpc: bool) -> QuietFeedOutcome {
         let state = node_state(1, LeaderMode::Following { leader: 2 });
         let source = node_state(2, LeaderMode::Leading);
         advance(&source, source_ahead_by).await;
@@ -1089,35 +1113,44 @@ mod tests {
         })
         .await;
         let took = if resubscribed.is_ok() { subscribed_at.elapsed() } else { window };
-        (io.subscriptions.load(Ordering::SeqCst), took)
+        QuietFeedOutcome {
+            subscriptions: io.subscriptions.load(Ordering::SeqCst),
+            took,
+            stalled_feeds_dropped: state.counters.stalled_feeds_dropped.load(Ordering::Relaxed),
+        }
     }
 
     #[tokio::test(start_paused = true)]
     async fn quiet_feed_is_dropped_when_target_is_ahead() {
-        let (subscriptions, took) = quiet_feed_resubscribes(3, true).await;
-        assert!(2 <= subscriptions, "a feed stuck behind its target must be dropped");
+        let outcome = quiet_feed_resubscribes(3, true).await;
+        assert!(2 <= outcome.subscriptions, "a feed stuck behind its target must be dropped");
+        assert!(1 <= outcome.stalled_feeds_dropped, "the dropped feed must be counted");
 
         /* one quiet period to probe, one more to confirm the stall, plus
          * the rpc round trip and the resubscribe pacing */
         let timing = test_timing();
         let budget = timing.feed_idle_timeout * 2 + keepalive_settings().message_timeout + timing.retry_delay;
+        let took = outcome.took;
         assert!(took <= budget, "took {took:?} to drop a stalled feed (budget {budget:?})");
     }
 
     #[tokio::test(start_paused = true)]
     async fn quiet_feed_is_dropped_when_target_does_not_answer() {
-        let (subscriptions, took) = quiet_feed_resubscribes(0, false).await;
-        assert!(2 <= subscriptions, "a feed whose target stopped answering must be dropped");
+        let outcome = quiet_feed_resubscribes(0, false).await;
+        assert!(2 <= outcome.subscriptions, "a feed whose target stopped answering must be dropped");
+        assert!(1 <= outcome.stalled_feeds_dropped, "the dropped feed must be counted");
 
         let timing = test_timing();
         let budget = timing.feed_idle_timeout + keepalive_settings().message_timeout + timing.retry_delay;
+        let took = outcome.took;
         assert!(took <= budget, "took {took:?} to drop an unresponsive target (budget {budget:?})");
     }
 
     #[tokio::test(start_paused = true)]
     async fn quiet_feed_is_kept_while_target_is_also_quiet() {
-        let (subscriptions, _) = quiet_feed_resubscribes(0, true).await;
-        assert_eq!(subscriptions, 1, "a quiet feed from a target with nothing new must be kept");
+        let outcome = quiet_feed_resubscribes(0, true).await;
+        assert_eq!(outcome.subscriptions, 1, "a quiet feed from a target with nothing new must be kept");
+        assert_eq!(outcome.stalled_feeds_dropped, 0);
     }
 
     /// Through a relay, a frozen relay reports its own frozen sequence. The

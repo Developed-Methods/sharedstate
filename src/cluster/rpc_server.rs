@@ -350,6 +350,7 @@ mod tests {
                 mode: LeaderMode::Leading,
             }),
             sync_status: watch::Sender::new(status),
+            counters: Default::default(),
         });
         let (actions_tx, _actions_rx) = mpsc::channel(4);
         let actions_tx: Sender<(u64, u64)> = actions_tx;
