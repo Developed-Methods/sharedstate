@@ -155,7 +155,12 @@ where
         if let Some(gateway) = self.state.voter_gateway {
             /* the voter set behind the gateway acts as one virtual voter at
              * the gateway address; the observer rules only look at connected
-             * voters, so a stale or missing view is a disconnected one */
+             * voters, so a stale or missing view is a disconnected one.
+             * It must be the only voter: a voter this node happens to have
+             * a connection to would otherwise win whenever its address
+             * sorts below the gateway's, moving the observer off the
+             * gateway */
+            peer_views.retain(|peer| !peer.is_voter);
             let view = self.state.gateway_view.lock().await.clone();
             let fresh = view.as_ref().is_some_and(|view| view.is_fresh(now_ms()));
             peer_views.push(PeerView {

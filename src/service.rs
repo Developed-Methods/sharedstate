@@ -195,6 +195,7 @@ where
                 mode: LeaderMode::NoLeader,
             }),
             sync_status: watch::Sender::new(SyncStatus::NotSynced),
+            counters: Default::default(),
         });
 
         let peer_connections = Arc::new(PeerConnections::new(io.clone(), settings.net.clone(), node.clone()));
@@ -465,6 +466,16 @@ mod tests {
         let mut handle = node.state_handle();
         wait_for(&format!("node {} to see {key}={value}", node.my_address()), || {
             handle.read_with(|state| state.state().values.get(&key) == Some(&value))
+        })
+        .await;
+    }
+
+    /// The subscription applies the state before it publishes the sync
+    /// status, so a value can be visible a moment before the status that
+    /// delivered it.
+    async fn wait_for_sync_status(node: &SharedState<SimulatedIo, KvState>, expected: SyncStatus<u64>) {
+        wait_for(&format!("node {} to report {expected:?}", node.my_address()), || {
+            *node.node().sync_status.borrow() == expected
         })
         .await;
     }
@@ -891,10 +902,15 @@ mod tests {
         node1.submit_action((2, 2)).await.unwrap();
         wait_for_value(&node4, 2, 2).await;
 
-        let relay = match *node4.node().sync_status.borrow() {
-            SyncStatus::Relayed { relay, leader: 1 } => relay,
-            status => panic!("observer should be relayed from a voter, got {status:?}"),
-        };
+        let mut relay = 0;
+        wait_for("observer to relay through a voter", || match *node4.node().sync_status.borrow() {
+            SyncStatus::Relayed { relay: via, leader: 1 } => {
+                relay = via;
+                true
+            }
+            _ => false,
+        })
+        .await;
         let other_voter = if relay == 2 { 3 } else { 2 };
 
         /* the relay loses its direct link to the leader; it is still vouched
@@ -932,7 +948,7 @@ mod tests {
         voter1.submit_action((1, 1)).await.unwrap();
         wait_for_value(&observer4, 1, 1).await;
         wait_for_value(&observer5, 1, 1).await;
-        assert_eq!(*observer4.node().sync_status.borrow(), SyncStatus::Gateway { gateway: GATEWAY });
+        wait_for_sync_status(&observer4, SyncStatus::Gateway { gateway: GATEWAY }).await;
 
         /* actions forwarded through whichever voter answers still reach
          * the leader and replicate everywhere */
@@ -1011,7 +1027,7 @@ mod tests {
         wait_for_value(&observer, 1, 1).await;
 
         assert!(0 < net.gateway_connections_opened(GATEWAY, 3).await, "test never exercised the stuck voter");
-        assert_eq!(*observer.node().sync_status.borrow(), SyncStatus::Gateway { gateway: GATEWAY });
+        wait_for_sync_status(&observer, SyncStatus::Gateway { gateway: GATEWAY }).await;
     }
 
     #[tokio::test]

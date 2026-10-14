@@ -30,7 +30,7 @@ use std::{
     io::{Error, ErrorKind},
     iter,
     pin::Pin,
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 
@@ -94,7 +94,17 @@ pub struct StateSyncTask<I: SyncIO, D: DeterministicState> {
     actions_rx: Receiver<(I::Address, D::Action)>,
     handle: StateHandle<D>,
     timing: StateSyncTiming,
+    last_drop_warning: Option<tokio::time::Instant>,
+    /// A client action taken off `actions_rx` after the leader changed. It is
+    /// handled before any newer action once the next subscription opens or
+    /// this node starts leading.
+    held_action: Option<(I::Address, D::Action)>,
 }
+
+/// Dropped forwarded actions are counted every time but logged at most this
+/// often. A target that stopped answering drops every action the node
+/// produces, and a warning per action would crowd out every other warning.
+const DROP_WARNING_INTERVAL: Duration = Duration::from_secs(1);
 
 enum Flow {
     Continue,
@@ -135,6 +145,8 @@ where
             actions_rx,
             handle,
             timing,
+            last_drop_warning: None,
+            held_action: None,
         }
     }
 
@@ -178,6 +190,10 @@ where
         tracing::info!(%term, "leading, taking authority over shared state");
         self.set_sync_status(SyncStatus::Leading);
 
+        if let Some((source, action)) = self.held_action.take() {
+            self.apply_with_authority(source, action).await;
+        }
+
         loop {
             tokio::select! {
                 action = self.actions_rx.recv() => {
@@ -185,22 +201,13 @@ where
                         return Flow::Shutdown;
                     };
 
-                    let current = self.state.leader_state.lock().await.mode.clone();
-                    if let LeaderMode::Following { leader } = current {
-                        tracing::info!(?leader, "no longer leading, forwarding queued action to new leader");
-                        self.forward_action(leader, source, action).await;
-                        return Flow::Continue;
-                    }
-                    if !matches!(current, LeaderMode::Leading) {
-                        tracing::info!("no longer leading, releasing authority before applying queued action");
+                    if !matches!(self.state.leader_state.lock().await.mode, LeaderMode::Leading) {
+                        tracing::info!("no longer leading, holding queued action for the next sync source");
+                        self.held_action = Some((source, action));
                         return Flow::Continue;
                     }
 
-                    let authority = self
-                        .handle
-                        .read_with(move |state| state.authority(RecoverableStateAction::StateAction { action }));
-                    self.state.state.update(iter::once(authority)).await;
-                    tracing::debug!(?source, "applied action with local authority");
+                    self.apply_with_authority(source, action).await;
                 }
                 _ = tokio::time::sleep(self.timing.leader_poll_interval) => {
                     if !matches!(self.state.leader_state.lock().await.mode, LeaderMode::Leading) {
@@ -451,6 +458,10 @@ where
         let mut behind_target: Option<u64> = None;
         let mut probe: Option<SeqProbe> = None;
 
+        if let Some((source, action)) = self.held_action.take() {
+            self.forward_action(target, source, action).await;
+        }
+
         loop {
             tokio::select! {
                 response = read.recv() => match response {
@@ -481,7 +492,7 @@ where
                     let current = self.state.leader_state.lock().await.mode.clone();
                     if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
                         tracing::info!(?leader, "leader changed before forwarding action, dropping subscription");
-                        self.drop_queued_actions();
+                        self.held_action = Some((source, action));
                         return SyncAttempt::LeaderChanged;
                     }
                     self.forward_action(target, source, action).await;
@@ -492,6 +503,7 @@ where
                             ?target, expected_seq, target_seq,
                             "action feed stalled behind sync target, dropping subscription"
                         );
+                        self.state.counters.stalled_feeds_dropped.fetch_add(1, Ordering::Relaxed);
                         return SyncAttempt::Finished { applied_actions };
                     }
                     probe = Some(self.probe_next_seq(target, leader));
@@ -506,6 +518,7 @@ where
                         Ok(_) => {}
                         Err(error) => {
                             tracing::warn!(?target, ?error, "sync target did not answer while the feed was quiet, dropping subscription");
+                            self.state.counters.stalled_feeds_dropped.fetch_add(1, Ordering::Relaxed);
                             return SyncAttempt::Finished { applied_actions };
                         }
                     }
@@ -515,7 +528,6 @@ where
                     let current = self.state.leader_state.lock().await.mode.clone();
                     if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
                         tracing::info!(?leader, "leader changed, dropping subscription");
-                        self.drop_queued_actions();
                         return SyncAttempt::LeaderChanged;
                     }
                 }
@@ -550,20 +562,31 @@ where
         })
     }
 
-    fn drop_queued_actions(&mut self) {
-        while self.actions_rx.try_recv().is_ok() {}
+    async fn apply_with_authority(&mut self, source: I::Address, action: D::Action) {
+        let authority = self
+            .handle
+            .read_with(move |state| state.authority(RecoverableStateAction::StateAction { action }));
+        self.state.state.update(iter::once(authority)).await;
+        tracing::debug!(?source, "applied action with local authority");
     }
 
-    async fn forward_action(&self, target: I::Address, source: I::Address, action: D::Action) {
-        match self
+    async fn forward_action(&mut self, target: I::Address, source: I::Address, action: D::Action) {
+        let Err(error) = self
             .peer_connections
             .try_enqueue_forwarded_action(target, source, action)
             .await
+        else {
+            return;
+        };
+
+        let counter = &self.state.counters.forwarded_actions_dropped;
+        let dropped = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        if self
+            .last_drop_warning
+            .is_none_or(|at| DROP_WARNING_INTERVAL <= at.elapsed())
         {
-            Ok(()) => {}
-            Err(error) => {
-                tracing::warn!(?target, ?source, ?error, "failed to forward action to sync target");
-            }
+            tracing::warn!(?target, ?source, ?error, dropped, "failed to forward action to sync target");
+            self.last_drop_warning = Some(tokio::time::Instant::now());
         }
     }
 }
@@ -698,6 +721,7 @@ mod tests {
                 mode,
             }),
             sync_status: watch::Sender::new(SyncStatus::NotSynced),
+            counters: Default::default(),
         })
     }
 
@@ -851,6 +875,7 @@ mod tests {
                 mode: LeaderMode::Following { leader: 100 },
             }),
             sync_status: watch::Sender::new(SyncStatus::NotSynced),
+            counters: Default::default(),
         });
         {
             let mut peers = state.peers.lock().await;
@@ -989,12 +1014,14 @@ mod tests {
     /// Accepts the recovery subscription and then keeps the feed open on
     /// keepalives without ever streaming an action, like a relay whose own
     /// feed froze. RPC connections answer leader info queries with
-    /// `source`'s state, or never answer at all.
+    /// `source`'s state, or never answer at all. Forwarded client actions
+    /// are recorded with the address they were sent to.
     struct QuietFeedIo {
         settings: NetIoSettings,
         source: Arc<NodeState<u64, TestState>>,
         answers_rpc: bool,
         subscriptions: Arc<AtomicU32>,
+        forwarded: Arc<StdMutex<Vec<(u64, u64)>>>,
     }
 
     impl QuietFeedIo {
@@ -1004,7 +1031,12 @@ mod tests {
                 source,
                 answers_rpc,
                 subscriptions: Arc::new(AtomicU32::new(0)),
+                forwarded: Arc::new(StdMutex::new(Vec::new())),
             }
+        }
+
+        fn forwarded(&self) -> Vec<(u64, u64)> {
+            self.forwarded.lock().unwrap().clone()
         }
     }
 
@@ -1025,11 +1057,13 @@ mod tests {
             }
             .server_channels::<TestState>(self.settings.clone());
             tokio::spawn(serve_quiet_feed(
+                *remote,
                 write,
                 read,
                 self.source.clone(),
                 self.answers_rpc,
                 self.subscriptions.clone(),
+                self.forwarded.clone(),
             ));
 
             Ok(SyncConnection {
@@ -1041,11 +1075,13 @@ mod tests {
     }
 
     async fn serve_quiet_feed(
+        remote: u64,
         write: Sender<SyncResponse<u64, TestState>>,
         mut read: Receiver<SyncRequest<u64, TestState>>,
         source: Arc<NodeState<u64, TestState>>,
         answers_rpc: bool,
         subscriptions: Arc<AtomicU32>,
+        forwarded: Arc<StdMutex<Vec<(u64, u64)>>>,
     ) {
         while let Some(request) = read.recv().await {
             let response = match request {
@@ -1055,7 +1091,10 @@ mod tests {
                     SyncResponse::Accepted(details.next_seq())
                 }
                 SyncRequest::LeaderInfoQuery if answers_rpc => SyncResponse::LeaderInformation(source.leader_info().await),
-                SyncRequest::Action { .. } if answers_rpc => SyncResponse::Ok,
+                SyncRequest::Action { action, .. } if answers_rpc => {
+                    forwarded.lock().unwrap().push((remote, action));
+                    SyncResponse::Ok
+                }
                 SyncRequest::LeaderInfoQuery | SyncRequest::Action { .. } => continue,
                 _ => SyncResponse::UnexpectedRequest,
             };
@@ -1072,7 +1111,13 @@ mod tests {
             .await;
     }
 
-    async fn quiet_feed_resubscribes(source_ahead_by: u64, answers_rpc: bool) -> (u32, Duration) {
+    struct QuietFeedOutcome {
+        subscriptions: u32,
+        took: Duration,
+        stalled_feeds_dropped: u64,
+    }
+
+    async fn quiet_feed_resubscribes(source_ahead_by: u64, answers_rpc: bool) -> QuietFeedOutcome {
         let state = node_state(1, LeaderMode::Following { leader: 2 });
         let source = node_state(2, LeaderMode::Leading);
         advance(&source, source_ahead_by).await;
@@ -1089,35 +1134,44 @@ mod tests {
         })
         .await;
         let took = if resubscribed.is_ok() { subscribed_at.elapsed() } else { window };
-        (io.subscriptions.load(Ordering::SeqCst), took)
+        QuietFeedOutcome {
+            subscriptions: io.subscriptions.load(Ordering::SeqCst),
+            took,
+            stalled_feeds_dropped: state.counters.stalled_feeds_dropped.load(Ordering::Relaxed),
+        }
     }
 
     #[tokio::test(start_paused = true)]
     async fn quiet_feed_is_dropped_when_target_is_ahead() {
-        let (subscriptions, took) = quiet_feed_resubscribes(3, true).await;
-        assert!(2 <= subscriptions, "a feed stuck behind its target must be dropped");
+        let outcome = quiet_feed_resubscribes(3, true).await;
+        assert!(2 <= outcome.subscriptions, "a feed stuck behind its target must be dropped");
+        assert!(1 <= outcome.stalled_feeds_dropped, "the dropped feed must be counted");
 
         /* one quiet period to probe, one more to confirm the stall, plus
          * the rpc round trip and the resubscribe pacing */
         let timing = test_timing();
         let budget = timing.feed_idle_timeout * 2 + keepalive_settings().message_timeout + timing.retry_delay;
+        let took = outcome.took;
         assert!(took <= budget, "took {took:?} to drop a stalled feed (budget {budget:?})");
     }
 
     #[tokio::test(start_paused = true)]
     async fn quiet_feed_is_dropped_when_target_does_not_answer() {
-        let (subscriptions, took) = quiet_feed_resubscribes(0, false).await;
-        assert!(2 <= subscriptions, "a feed whose target stopped answering must be dropped");
+        let outcome = quiet_feed_resubscribes(0, false).await;
+        assert!(2 <= outcome.subscriptions, "a feed whose target stopped answering must be dropped");
+        assert!(1 <= outcome.stalled_feeds_dropped, "the dropped feed must be counted");
 
         let timing = test_timing();
         let budget = timing.feed_idle_timeout + keepalive_settings().message_timeout + timing.retry_delay;
+        let took = outcome.took;
         assert!(took <= budget, "took {took:?} to drop an unresponsive target (budget {budget:?})");
     }
 
     #[tokio::test(start_paused = true)]
     async fn quiet_feed_is_kept_while_target_is_also_quiet() {
-        let (subscriptions, _) = quiet_feed_resubscribes(0, true).await;
-        assert_eq!(subscriptions, 1, "a quiet feed from a target with nothing new must be kept");
+        let outcome = quiet_feed_resubscribes(0, true).await;
+        assert_eq!(outcome.subscriptions, 1, "a quiet feed from a target with nothing new must be kept");
+        assert_eq!(outcome.stalled_feeds_dropped, 0);
     }
 
     /// Through a relay, a frozen relay reports its own frozen sequence. The
@@ -1148,6 +1202,31 @@ mod tests {
             .await
             .expect("a relay feed stuck behind the leader must be dropped");
         assert!(matches!(attempt, SyncAttempt::Finished { applied_actions: false }));
+    }
+
+    /// Client actions that arrive while the follower switches leaders must
+    /// reach the new leader instead of being dropped with the old
+    /// subscription.
+    #[tokio::test(start_paused = true)]
+    async fn actions_queued_during_leader_change_reach_the_new_leader() {
+        let state = node_state(1, LeaderMode::Following { leader: 2 });
+        let io = Arc::new(QuietFeedIo::new(node_state(2, LeaderMode::Leading), true));
+        let actions_tx = start_task_with_settings(&state, &io, keepalive_settings());
+        let mut sync_status = state.sync_status.subscribe();
+        sync_status
+            .wait_for(|status| *status == SyncStatus::Direct { leader: 2 })
+            .await
+            .unwrap();
+
+        *state.leader_state.lock().await = LeaderState {
+            term: ElectionTerm::from_term(1),
+            mode: LeaderMode::Following { leader: 3 },
+        };
+        actions_tx.send((1, 10)).await.unwrap();
+        actions_tx.send((1, 11)).await.unwrap();
+
+        wait_until("both actions forwarded", || 2 <= io.forwarded().len()).await;
+        assert_eq!(io.forwarded(), vec![(3, 10), (3, 11)]);
     }
 
     #[tokio::test(start_paused = true)]

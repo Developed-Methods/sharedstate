@@ -673,6 +673,7 @@ mod tests {
                 mode: LeaderMode::Following { leader: 2 },
             }),
             sync_status: watch::Sender::new(SyncStatus::NotSynced),
+            counters: Default::default(),
         })
     }
 

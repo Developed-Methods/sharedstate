@@ -1,4 +1,4 @@
-use std::{collections::HashMap, num::NonZeroU64, time::Duration};
+use std::{collections::HashMap, num::NonZeroU64, sync::atomic::AtomicU64, time::Duration};
 
 use tokio::sync::{Mutex, watch};
 
@@ -35,6 +35,19 @@ pub struct NodeState<A: SyncIOAddress, D: DeterministicState> {
     /// the state sync task; the rpc server only serves subscriptions while
     /// this says the node is a live source (see [`SyncStatus::can_relay`]).
     pub sync_status: watch::Sender<SyncStatus<A>>,
+    pub counters: NodeCounters,
+}
+
+/// Events that are otherwise only visible in logs, for callers to export as
+/// metrics.
+#[derive(Debug, Default)]
+pub struct NodeCounters {
+    /// Client actions the state sync task could not hand to its sync target,
+    /// most often because the target stopped answering and its queue filled.
+    pub forwarded_actions_dropped: AtomicU64,
+    /// Subscriptions the state sync task dropped because the feed stalled or
+    /// the sync target stopped answering while the feed was quiet.
+    pub stalled_feeds_dropped: AtomicU64,
 }
 
 /// The election state of the voter set as seen through the gateway.
