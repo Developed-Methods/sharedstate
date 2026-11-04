@@ -1,0 +1,307 @@
+//! Reproduces the 2026-11-01 outage where a rolling reboot of the
+//! sync-servers wiped the tunnel state on every node.
+//!
+//! The sync-servers (voters) were rebooted one at a time for a kernel
+//! update. The leader came back within seconds with an empty state and,
+//! before it learned about its peers, elected itself as a lone voter.
+//! Production starts the node with no initial peers and seeds them right
+//! after, so the first leader tick can run against an empty peer map.
+//!
+//! The other voters and the tunnel servers still followed that address in
+//! the cluster's current term. Its new process accepted their subscriptions
+//! as the leader of its own term, could not recover their states, and sent
+//! each of them its empty state as a fresh snapshot. The leader then learned
+//! the real term and stepped down, but every node had already been reset.
+//! The tunnel servers dropped 99% of their tunnels and traffic fell by 75%
+//! until the tunnel-state-updater had rebuilt the state from the database.
+//!
+//! Nodes 1 to 3 are the sync-servers, 4 and 5 are the tunnel servers.
+
+use std::{
+    collections::BTreeMap,
+    io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
+use message_encoding::MessageEncoding;
+use sharedstate::{
+    cluster::{
+        leader::{LeaderMode, LeaderTiming},
+        node_state::{ConnectStatus, PeerState},
+        peer_discovery::PeerDiscoveryTiming,
+        state_sync::StateSyncTiming,
+    },
+    state::deterministic_state::DeterministicState,
+    transport::{
+        channels::NetIoSettings,
+        simulated::{SimulatedIo, SimulatedNet},
+    },
+    SharedState, SharedStateConfig, SharedStateSettings,
+};
+
+const SYNC_SERVERS: [u64; 3] = [1, 2, 3];
+const TUNNEL_SERVERS: [u64; 2] = [4, 5];
+
+/// Keys written before the restart. Every node must still hold them after.
+const KEYS: u64 = 50;
+
+type Node = SharedState<SimulatedIo, KvState>;
+
+#[derive(Clone, Debug, Default)]
+struct KvState {
+    seq: u64,
+    values: BTreeMap<u64, u64>,
+}
+
+impl DeterministicState for KvState {
+    type Action = (u64, u64);
+    type AuthorityAction = (u64, u64);
+
+    fn accept_seq(&self) -> u64 {
+        self.seq
+    }
+
+    fn authority(&self, action: Self::Action) -> Self::AuthorityAction {
+        action
+    }
+
+    fn update(&mut self, (key, value): &Self::AuthorityAction) {
+        self.values.insert(*key, *value);
+        self.seq += 1;
+    }
+}
+
+impl MessageEncoding for KvState {
+    fn write_to<T: io::Write>(&self, out: &mut T) -> io::Result<usize> {
+        let mut sum = self.seq.write_to(out)?;
+        sum += (self.values.len() as u64).write_to(out)?;
+        for (key, value) in &self.values {
+            sum += key.write_to(out)?;
+            sum += value.write_to(out)?;
+        }
+        Ok(sum)
+    }
+
+    fn read_from<T: io::Read>(read: &mut T) -> io::Result<Self> {
+        let seq = MessageEncoding::read_from(read)?;
+        let len = u64::read_from(read)? as usize;
+        let mut values = BTreeMap::new();
+        for _ in 0..len {
+            values.insert(MessageEncoding::read_from(read)?, MessageEncoding::read_from(read)?);
+        }
+        Ok(Self { seq, values })
+    }
+}
+
+/// Production timings scaled down by 10x. The ratio that matters here is
+/// discovery (3s in production) against the sync retry (500ms): a follower
+/// re-dials its leader several times before gossip tells it anything new.
+fn fast_settings() -> SharedStateSettings {
+    SharedStateSettings {
+        net: NetIoSettings {
+            process_timeout: Duration::from_millis(500),
+            message_timeout: Duration::from_secs(1),
+        },
+        broadcast: Default::default(),
+        discovery_timing: PeerDiscoveryTiming {
+            observation_interval: Duration::from_millis(300),
+            max_concurrent_observations: 8,
+            gateway_view_ttl: Duration::from_secs(5),
+        },
+        leader_timing: LeaderTiming {
+            tick_interval: Duration::from_millis(50),
+        },
+        sync_timing: StateSyncTiming {
+            leader_poll_interval: Duration::from_millis(20),
+            retry_delay: Duration::from_millis(50),
+            ..Default::default()
+        },
+        peer_expiry: Default::default(),
+    }
+}
+
+fn is_sync_server(address: u64) -> bool {
+    SYNC_SERVERS.contains(&address)
+}
+
+fn all_addresses() -> impl Iterator<Item = u64> {
+    SYNC_SERVERS.into_iter().chain(TUNNEL_SERVERS)
+}
+
+async fn start_node(net: &SimulatedNet, address: u64, initial_peers: Vec<u64>) -> Node {
+    let io = net.start_io(address).await;
+    SharedState::start(SharedStateConfig {
+        io,
+        my_address: address,
+        can_lead: is_sync_server(address),
+        accessible: true,
+        voter_gateway: None,
+        initial_peers,
+        initial_state: KvState::default(),
+        settings: fast_settings(),
+    })
+    .unwrap()
+}
+
+/// What tunnel-sync's `discover_peer_details` does right after starting
+/// the node: adds the static peer list, voters marked as such.
+async fn seed_peers(node: &Node) {
+    let mut peers = node.node().peers.lock().await;
+    for address in all_addresses().filter(|address| *address != node.my_address()) {
+        peers
+            .entry(address)
+            .and_modify(|peer| peer.can_lead = Some(is_sync_server(address)))
+            .or_insert(PeerState {
+                addr: address,
+                can_lead: Some(is_sync_server(address)),
+                connect_status: ConnectStatus::NotConnected,
+                last_global_connectivity: None,
+                leader_info: None,
+            });
+    }
+}
+
+async fn wait_for_common_leader(nodes: &[&Node]) -> u64 {
+    wait_for_common_leader_other_than(nodes, None).await
+}
+
+async fn wait_for_common_leader_other_than(nodes: &[&Node], old: Option<u64>) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut leaders = Vec::new();
+        for node in nodes {
+            leaders.push(match node.leader_state().await.mode {
+                LeaderMode::Leading => Some(node.my_address()),
+                LeaderMode::Following { leader } => Some(leader),
+                _ => None,
+            });
+        }
+        if let Some(Some(leader)) = leaders.first().copied() {
+            if Some(leader) != old && leaders.iter().all(|seen| *seen == Some(leader)) {
+                return leader;
+            }
+        }
+        assert!(Instant::now() < deadline, "nodes never agreed on a leader: {leaders:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_keys(node: &Node, keys: u64, timeout: Duration) -> Result<(), String> {
+    let mut handle = node.state_handle();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if handle.read_with(|state| (0..keys).all(|key| state.state().values.get(&key) == Some(&key))) {
+            return Ok(());
+        }
+        if deadline <= Instant::now() {
+            let len = handle.read_with(|state| state.state().values.len());
+            return Err(format!(
+                "node {} holds {len} of {keys} keys after {timeout:?}",
+                node.my_address()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Rolling restart of the elected leader, the way the sync-servers were
+/// rebooted for the kernel update.
+#[tokio::test(flavor = "multi_thread")]
+async fn restarted_leader_does_not_wipe_cluster_state() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+
+    let net = SimulatedNet::new();
+    let mut nodes = BTreeMap::new();
+    for address in all_addresses() {
+        let peers = all_addresses().filter(|peer| *peer != address).collect();
+        nodes.insert(address, start_node(&net, address, peers).await);
+    }
+    let first_leader = wait_for_common_leader(&nodes.values().collect::<Vec<_>>()).await;
+
+    /* production had been through many elections; get past the initial
+     * term so the cluster's term is not the restarted node's starting one */
+    net.set_node_blocked(first_leader, true).await;
+    net.stop_node(first_leader).await;
+    drop(nodes.remove(&first_leader));
+    let survivors = nodes.values().collect::<Vec<_>>();
+    let leader = wait_for_common_leader_other_than(&survivors, Some(first_leader)).await;
+    let term = nodes[&leader].leader_state().await.term;
+    assert!(0 < term.term(), "failover did not move past the first term: {term}");
+    net.set_node_blocked(first_leader, false).await;
+    let restarted = start_node(&net, first_leader, Vec::new()).await;
+    seed_peers(&restarted).await;
+    nodes.insert(first_leader, restarted);
+    assert_eq!(wait_for_common_leader(&nodes.values().collect::<Vec<_>>()).await, leader);
+
+    for key in 0..KEYS {
+        nodes[&leader].submit_action((key, key)).await.unwrap();
+    }
+    for node in nodes.values() {
+        wait_for_keys(node, KEYS, Duration::from_secs(10)).await.unwrap();
+    }
+
+    /* every node other than the leader must keep the keys while the leader
+     * reboots; sample often so a reset that is later repaired still shows */
+    let wiped = Arc::new(AtomicBool::new(false));
+    let watchers = nodes
+        .values()
+        .filter(|node| node.my_address() != leader)
+        .map(|node| {
+            let address = node.my_address();
+            let mut handle = node.state_handle();
+            let wiped = wiped.clone();
+            tokio::spawn(async move {
+                loop {
+                    let len = handle.read_with(|state| state.state().values.len());
+                    if (len as u64) < KEYS && !wiped.swap(true, Ordering::SeqCst) {
+                        tracing::error!(address, len, "node lost its state while the leader restarted");
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    /* the leader reboots: its process dies and comes back moments later
+     * with an empty state. Production passes no initial peers and seeds them
+     * after start, so the first leader tick can see no peers at all; wait
+     * for that lone claim before seeding so the test does not depend on
+     * winning that race */
+    net.stop_node(leader).await;
+    drop(nodes.remove(&leader));
+    let restarted = start_node(&net, leader, Vec::new()).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !matches!(restarted.leader_state().await.mode, LeaderMode::Leading) {
+        assert!(
+            Instant::now() < deadline,
+            "restarted node never claimed leadership on its own, the test no longer models the outage"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    seed_peers(&restarted).await;
+    nodes.insert(leader, restarted);
+
+    let new_leader = wait_for_common_leader(&nodes.values().collect::<Vec<_>>()).await;
+    tracing::info!(new_leader, "cluster settled after the leader restart");
+
+    let mut missing = Vec::new();
+    for node in nodes.values() {
+        if let Err(error) = wait_for_keys(node, KEYS, Duration::from_secs(10)).await {
+            missing.push(error);
+        }
+    }
+    for watcher in watchers {
+        watcher.abort();
+    }
+
+    assert!(
+        !wiped.load(Ordering::SeqCst) && missing.is_empty(),
+        "the restarted leader's empty state replaced the cluster's state (wiped while restarting: {}):\n{}",
+        wiped.load(Ordering::SeqCst),
+        missing.join("\n"),
+    );
+}

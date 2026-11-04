@@ -42,7 +42,7 @@ use crate::{
         node_state::{ConnectStatus, NodeState, SyncStatus},
         peer_connections::{PeerConnections, PeerRpcError},
     },
-    protocol::messages::{ElectionTerm, LeaderMode, SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{ElectionTerm, LeaderMode, LeaderState, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         deterministic_state::DeterministicState, recoverable_state::RecoverableStateAction,
         subscribable_state::StateHandle,
@@ -327,7 +327,7 @@ where
         /* the write half is unused after the handshake but must stay alive
          * for the duration of the stream or the connection closes */
         let (_write, mut read, next_seq) = tokio::select! {
-            opened = self.open_subscription(target) => match opened {
+            opened = self.open_subscription(target, leader) => match opened {
                 Ok(opened) => opened,
                 Err(error) => {
                     tracing::warn!(?target, ?error, "state subscription failed");
@@ -367,6 +367,7 @@ where
     async fn open_subscription(
         &mut self,
         target: I::Address,
+        leader: I::Address,
     ) -> std::io::Result<(Sender<SyncRequest<I::Address, D>>, Receiver<SyncResponse<I::Address, D>>, u64)> {
         /* connect gives no timing guarantee, bound it like every other step */
         let connection = tokio::time::timeout(self.settings.message_timeout, self.io.connect(&target))
@@ -374,7 +375,7 @@ where
             .map_err(|_| Error::new(ErrorKind::TimedOut, "timed out connecting for state sync"))??;
 
         let (_remote, write, mut read) = connection.client_channels::<D>(self.settings.clone());
-        let next_seq = self.subscribe(&write, &mut read, target).await?;
+        let next_seq = self.subscribe(&write, &mut read, target, leader).await?;
         Ok((write, read, next_seq))
     }
 
@@ -386,6 +387,7 @@ where
         write: &Sender<SyncRequest<I::Address, D>>,
         read: &mut Receiver<SyncResponse<I::Address, D>>,
         target: I::Address,
+        leader: I::Address,
     ) -> std::io::Result<u64> {
         let timeout = self.settings.message_timeout;
 
@@ -395,6 +397,26 @@ where
 
         send(write, self.state.handshake_address()).await?;
         expect_ok(recv(read, timeout).await?, "my address")?;
+
+        /* a leader that restarts comes back with an empty state and, until it
+         * learns of its peers, elects itself in a new term of its own. We
+         * still follow its address in our term, and resetting from its fresh
+         * snapshot would replace our state with its empty one. Ask on this
+         * connection, so the answer comes from the process that would serve
+         * the feed, and only subscribe to a source in our term */
+        let term = self.state.leader_state.lock().await.term;
+        send(write, SyncRequest::LeaderQuery).await?;
+        match recv(read, timeout).await? {
+            SyncResponse::LeaderState(remote) if self.serves_term(target, leader, term, &remote) => {}
+            SyncResponse::LeaderState(remote) => {
+                tracing::warn!(?target, ?leader, %term, ?remote, "sync target is not a source in our term");
+                return Err(Error::new(
+                    ErrorKind::NotConnected,
+                    format!("sync target is not a source in term {term}"),
+                ));
+            }
+            response => return Err(unexpected("LeaderState", &response)),
+        }
 
         tracing::info!(?target, "sync trace: handshake done, settling recovery details");
         let details = self.state.state.settled_recovery_details().await;
@@ -430,6 +452,40 @@ where
             }
             SyncResponse::NotSynced => Err(not_synced()),
             response => Err(unexpected("Accepted or RecoveryFailed", &response)),
+        }
+    }
+
+    /// Whether `remote`, the leader state the target reports, makes it a
+    /// source of `leader`'s feed in `term`: the leader itself leading, or a
+    /// relay following it. Behind a gateway, the leader is the gateway and
+    /// any voter answering through it serves the feed.
+    fn serves_term(
+        &self,
+        target: I::Address,
+        leader: I::Address,
+        term: ElectionTerm,
+        remote: &LeaderState<I::Address>,
+    ) -> bool {
+        let behind_gateway = self.state.is_gateway(leader);
+
+        /* behind a gateway our term is the one reported by whichever voter
+         * answered discovery last, and the voter answering this connection
+         * may report a same-numbered term from a different root. Only an
+         * older term number shows that the voter restarted */
+        let in_term = if behind_gateway {
+            term.term() <= remote.term.term()
+        } else {
+            remote.term == term
+        };
+        if !in_term {
+            return false;
+        }
+
+        match remote.mode {
+            LeaderMode::Leading => target == leader,
+            LeaderMode::Following { .. } if target == leader => behind_gateway,
+            LeaderMode::Following { leader: followed } => followed == leader,
+            LeaderMode::NoLeader | LeaderMode::Electing { .. } => false,
         }
     }
 
@@ -963,6 +1019,10 @@ mod tests {
         while let Some(request) = read.recv().await {
             let response = match request {
                 SyncRequest::ProtocolVersion(_) | SyncRequest::MyAddress(_) => SyncResponse::Ok,
+                SyncRequest::LeaderQuery => SyncResponse::LeaderState(LeaderState {
+                    term: ElectionTerm::from_term(0),
+                    mode: LeaderMode::Leading,
+                }),
                 SyncRequest::SubscribeRecovery(details) => {
                     /* accept, then drop the connection without streaming */
                     let _ = write.send(SyncResponse::Accepted(details.next_seq())).await;
@@ -1050,6 +1110,7 @@ mod tests {
         while let Some(request) = read.recv().await {
             let response = match request {
                 SyncRequest::ProtocolVersion(_) | SyncRequest::MyAddress(_) => SyncResponse::Ok,
+                SyncRequest::LeaderQuery => SyncResponse::LeaderState(source.leader_state.lock().await.clone()),
                 SyncRequest::SubscribeRecovery(details) => {
                     subscriptions.fetch_add(1, Ordering::SeqCst);
                     SyncResponse::Accepted(details.next_seq())
