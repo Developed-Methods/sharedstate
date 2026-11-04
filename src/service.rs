@@ -112,6 +112,9 @@ pub struct SharedStateSettings {
     pub leader_timing: LeaderTiming,
     pub sync_timing: StateSyncTiming,
     pub peer_expiry: PeerExpiry,
+    /// How many other voters must back a voter before it leads. See
+    /// [`LeaderTask::with_min_leader_peers`]; zero disables the floor.
+    pub min_leader_peers: usize,
 }
 
 const ACTION_QUEUE_CAPACITY: usize = 512;
@@ -201,12 +204,24 @@ where
         let (actions_tx, actions_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         let rpc_server = Arc::new(RpcServer::new(node.clone(), actions_tx.clone()));
 
+        /* other voters dial us on their discovery rounds, so two rounds
+         * without hearing of one means we really are alone */
+        let lone_leader_grace = settings
+            .leader_timing
+            .lone_leader_grace
+            .unwrap_or(settings.discovery_timing.observation_interval * 2);
+
         let tasks = vec![
             rpc_server.start_listener(io.clone(), settings.net.clone()),
             tokio::spawn(
                 PeerDiscoveryTask::new(node.clone(), peer_connections.clone(), settings.discovery_timing).run(),
             ),
-            tokio::spawn(LeaderTask::new(node.clone(), settings.leader_timing, settings.peer_expiry).run()),
+            tokio::spawn(
+                LeaderTask::new(node.clone(), settings.leader_timing, settings.peer_expiry)
+                    .with_lone_leader_grace(lone_leader_grace)
+                    .with_min_leader_peers(settings.min_leader_peers)
+                    .run(),
+            ),
             tokio::spawn(
                 StateSyncTask::new(node.clone(), peer_connections, io, settings.net, actions_rx, settings.sync_timing)
                     .run(),
@@ -345,6 +360,7 @@ mod tests {
             },
             leader_timing: LeaderTiming {
                 tick_interval: Duration::from_millis(25),
+                ..Default::default()
             },
             sync_timing: StateSyncTiming {
                 leader_poll_interval: Duration::from_millis(20),
@@ -352,6 +368,7 @@ mod tests {
                 ..Default::default()
             },
             peer_expiry: Default::default(),
+            min_leader_peers: 0,
         }
     }
 
@@ -1067,9 +1084,11 @@ mod tests {
         node2.submit_action((2, 2)).await.unwrap();
         wait_for_value(&node3, 2, 2).await;
 
-        /* heal the partition; node 1 must concede and follow node 2 */
+        /* heal the partition; node 1 must concede and follow node 2. When
+         * the partition outlasts a discovery round, dials across it fail and
+         * discovery waits 10s before dialing those peers again */
         net.set_node_blocked(1, false).await;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let state = node1.leader_state().await;
             if matches!(state.mode, LeaderMode::Following { leader: 2 }) {

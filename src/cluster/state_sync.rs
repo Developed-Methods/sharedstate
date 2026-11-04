@@ -42,7 +42,7 @@ use crate::{
         node_state::{ConnectStatus, NodeState, SyncStatus},
         peer_connections::{PeerConnections, PeerRpcError},
     },
-    protocol::messages::{ElectionTerm, LeaderMode, SyncRequest, SyncResponse, PROTOCOL_VERSION},
+    protocol::messages::{ElectionTerm, LeaderMode, LeaderState, SyncRequest, SyncResponse, PROTOCOL_VERSION},
     state::{
         deterministic_state::DeterministicState, recoverable_state::RecoverableStateAction,
         subscribable_state::StateHandle,
@@ -92,6 +92,9 @@ pub struct StateSyncTask<I: SyncIO, D: DeterministicState> {
     io: Arc<I>,
     settings: NetIoSettings,
     actions_rx: Receiver<(I::Address, D::Action)>,
+    /// An action taken from the channel when the leader changed before it
+    /// could be applied or forwarded; it goes first to the next sync source
+    held_action: Option<(I::Address, D::Action)>,
     handle: StateHandle<D>,
     timing: StateSyncTiming,
 }
@@ -133,6 +136,7 @@ where
             io,
             settings,
             actions_rx,
+            held_action: None,
             handle,
             timing,
         }
@@ -180,7 +184,7 @@ where
 
         loop {
             tokio::select! {
-                action = self.actions_rx.recv() => {
+                action = next_action(&mut self.held_action, &mut self.actions_rx) => {
                     let Some((source, action)) = action else {
                         return Flow::Shutdown;
                     };
@@ -193,6 +197,7 @@ where
                     }
                     if !matches!(current, LeaderMode::Leading) {
                         tracing::info!("no longer leading, releasing authority before applying queued action");
+                        self.held_action = Some((source, action));
                         return Flow::Continue;
                     }
 
@@ -327,7 +332,7 @@ where
         /* the write half is unused after the handshake but must stay alive
          * for the duration of the stream or the connection closes */
         let (_write, mut read, next_seq) = tokio::select! {
-            opened = self.open_subscription(target) => match opened {
+            opened = self.open_subscription(target, leader) => match opened {
                 Ok(opened) => opened,
                 Err(error) => {
                     tracing::warn!(?target, ?error, "state subscription failed");
@@ -367,6 +372,7 @@ where
     async fn open_subscription(
         &mut self,
         target: I::Address,
+        leader: I::Address,
     ) -> std::io::Result<(Sender<SyncRequest<I::Address, D>>, Receiver<SyncResponse<I::Address, D>>, u64)> {
         /* connect gives no timing guarantee, bound it like every other step */
         let connection = tokio::time::timeout(self.settings.message_timeout, self.io.connect(&target))
@@ -374,7 +380,7 @@ where
             .map_err(|_| Error::new(ErrorKind::TimedOut, "timed out connecting for state sync"))??;
 
         let (_remote, write, mut read) = connection.client_channels::<D>(self.settings.clone());
-        let next_seq = self.subscribe(&write, &mut read, target).await?;
+        let next_seq = self.subscribe(&write, &mut read, target, leader).await?;
         Ok((write, read, next_seq))
     }
 
@@ -386,6 +392,7 @@ where
         write: &Sender<SyncRequest<I::Address, D>>,
         read: &mut Receiver<SyncResponse<I::Address, D>>,
         target: I::Address,
+        leader: I::Address,
     ) -> std::io::Result<u64> {
         let timeout = self.settings.message_timeout;
 
@@ -395,6 +402,26 @@ where
 
         send(write, self.state.handshake_address()).await?;
         expect_ok(recv(read, timeout).await?, "my address")?;
+
+        /* a leader that restarts comes back with an empty state and, until it
+         * learns of its peers, elects itself in a new term of its own. We
+         * still follow its address in our term, and resetting from its fresh
+         * snapshot would replace our state with its empty one. Ask on this
+         * connection, so the answer comes from the process that would serve
+         * the feed, and only subscribe to a source in our term */
+        let term = self.state.leader_state.lock().await.term;
+        send(write, SyncRequest::LeaderQuery).await?;
+        match recv(read, timeout).await? {
+            SyncResponse::LeaderState(remote) if self.serves_term(target, leader, term, &remote) => {}
+            SyncResponse::LeaderState(remote) => {
+                tracing::warn!(?target, ?leader, %term, ?remote, "sync target is not a source in our term");
+                return Err(Error::new(
+                    ErrorKind::NotConnected,
+                    format!("sync target is not a source in term {term}"),
+                ));
+            }
+            response => return Err(unexpected("LeaderState", &response)),
+        }
 
         tracing::info!(?target, "sync trace: handshake done, settling recovery details");
         let details = self.state.state.settled_recovery_details().await;
@@ -430,6 +457,40 @@ where
             }
             SyncResponse::NotSynced => Err(not_synced()),
             response => Err(unexpected("Accepted or RecoveryFailed", &response)),
+        }
+    }
+
+    /// Whether `remote`, the leader state the target reports, makes it a
+    /// source of `leader`'s feed in `term`: the leader itself leading, or a
+    /// relay following it. Behind a gateway, the leader is the gateway and
+    /// any voter answering through it serves the feed.
+    fn serves_term(
+        &self,
+        target: I::Address,
+        leader: I::Address,
+        term: ElectionTerm,
+        remote: &LeaderState<I::Address>,
+    ) -> bool {
+        let behind_gateway = self.state.is_gateway(leader);
+
+        /* behind a gateway our term is the one reported by whichever voter
+         * answered discovery last, and the voter answering this connection
+         * may report a same-numbered term from a different root. Only an
+         * older term number shows that the voter restarted */
+        let in_term = if behind_gateway {
+            term.term() <= remote.term.term()
+        } else {
+            remote.term == term
+        };
+        if !in_term {
+            return false;
+        }
+
+        match remote.mode {
+            LeaderMode::Leading => target == leader,
+            LeaderMode::Following { .. } if target == leader => behind_gateway,
+            LeaderMode::Following { leader: followed } => followed == leader,
+            LeaderMode::NoLeader | LeaderMode::Electing { .. } => false,
         }
     }
 
@@ -474,14 +535,14 @@ where
                         return SyncAttempt::Finished { applied_actions };
                     }
                 },
-                action = self.actions_rx.recv() => {
+                action = next_action(&mut self.held_action, &mut self.actions_rx) => {
                     let Some((source, action)) = action else {
                         return SyncAttempt::Shutdown;
                     };
                     let current = self.state.leader_state.lock().await.mode.clone();
                     if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
                         tracing::info!(?leader, "leader changed before forwarding action, dropping subscription");
-                        self.drop_queued_actions();
+                        self.held_action = Some((source, action));
                         return SyncAttempt::LeaderChanged;
                     }
                     self.forward_action(target, source, action).await;
@@ -515,7 +576,6 @@ where
                     let current = self.state.leader_state.lock().await.mode.clone();
                     if !matches!(&current, LeaderMode::Following { leader: still } if *still == leader) {
                         tracing::info!(?leader, "leader changed, dropping subscription");
-                        self.drop_queued_actions();
                         return SyncAttempt::LeaderChanged;
                     }
                 }
@@ -550,10 +610,6 @@ where
         })
     }
 
-    fn drop_queued_actions(&mut self) {
-        while self.actions_rx.try_recv().is_ok() {}
-    }
-
     async fn forward_action(&self, target: I::Address, source: I::Address, action: D::Action) {
         match self
             .peer_connections
@@ -565,6 +621,15 @@ where
                 tracing::warn!(?target, ?source, ?error, "failed to forward action to sync target");
             }
         }
+    }
+}
+
+/// The next client action, the held one first. Returns at once while one is
+/// held, so it is only taken when its select branch wins.
+async fn next_action<A, T>(held: &mut Option<(A, T)>, actions_rx: &mut Receiver<(A, T)>) -> Option<(A, T)> {
+    match held.take() {
+        Some(action) => Some(action),
+        None => actions_rx.recv().await,
     }
 }
 
@@ -963,6 +1028,10 @@ mod tests {
         while let Some(request) = read.recv().await {
             let response = match request {
                 SyncRequest::ProtocolVersion(_) | SyncRequest::MyAddress(_) => SyncResponse::Ok,
+                SyncRequest::LeaderQuery => SyncResponse::LeaderState(LeaderState {
+                    term: ElectionTerm::from_term(0),
+                    mode: LeaderMode::Leading,
+                }),
                 SyncRequest::SubscribeRecovery(details) => {
                     /* accept, then drop the connection without streaming */
                     let _ = write.send(SyncResponse::Accepted(details.next_seq())).await;
@@ -1050,6 +1119,7 @@ mod tests {
         while let Some(request) = read.recv().await {
             let response = match request {
                 SyncRequest::ProtocolVersion(_) | SyncRequest::MyAddress(_) => SyncResponse::Ok,
+                SyncRequest::LeaderQuery => SyncResponse::LeaderState(source.leader_state.lock().await.clone()),
                 SyncRequest::SubscribeRecovery(details) => {
                     subscriptions.fetch_add(1, Ordering::SeqCst);
                     SyncResponse::Accepted(details.next_seq())
@@ -1063,6 +1133,50 @@ mod tests {
                 return;
             }
         }
+    }
+
+    async fn set_mode(state: &NodeState<u64, TestState>, mode: LeaderMode<u64>) {
+        state.leader_state.lock().await.mode = mode;
+    }
+
+    fn applied_actions(state: &NodeState<u64, TestState>) -> u64 {
+        state.state.create_handle().read_with(|state| state.state().0)
+    }
+
+    /// An action taken from the queue in the moment leadership ends is
+    /// applied once the node leads again, not dropped.
+    #[tokio::test(start_paused = true)]
+    async fn action_taken_as_leadership_ends_is_applied_later() {
+        let state = node_state(1, LeaderMode::Leading);
+        let io = Arc::new(HangingIo::default());
+        let actions_tx = start_task(&state, &io);
+        let mut sync_status = state.sync_status.subscribe();
+        sync_status.wait_for(|status| *status == SyncStatus::Leading).await.unwrap();
+
+        set_mode(&state, LeaderMode::Electing { vote: None }).await;
+        actions_tx.send((1, 7)).await.unwrap();
+        tokio::time::sleep(test_timing().leader_poll_interval * 5).await;
+        assert_eq!(applied_actions(&state), 0, "applied without authority");
+
+        set_mode(&state, LeaderMode::Leading).await;
+        wait_until("the held action to apply", || applied_actions(&state) == 1).await;
+    }
+
+    /// The same for a follower whose leader changes while it streams: the
+    /// action it took goes to the next sync source, here itself as leader.
+    #[tokio::test(start_paused = true)]
+    async fn action_taken_as_the_leader_changes_is_applied_later() {
+        let state = node_state(1, LeaderMode::Following { leader: 2 });
+        let io = Arc::new(QuietFeedIo::new(node_state(2, LeaderMode::Leading), true));
+        let actions_tx = start_task(&state, &io);
+        wait_until("the subscription", || 1 <= io.subscriptions.load(Ordering::SeqCst)).await;
+
+        set_mode(&state, LeaderMode::NoLeader).await;
+        actions_tx.send((1, 7)).await.unwrap();
+        tokio::time::sleep(test_timing().leader_poll_interval * 5).await;
+
+        set_mode(&state, LeaderMode::Leading).await;
+        wait_until("the held action to apply", || applied_actions(&state) == 1).await;
     }
 
     /// Advances `node`'s state by `count` actions.

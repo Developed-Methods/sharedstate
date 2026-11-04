@@ -8,7 +8,10 @@ use std::{
 use crate::{
     cluster::node_state::{ConnectStatus, NodeState, PeerState},
     protocol::messages::{ElectionTerm, LeaderState},
-    state::{deterministic_state::DeterministicState, recoverable_state::RecoverableStateDetails},
+    state::{
+        deterministic_state::DeterministicState,
+        recoverable_state::{FollowerRecovery, RecoverableStateDetails},
+    },
     transport::traits::SyncIOAddress,
     utils::now_ms,
 };
@@ -18,12 +21,17 @@ pub use crate::protocol::messages::LeaderMode;
 #[derive(Clone, Debug)]
 pub struct LeaderTiming {
     pub tick_interval: Duration,
+    /// How long after start a voter that knows no other voter waits before
+    /// it elects itself, see [`LeaderTask::with_lone_leader_grace`]. `None`
+    /// waits two peer discovery rounds.
+    pub lone_leader_grace: Option<Duration>,
 }
 
 impl Default for LeaderTiming {
     fn default() -> Self {
         Self {
             tick_interval: Duration::from_millis(250),
+            lone_leader_grace: None,
         }
     }
 }
@@ -72,6 +80,9 @@ where
     state: Arc<NodeState<A, D>>,
     timing: LeaderTiming,
     expiry: PeerExpiry,
+    started: tokio::time::Instant,
+    lone_leader_grace: Duration,
+    min_leader_peers: usize,
 }
 
 impl<A, D> LeaderTask<A, D>
@@ -80,7 +91,50 @@ where
     D: DeterministicState,
 {
     pub fn new(state: Arc<NodeState<A, D>>, timing: LeaderTiming, expiry: PeerExpiry) -> Self {
-        Self { state, timing, expiry }
+        Self {
+            state,
+            timing,
+            expiry,
+            started: tokio::time::Instant::now(),
+            lone_leader_grace: Duration::ZERO,
+            min_leader_peers: 0,
+        }
+    }
+
+    /// How long after start a voter that knows no other voter waits before
+    /// it elects itself.
+    ///
+    /// A voter that restarts comes back with an empty state and, when its
+    /// peers are configured after start, without peers. Electing itself
+    /// right away makes its empty state the cluster's for anyone that
+    /// subscribes before it learns of the others, and followers behind a
+    /// voter gateway cannot tell its claim from the cluster's. Within a
+    /// discovery round the other voters dial it and it learns of them.
+    pub fn with_lone_leader_grace(mut self, grace: Duration) -> Self {
+        self.lone_leader_grace = grace;
+        self
+    }
+
+    /// How many other voters must back this voter before it leads, on top
+    /// of the majority of known voters.
+    ///
+    /// The majority only counts the voters this voter knows about, and a
+    /// voter that restarted without its peer list knows none, so the
+    /// majority of one is itself. Its empty state then becomes the
+    /// cluster's for every follower that subscribes to it, which includes
+    /// followers behind a voter gateway whenever the gateway routes to it.
+    /// With a floor, the voter only leads once enough peers voted for it,
+    /// and peers vote for the candidate whose state can recover the most
+    /// peers, so an empty or stale state never wins. A leader that can no
+    /// longer reach that many voters steps down.
+    ///
+    /// Zero, the default, keeps single-voter clusters working. In a cluster
+    /// of `n` voters, any value up to `n / 2` never blocks an election the
+    /// majority would allow once every voter knows the others; it only
+    /// takes effect while a voter knows fewer voters than there are.
+    pub fn with_min_leader_peers(mut self, min_leader_peers: usize) -> Self {
+        self.min_leader_peers = min_leader_peers;
+        self
     }
 
     pub async fn run(mut self) {
@@ -158,6 +212,12 @@ where
              * voters, so a stale or missing view is a disconnected one */
             let view = self.state.gateway_view.lock().await.clone();
             let fresh = view.as_ref().is_some_and(|view| view.is_fresh(now_ms()));
+            /* it is also the only voter we follow: a voter that dials us
+             * directly is connected too, and following it would bypass the
+             * gateway every other path of ours goes through */
+            if !self.state.can_lead {
+                peer_views.retain(|peer| !peer.is_voter);
+            }
             peer_views.push(PeerView {
                 addr: gateway,
                 is_voter: true,
@@ -169,10 +229,18 @@ where
             });
         }
 
+        if self.state.can_lead
+            && !peer_views.iter().any(|peer| peer.is_voter)
+            && self.started.elapsed() < self.lone_leader_grace
+        {
+            tracing::debug!("no other voter known yet, waiting before electing ourselves");
+            return;
+        }
+
         let mut leader_state = self.state.leader_state.lock().await;
 
         let next = if self.state.can_lead {
-            next_voter_state(&me, &leader_state, &peer_views)
+            next_voter_state(&me, &leader_state, &peer_views, self.min_leader_peers)
         } else {
             next_observer_state(&leader_state, &peer_views)
         };
@@ -247,14 +315,16 @@ impl<A: SyncIOAddress> PeerView<A> {
 ///  - a voter votes for the reachable candidate that can recover the most
 ///    known peer states, then the best connected one, and finally falls back
 ///    to the lowest address, so votes can't tie
-///  - leadership requires a strict majority of the known voter set, and
-///    conflicting claims in one term resolve to the lowest address without
+///  - leadership requires a strict majority of the known voter set and at
+///    least `min_leader_peers` other voters backing it, and conflicting
+///    claims in one term resolve to the lowest address without
 ///    bumping the term (term bumps are reserved for leader failure and
 ///    conflicting election roots)
 fn next_voter_state<A: SyncIOAddress>(
     me: &PeerView<A>,
     current: &LeaderState<A>,
     peers: &[PeerView<A>],
+    min_leader_peers: usize,
 ) -> LeaderState<A> {
     let voters = || peers.iter().filter(|peer| peer.is_voter);
     let seen_terms = || voters().filter_map(|peer| peer.leader_state.as_ref().map(|state| state.term));
@@ -281,6 +351,29 @@ fn next_voter_state<A: SyncIOAddress>(
         };
     }
 
+    /* a voter that restarts starts over in term 0 of a new root, and while
+     * it knows no peers it leads that root alone with an empty state. Until
+     * the cluster's first failover its root outranks the cluster's, so
+     * adopting it would follow that claim and reset every node to the empty
+     * state. A follower that sees a claim in a different root at its term
+     * number starts a new election instead, where votes go to the candidate
+     * that can recover the most peers */
+    if matches!(current.mode, LeaderMode::Following { .. })
+        && term != current.term
+        && term.term() == current.term.term()
+        && voters().any(|peer| peer.mode_at_term(term) == Some(&LeaderMode::Leading))
+    {
+        tracing::warn!(
+            term = %current.term,
+            claimed = %term,
+            "a different election root claims leadership at our term number, starting a new election"
+        );
+        return LeaderState {
+            term: term.bump(),
+            mode: LeaderMode::Electing { vote: None },
+        };
+    }
+
     let mode = if term == current.term {
         current.mode.clone()
     } else {
@@ -290,7 +383,8 @@ fn next_voter_state<A: SyncIOAddress>(
     };
 
     let voter_count = voters().count() + 1;
-    let has_majority = |supporters: usize| voter_count < supporters * 2;
+    /* supporters include ourselves */
+    let has_quorum = |supporters: usize| voter_count < supporters * 2 && min_leader_peers < supporters;
 
     /* a Leading claim at the current term is authoritative (it required a
      * majority); if partitions merge with two claims, the lowest address wins */
@@ -303,12 +397,13 @@ fn next_voter_state<A: SyncIOAddress>(
     match mode {
         LeaderMode::Leading => {
             let reachable_count = voters().filter(|peer| !peer.unreachable).count() + 1;
-            if !has_majority(reachable_count) {
+            if !has_quorum(reachable_count) {
                 tracing::warn!(
                     %term,
                     voter_count,
                     reachable_count,
-                    "lost contact with voter majority, stepping down"
+                    min_leader_peers,
+                    "lost contact with a voter quorum, stepping down"
                 );
                 return LeaderState {
                     term: term.bump(),
@@ -375,9 +470,15 @@ fn next_voter_state<A: SyncIOAddress>(
                 };
             }
 
-            /* prefer the candidate whose state can recover the most known
-             * peers (so the fewest nodes start fresh), then the one with the
-             * best connectivity to voters, then the lowest address */
+            /* prefer the candidate whose state the most known peers can
+             * follow without losing actions (so the fewest nodes start
+             * fresh), then the one whose state went through the most
+             * generations and actions, then the one with the best
+             * connectivity to voters, then the lowest address. An empty
+             * peer loses nothing by resetting to a state with actions, so
+             * every such candidate counts it: a voter that restarted empty
+             * only counts itself and the empty peers in its own lineage,
+             * and never outscores one holding the cluster's state */
             let known_states = peers
                 .iter()
                 .chain([me])
@@ -395,7 +496,12 @@ fn next_voter_state<A: SyncIOAddress>(
                     .map(|details| {
                         known_states
                             .iter()
-                            .filter(|follower| details.can_recover_follower(follower))
+                            .filter(|follower| {
+                                matches!(
+                                    details.can_recover_follower(follower),
+                                    FollowerRecovery::CanRecover | FollowerRecovery::FollowerShouldReset
+                                )
+                            })
                             .count()
                     })
                     .unwrap_or(0);
@@ -404,7 +510,12 @@ fn next_voter_state<A: SyncIOAddress>(
                     .iter()
                     .filter(|addr| voter_addrs.contains(addr))
                     .count();
-                (recoverable, connectivity)
+                let progress = candidate
+                    .recovery
+                    .as_ref()
+                    .map(|details| (details.generation(), details.next_seq()))
+                    .unwrap_or_default();
+                (recoverable, progress, connectivity)
             };
 
             let vote = voters()
@@ -424,8 +535,8 @@ fn next_voter_state<A: SyncIOAddress>(
                     })
                     .count();
 
-                if has_majority(support) {
-                    tracing::info!(%term, support, voter_count, "won election with voter majority");
+                if has_quorum(support) {
+                    tracing::info!(%term, support, voter_count, "won election with a voter quorum");
                     return LeaderState {
                         term,
                         mode: LeaderMode::Leading,
@@ -454,6 +565,19 @@ fn next_observer_state<A: SyncIOAddress>(current: &LeaderState<A>, peers: &[Peer
     let Some(term) = voter_states.iter().map(|(_, state)| state.term).max() else {
         return current.clone();
     };
+
+    /* a different root at our term number replaces ours only once no
+     * connected voter is left in ours. Voters following a leader in our root
+     * start a new election when another root claims leadership at the same
+     * number (see next_voter_state), and following that claim in the
+     * meantime would reset us to the state of a voter that restarted empty */
+    if matches!(current.mode, LeaderMode::Following { .. })
+        && term != current.term
+        && term.term() == current.term.term()
+        && voter_states.iter().any(|(_, state)| state.term == current.term)
+    {
+        return current.clone();
+    }
 
     let claimed = voter_states
         .iter()
@@ -569,8 +693,41 @@ mod tests {
 
     #[test]
     fn lone_voter_becomes_leader() {
-        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &[]);
+        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &[], 0);
         assert_eq!(next, ls(0, LeaderMode::Leading));
+    }
+
+    #[test]
+    fn lone_voter_does_not_lead_below_min_leader_peers() {
+        /* a voter that restarted without its peer list is its own majority,
+         * the floor keeps it from leading on that alone */
+        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &[], 1);
+        assert_eq!(next, ls(0, electing(1)));
+        let next = next_voter_state(&me(1), &next, &[], 1);
+        assert_eq!(next, ls(0, electing(1)));
+    }
+
+    #[test]
+    fn min_leader_peers_counts_backing_voters() {
+        let peers = [voter(2, Some(ls(4, electing(1))))];
+        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers, 1);
+        assert_eq!(next, ls(4, LeaderMode::Leading));
+
+        /* two of two voters is a majority, but not two other voters */
+        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers, 2);
+        assert_eq!(next, ls(4, electing(1)));
+    }
+
+    #[test]
+    fn leader_steps_down_below_min_leader_peers() {
+        let peers = [voter(2, Some(ls(4, following(1))))];
+        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers, 1);
+        assert_eq!(next, ls(4, LeaderMode::Leading));
+
+        /* the peer expired out of the voter set, so we are the majority on
+         * our own but no longer have a peer behind us */
+        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &[], 1);
+        assert_logical_state(next, 5, LeaderMode::Electing { vote: None });
     }
 
     #[test]
@@ -585,7 +742,7 @@ mod tests {
             reachable: vec![],
         }];
 
-        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &peers);
+        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &peers, 0);
         assert_eq!(next, ls(0, electing(1)));
     }
 
@@ -594,27 +751,27 @@ mod tests {
         let peers = [unreachable(voter(2, None)), unreachable(voter(3, None))];
 
         /* 2 of 3 voters unreachable: still just electing, no majority */
-        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &peers);
+        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &peers, 0);
         assert_eq!(next, ls(0, electing(1)));
 
         /* but a peer we never learned anything about is not a voter */
         let mut unknown = unreachable(voter(9, None));
         unknown.is_voter = false;
-        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &[unknown]);
+        let next = next_voter_state(&me(1), &ls(0, LeaderMode::NoLeader), &[unknown], 0);
         assert_eq!(next, ls(0, LeaderMode::Leading));
     }
 
     #[test]
     fn votes_for_lowest_reachable_address() {
         let peers = [voter(1, None), voter(3, None)];
-        let next = next_voter_state(&me(2), &ls(4, LeaderMode::Electing { vote: None }), &peers);
+        let next = next_voter_state(&me(2), &ls(4, LeaderMode::Electing { vote: None }), &peers, 0);
         assert_eq!(next, ls(4, electing(1)));
     }
 
     #[test]
     fn skips_unreachable_candidates() {
         let peers = [unreachable(voter(1, None)), voter(3, None)];
-        let next = next_voter_state(&me(2), &ls(4, LeaderMode::Electing { vote: None }), &peers);
+        let next = next_voter_state(&me(2), &ls(4, LeaderMode::Electing { vote: None }), &peers, 0);
         assert_eq!(next, ls(4, electing(2)));
     }
 
@@ -625,7 +782,7 @@ mod tests {
         let mut unknown = voter(1, None);
         unknown.recovery = None;
 
-        let next = next_voter_state(&me(2), &ls(4, LeaderMode::Electing { vote: None }), &[unknown]);
+        let next = next_voter_state(&me(2), &ls(4, LeaderMode::Electing { vote: None }), &[unknown], 0);
         assert_eq!(next, ls(4, electing(2)));
     }
 
@@ -646,8 +803,54 @@ mod tests {
         myself.recovery = Some(RecoverableStateDetails::new(5, 1));
 
         let peers = [candidate, peer4, peer5];
-        let next = next_voter_state(&myself, &ls(4, LeaderMode::Electing { vote: None }), &peers);
+        let next = next_voter_state(&myself, &ls(4, LeaderMode::Electing { vote: None }), &peers, 0);
         assert_eq!(next, ls(4, electing(3)));
+    }
+
+    #[test]
+    fn votes_for_the_only_state_with_actions_over_empty_ones() {
+        /* A and B restarted empty under new identities, C loaded a state at
+         * sequence 1000 without any history; C has the highest address */
+        let holder = RecoverableStateDetails::new(103, 1000);
+        for shared_empty_root in [false, true] {
+            let a = RecoverableStateDetails::new(101, 0);
+            /* B already reset to A's state, so A could replay onto it */
+            let b = if shared_empty_root { a.clone() } else { RecoverableStateDetails::new(102, 0) };
+
+            let mut myself = me(1);
+            myself.recovery = Some(a);
+            let mut peer_b = voter(2, None);
+            peer_b.recovery = Some(b);
+            let mut peer_c = voter(3, None);
+            peer_c.recovery = Some(holder.clone());
+
+            let next = next_voter_state(&myself, &ls(0, LeaderMode::NoLeader), &[peer_b, peer_c], 0);
+            assert_eq!(next, ls(0, electing(3)), "shared empty root: {shared_empty_root}");
+        }
+    }
+
+    #[test]
+    fn prefers_the_more_advanced_state_when_recovery_ties() {
+        /* with two voters left, one restarted empty: each state recovers
+         * only itself, and the empty one has the lower address */
+        let empty = RecoverableStateDetails::new(200, 0);
+        let mut cluster = RecoverableStateDetails::new(100, 0);
+        cluster.apply_generation_bump(101);
+        cluster.apply_inner_state_seq(0);
+
+        let mut restarted = me(1);
+        restarted.recovery = Some(empty.clone());
+        let mut holder = voter(2, None);
+        holder.recovery = Some(cluster.clone());
+        let next = next_voter_state(&restarted, &ls(4, LeaderMode::Electing { vote: None }), &[holder], 1);
+        assert_eq!(next, ls(4, electing(2)));
+
+        let mut holder = me(2);
+        holder.recovery = Some(cluster);
+        let mut restarted = voter(1, None);
+        restarted.recovery = Some(empty);
+        let next = next_voter_state(&holder, &ls(4, LeaderMode::Electing { vote: None }), &[restarted], 1);
+        assert_eq!(next, ls(4, electing(2)));
     }
 
     #[test]
@@ -660,7 +863,7 @@ mod tests {
         peer2.reachable = vec![1, 2, 3];
 
         let peers = [peer1, peer2];
-        let next = next_voter_state(&me(3), &ls(4, LeaderMode::Electing { vote: None }), &peers);
+        let next = next_voter_state(&me(3), &ls(4, LeaderMode::Electing { vote: None }), &peers, 0);
         assert_eq!(next, ls(4, electing(2)));
     }
 
@@ -674,35 +877,35 @@ mod tests {
         peer2.reachable = vec![2, 100, 101, 102];
 
         let peers = [peer1, peer2];
-        let next = next_voter_state(&me(3), &ls(4, LeaderMode::Electing { vote: None }), &peers);
+        let next = next_voter_state(&me(3), &ls(4, LeaderMode::Electing { vote: None }), &peers, 0);
         assert_eq!(next, ls(4, electing(1)));
     }
 
     #[test]
     fn wins_election_with_majority() {
         let peers = [voter(2, Some(ls(4, electing(1)))), voter(3, Some(ls(4, electing(3))))];
-        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers);
+        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers, 0);
         assert_eq!(next, ls(4, LeaderMode::Leading));
     }
 
     #[test]
     fn does_not_win_without_majority() {
         let peers = [voter(2, Some(ls(4, electing(2)))), voter(3, Some(ls(4, electing(3))))];
-        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers);
+        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers, 0);
         assert_eq!(next, ls(4, electing(1)));
     }
 
     #[test]
     fn following_a_winner_counts_as_support() {
         let peers = [voter(2, Some(ls(4, following(1)))), voter(3, Some(ls(4, electing(3))))];
-        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers);
+        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers, 0);
         assert_eq!(next, ls(4, LeaderMode::Leading));
     }
 
     #[test]
     fn stale_term_votes_do_not_count() {
         let peers = [voter(2, Some(ls(3, electing(1)))), voter(3, Some(ls(3, following(1))))];
-        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers);
+        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers, 0);
         assert_eq!(next, ls(4, electing(1)));
     }
 
@@ -715,18 +918,18 @@ mod tests {
             voter(2, Some(ls(4, electing(1)))),
             voter(3, Some(ls(4, following(1)))),
         ];
-        let next = next_voter_state(&me(1), &ls_root(4, 9, electing(1)), &peers);
+        let next = next_voter_state(&me(1), &ls_root(4, 9, electing(1)), &peers, 0);
         assert_eq!(next, ls_root(4, 9, electing(1)));
 
         /* the same votes at the exact same term do count */
-        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers);
+        let next = next_voter_state(&me(1), &ls(4, electing(1)), &peers, 0);
         assert_eq!(next, ls(4, LeaderMode::Leading));
     }
 
     #[test]
     fn adopts_highest_term_and_follows_its_claim() {
         let peers = [voter(2, Some(ls(7, LeaderMode::Leading))), voter(3, Some(ls(6, following(3))))];
-        let next = next_voter_state(&me(1), &ls(2, LeaderMode::Leading), &peers);
+        let next = next_voter_state(&me(1), &ls(2, LeaderMode::Leading), &peers, 0);
         assert_eq!(next, ls(7, following(2)));
     }
 
@@ -735,11 +938,11 @@ mod tests {
         let peers = [voter(2, Some(ls(4, LeaderMode::Leading)))];
 
         /* higher address concedes */
-        let next = next_voter_state(&me(3), &ls(4, LeaderMode::Leading), &peers);
+        let next = next_voter_state(&me(3), &ls(4, LeaderMode::Leading), &peers, 0);
         assert_eq!(next, ls(4, following(2)));
 
         /* lower address keeps the claim */
-        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers);
+        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers, 0);
         assert_eq!(next, ls(4, LeaderMode::Leading));
     }
 
@@ -749,12 +952,12 @@ mod tests {
          * created by a different root, so instead of conceding by address we
          * bump into a fresh election */
         let peers = [voter(2, Some(ls_root(4, 9, LeaderMode::Leading)))];
-        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers);
+        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers, 0);
         assert_logical_state(next, 5, LeaderMode::Electing { vote: None });
 
         /* also when our nonce is the greater one */
         let peers = [voter(2, Some(ls(4, LeaderMode::Leading)))];
-        let next = next_voter_state(&me(1), &ls_root(4, 9, LeaderMode::Leading), &peers);
+        let next = next_voter_state(&me(1), &ls_root(4, 9, LeaderMode::Leading), &peers, 0);
         assert_logical_state(next, 5, LeaderMode::Electing { vote: None });
     }
 
@@ -763,15 +966,30 @@ mod tests {
         /* an electing voter that adopts a same-numbered term from a different
          * root drops its old vote and re-elects within the adopted term */
         let peers = [voter(2, Some(ls_root(4, 9, LeaderMode::Electing { vote: None })))];
-        let next = next_voter_state(&me(1), &ls(4, following(3)), &peers);
+        let next = next_voter_state(&me(1), &ls(4, following(3)), &peers, 0);
         assert_eq!(next.term, ElectionTerm::from_parts(4, 9));
         assert_eq!(next.mode, electing(1));
     }
 
     #[test]
+    fn follower_starts_new_election_when_a_different_root_claims_its_term() {
+        /* a restarted voter leads a newer root of our term number alone;
+         * adopting it would follow that claim */
+        let peers = [voter(1, Some(ls_root(0, 9, LeaderMode::Leading))), voter(3, Some(ls(0, following(1))))];
+        let next = next_voter_state(&me(2), &ls(0, following(1)), &peers, 0);
+        assert_logical_state(next, 1, LeaderMode::Electing { vote: None });
+
+        /* a claim in our own root, or a higher term number, is followed */
+        let peers = [voter(1, Some(ls(0, LeaderMode::Leading)))];
+        assert_eq!(next_voter_state(&me(2), &ls(0, following(1)), &peers, 0), ls(0, following(1)));
+        let peers = [voter(1, Some(ls_root(1, 9, LeaderMode::Leading)))];
+        assert_eq!(next_voter_state(&me(2), &ls(0, following(1)), &peers, 0), ls_root(1, 9, following(1)));
+    }
+
+    #[test]
     fn follower_starts_new_term_when_leader_is_unreachable() {
         let peers = [unreachable(voter(1, Some(ls(4, LeaderMode::Leading)))), voter(3, None)];
-        let next = next_voter_state(&me(2), &ls(4, following(1)), &peers);
+        let next = next_voter_state(&me(2), &ls(4, following(1)), &peers, 0);
         assert_logical_state(next, 5, LeaderMode::Electing { vote: None });
     }
 
@@ -780,35 +998,35 @@ mod tests {
         /* the leader's last gossip is from an older term but it is still
          * reachable; don't churn */
         let peers = [voter(1, Some(ls(3, LeaderMode::Leading)))];
-        let next = next_voter_state(&me(2), &ls(4, following(1)), &peers);
+        let next = next_voter_state(&me(2), &ls(4, following(1)), &peers, 0);
         assert_eq!(next, ls(4, following(1)));
     }
 
     #[test]
     fn follower_rejoins_election_when_leader_abdicates() {
         let peers = [voter(1, Some(ls(4, LeaderMode::Electing { vote: None })))];
-        let next = next_voter_state(&me(2), &ls(4, following(1)), &peers);
+        let next = next_voter_state(&me(2), &ls(4, following(1)), &peers, 0);
         assert_eq!(next, ls(4, LeaderMode::Electing { vote: None }));
     }
 
     #[test]
     fn follower_adopts_leaders_concession() {
         let peers = [voter(2, Some(ls(4, following(1)))), voter(1, None)];
-        let next = next_voter_state(&me(3), &ls(4, following(2)), &peers);
+        let next = next_voter_state(&me(3), &ls(4, following(2)), &peers, 0);
         assert_eq!(next, ls(4, following(1)));
     }
 
     #[test]
     fn leader_steps_down_without_reachable_majority() {
         let peers = [unreachable(voter(2, None)), unreachable(voter(3, None))];
-        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers);
+        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers, 0);
         assert_logical_state(next, 5, LeaderMode::Electing { vote: None });
     }
 
     #[test]
     fn leader_keeps_leading_with_reachable_majority() {
         let peers = [voter(2, Some(ls(4, following(1)))), unreachable(voter(3, None))];
-        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers);
+        let next = next_voter_state(&me(1), &ls(4, LeaderMode::Leading), &peers, 0);
         assert_eq!(next, ls(4, LeaderMode::Leading));
     }
 
@@ -817,16 +1035,16 @@ mod tests {
         /* every voter recomputes its vote deterministically, so an initial
          * split (everyone voted for itself) resolves to the lowest address */
         let peers = [voter(2, Some(ls(0, electing(2)))), voter(3, Some(ls(0, electing(3))))];
-        let next = next_voter_state(&me(1), &ls(0, electing(1)), &peers);
+        let next = next_voter_state(&me(1), &ls(0, electing(1)), &peers, 0);
         assert_eq!(next, ls(0, electing(1)));
 
         let peers = [voter(1, Some(ls(0, electing(1)))), voter(3, Some(ls(0, electing(3))))];
-        let next = next_voter_state(&me(2), &ls(0, electing(2)), &peers);
+        let next = next_voter_state(&me(2), &ls(0, electing(2)), &peers, 0);
         assert_eq!(next, ls(0, electing(1)));
 
         /* once the split voters adopt the lowest address, it wins */
         let peers = [voter(2, Some(ls(0, electing(1)))), voter(3, Some(ls(0, electing(1))))];
-        let next = next_voter_state(&me(1), &ls(0, electing(1)), &peers);
+        let next = next_voter_state(&me(1), &ls(0, electing(1)), &peers, 0);
         assert_eq!(next, ls(0, LeaderMode::Leading));
     }
 
@@ -853,6 +1071,17 @@ mod tests {
         let peers = [voter(1, Some(ls(4, electing(1)))), voter(2, Some(ls(4, electing(1))))];
         let next = next_observer_state(&ls(3, following(1)), &peers);
         assert_eq!(next, ls(4, LeaderMode::NoLeader));
+    }
+
+    #[test]
+    fn observer_keeps_its_root_while_a_voter_remains_in_it() {
+        let current = ls(0, following(1));
+        let peers = [voter(1, Some(ls_root(0, 9, LeaderMode::Leading))), voter(2, Some(ls(0, following(1))))];
+        assert_eq!(next_observer_state(&current, &peers), current);
+
+        /* once every voter left our root, the other one is the cluster's */
+        let peers = [voter(1, Some(ls_root(0, 9, LeaderMode::Leading))), voter(2, Some(ls_root(0, 9, following(1))))];
+        assert_eq!(next_observer_state(&current, &peers), ls_root(0, 9, following(1)));
     }
 
     #[test]
@@ -920,7 +1149,7 @@ mod tests {
                 };
 
                 node.state = if node.can_lead {
-                    next_voter_state(&myself, &node.state, &peers)
+                    next_voter_state(&myself, &node.state, &peers, 0)
                 } else {
                     next_observer_state(&node.state, &peers)
                 };
@@ -1004,6 +1233,54 @@ mod tests {
 
         run_rounds(&mut nodes, &[], 8);
         assert_all_agree(&nodes, 3, 4, &[]);
+    }
+
+    #[test]
+    fn restarted_voter_does_not_take_over_a_cluster_in_its_first_term() {
+        /* the cluster never left term 0 when its leader restarted with an
+         * empty state and led a newer root alone before it learned of its
+         * peers. Nobody may follow that claim: the voters holding the
+         * cluster's state elect one of them in a new term */
+        let cluster = RecoverableStateDetails::new(100, 50);
+        let mut nodes = vec![
+            SimNode {
+                addr: 1,
+                can_lead: true,
+                state: ls_root(0, 9, LeaderMode::Leading),
+                recovery: RecoverableStateDetails::new(200, 0),
+            },
+            SimNode {
+                addr: 2,
+                can_lead: true,
+                state: ls_root(0, 7, following(1)),
+                recovery: cluster.clone(),
+            },
+            SimNode {
+                addr: 3,
+                can_lead: true,
+                state: ls_root(0, 7, following(1)),
+                recovery: cluster.clone(),
+            },
+            SimNode {
+                addr: 4,
+                can_lead: false,
+                state: ls_root(0, 7, following(1)),
+                recovery: cluster,
+            },
+        ];
+
+        for _ in 0..8 {
+            run_rounds(&mut nodes, &[], 1);
+            for node in &nodes[1..] {
+                assert_ne!(
+                    node.state,
+                    ls_root(0, 9, following(1)),
+                    "node {} followed the restarted voter's claim",
+                    node.addr
+                );
+            }
+        }
+        assert_all_agree(&nodes, 2, 1, &[]);
     }
 
     #[test]

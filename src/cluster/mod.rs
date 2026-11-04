@@ -199,6 +199,51 @@ mod tests {
         assert_eq!(*state.leader_state.lock().await, LeaderState { term, mode: LeaderMode::Leading });
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn lone_voter_waits_for_its_peers_before_electing_itself() {
+        let state = Arc::new(NodeState {
+            my_address: 1,
+            can_lead: true,
+            accessible: true,
+            voter_gateway: None,
+            gateway_view: Mutex::new(None),
+            peers: Mutex::new(HashMap::new()),
+            state: SubscribableState::new(
+                RecoverableState::new(1, TestState(0)),
+                SequencedBroadcastSettings::default(),
+            )
+            .unwrap(),
+            leader_state: Mutex::new(LeaderState {
+                term: ElectionTerm::from_term(0),
+                mode: LeaderMode::NoLeader,
+            }),
+            sync_status: watch::Sender::new(SyncStatus::NotSynced),
+        });
+        let grace = std::time::Duration::from_secs(6);
+        let mut leader = LeaderTask::new(state.clone(), LeaderTiming::default(), PeerExpiry::default())
+            .with_lone_leader_grace(grace);
+
+        leader.tick().await;
+        assert_eq!(state.leader_state.lock().await.mode, LeaderMode::NoLeader);
+
+        /* a voter learned during the wait takes part in the election */
+        let mut peer = PeerState::empty(2);
+        peer.can_lead = Some(true);
+        state.peers.lock().await.insert(2, peer);
+        leader.tick().await;
+        assert_eq!(state.leader_state.lock().await.mode, LeaderMode::Electing { vote: Some(1) });
+
+        /* with nobody heard of, it leads alone once the wait is over */
+        state.peers.lock().await.clear();
+        *state.leader_state.lock().await = LeaderState {
+            term: ElectionTerm::from_term(0),
+            mode: LeaderMode::NoLeader,
+        };
+        tokio::time::advance(grace).await;
+        leader.tick().await;
+        assert_eq!(state.leader_state.lock().await.mode, LeaderMode::Leading);
+    }
+
     #[tokio::test]
     async fn observer_leader_tick_uses_the_gateway_view() {
         use crate::{cluster::node_state::GatewayView, utils::now_ms};
@@ -234,6 +279,23 @@ mod tests {
         *state.gateway_view.lock().await = Some(GatewayView::from_voter_state(&leading, now_ms() + 60_000));
         leader.tick().await;
         assert_eq!(state.leader_state.lock().await.mode, LeaderMode::Following { leader: 100 });
+
+        /* a voter that dialed us directly does not pull us off the gateway */
+        let mut voter = PeerState::empty(2);
+        voter.connect_status = crate::cluster::node_state::ConnectStatus::Connected { epoch_ms: now_ms() };
+        voter.leader_info = Some(crate::protocol::messages::LeaderInfo {
+            leader_state: LeaderState {
+                term: ElectionTerm::from_term(3),
+                mode: LeaderMode::Leading,
+            },
+            can_lead: true,
+            reachable_voters: vec![2],
+            recovery_details: crate::state::recoverable_state::RecoverableStateDetails::new(2, 0),
+        });
+        state.peers.lock().await.insert(2, voter);
+        leader.tick().await;
+        assert_eq!(state.leader_state.lock().await.mode, LeaderMode::Following { leader: 100 });
+        state.peers.lock().await.clear();
 
         /* an expired view is a disconnected voter: keep following */
         *state.gateway_view.lock().await = Some(GatewayView::from_voter_state(&leading, now_ms() - 1));
