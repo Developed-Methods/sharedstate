@@ -112,6 +112,9 @@ pub struct SharedStateSettings {
     pub leader_timing: LeaderTiming,
     pub sync_timing: StateSyncTiming,
     pub peer_expiry: PeerExpiry,
+    /// How many other voters must back a voter before it leads. See
+    /// [`LeaderTask::with_min_leader_peers`]; zero disables the floor.
+    pub min_leader_peers: usize,
 }
 
 const ACTION_QUEUE_CAPACITY: usize = 512;
@@ -216,6 +219,7 @@ where
             tokio::spawn(
                 LeaderTask::new(node.clone(), settings.leader_timing, settings.peer_expiry)
                     .with_lone_leader_grace(lone_leader_grace)
+                    .with_min_leader_peers(settings.min_leader_peers)
                     .run(),
             ),
             tokio::spawn(
@@ -364,6 +368,7 @@ mod tests {
                 ..Default::default()
             },
             peer_expiry: Default::default(),
+            min_leader_peers: 0,
         }
     }
 

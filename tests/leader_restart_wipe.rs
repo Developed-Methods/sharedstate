@@ -125,6 +125,7 @@ fn fast_settings() -> SharedStateSettings {
             ..Default::default()
         },
         peer_expiry: Default::default(),
+        min_leader_peers: 0,
     }
 }
 
@@ -157,11 +158,9 @@ async fn start_node(
     address: u64,
     initial_peers: Vec<u64>,
     topology: Topology,
-    lone_leader_grace: Option<Duration>,
+    settings: SharedStateSettings,
 ) -> Node {
     let io = net.start_io(address).await;
-    let mut settings = fast_settings();
-    settings.leader_timing.lone_leader_grace = lone_leader_grace;
     let gateway = behind_gateway(address, topology);
     SharedState::start(SharedStateConfig {
         io,
@@ -258,7 +257,7 @@ async fn start_cluster(net: &SimulatedNet, topology: Topology) -> BTreeMap<u64, 
     let mut nodes = BTreeMap::new();
     for address in all_addresses() {
         let peers = all_addresses().filter(|peer| *peer != address).collect();
-        nodes.insert(address, start_node(net, address, peers, topology, None).await);
+        nodes.insert(address, start_node(net, address, peers, topology, fast_settings()).await);
     }
     nodes
 }
@@ -303,6 +302,38 @@ enum Restart {
     LoneClaim { adoptable: bool },
     /// It waits for its peers as it does now and must never lead alone.
     WaitForPeers,
+    /// It is cut off from the other sync-servers while the load balancer
+    /// still routes the tunnel servers to it, and its wait for peers runs
+    /// out before it hears of them. Tunnel servers share the sync-server
+    /// addresses they know through the load balancer, which usually tells
+    /// it of its peers within the wait; this models it not. Only a voter
+    /// that needs `min_leader_peers` other voters to back it holds back.
+    CutOffFromVoters { min_leader_peers: usize },
+}
+
+/// What happened while the leader restarted.
+struct RestartOutcome {
+    /// The restarted node led while it held its empty state.
+    led_alone: bool,
+    /// Some other node lost keys at some point.
+    wiped: bool,
+    /// Nodes still missing keys once the cluster settled.
+    missing: Vec<String>,
+}
+
+impl RestartOutcome {
+    fn assert_state_kept(&self) {
+        assert!(
+            !self.led_alone,
+            "the restarted leader led with its empty state before it heard of its peers"
+        );
+        assert!(
+            !self.wiped && self.missing.is_empty(),
+            "the restarted leader's empty state replaced the cluster's state (wiped while restarting: {}):\n{}",
+            self.wiped,
+            self.missing.join("\n"),
+        );
+    }
 }
 
 /// Rolling restart of the elected leader, the way the sync-servers were
@@ -327,12 +358,14 @@ async fn restarted_leader_does_not_wipe_cluster_state() {
     let term = nodes[&leader].leader_state().await.term;
     assert!(0 < term.term(), "failover did not move past the first term: {term}");
     net.set_node_blocked(first_leader, false).await;
-    let restarted = start_node(&net, first_leader, Vec::new(), Topology::Direct, None).await;
+    let restarted = start_node(&net, first_leader, Vec::new(), Topology::Direct, fast_settings()).await;
     seed_peers(&restarted, Topology::Direct).await;
     nodes.insert(first_leader, restarted);
     assert_eq!(wait_for_common_leader(&nodes.values().collect::<Vec<_>>()).await, leader);
 
-    restart_leader_and_check_keys(&net, nodes, leader, Topology::Direct, Restart::LoneClaim { adoptable: false }).await;
+    restart_leader_and_check_keys(&net, nodes, leader, Topology::Direct, Restart::LoneClaim { adoptable: false })
+        .await
+        .assert_state_kept();
 }
 
 /// The same restart in a cluster that never had a failover. A restarted
@@ -343,7 +376,9 @@ async fn restarted_leader_does_not_wipe_cluster_state_in_first_term() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
 
     let (net, nodes, leader) = start_cluster_in_first_term(Topology::Direct).await;
-    restart_leader_and_check_keys(&net, nodes, leader, Topology::Direct, Restart::LoneClaim { adoptable: true }).await;
+    restart_leader_and_check_keys(&net, nodes, leader, Topology::Direct, Restart::LoneClaim { adoptable: true })
+        .await
+        .assert_state_kept();
 }
 
 /// The restart as it plays out now, with the tunnel servers behind the
@@ -355,7 +390,49 @@ async fn restarted_leader_waits_for_its_peers_before_leading_alone() {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
 
     let (net, nodes, leader) = start_cluster_in_first_term(Topology::Gateway).await;
-    restart_leader_and_check_keys(&net, nodes, leader, Topology::Gateway, Restart::WaitForPeers).await;
+    restart_leader_and_check_keys(&net, nodes, leader, Topology::Gateway, Restart::WaitForPeers)
+        .await
+        .assert_state_kept();
+}
+
+/// Waiting for peers does not help a restarted leader that cannot reach
+/// them in time: once the wait is over it leads alone, and the load
+/// balancer hands its empty state to the tunnel servers. This is the
+/// hazard `min_leader_peers` closes, kept here so the next test keeps
+/// modelling it.
+#[tokio::test(flavor = "multi_thread")]
+async fn restarted_leader_cut_off_from_its_peers_leads_alone_without_a_peer_minimum() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+
+    let (net, nodes, leader) = start_cluster_in_first_term(Topology::Gateway).await;
+    let outcome = restart_leader_and_check_keys(
+        &net,
+        nodes,
+        leader,
+        Topology::Gateway,
+        Restart::CutOffFromVoters { min_leader_peers: 0 },
+    )
+    .await;
+    assert!(outcome.led_alone, "the restarted leader never led alone, the test no longer models the hazard");
+}
+
+/// With a peer minimum the restarted leader waits, however long it stays
+/// cut off, until another sync-server backs it, and the others only back
+/// the sync-server holding the cluster's state.
+#[tokio::test(flavor = "multi_thread")]
+async fn restarted_leader_cut_off_from_its_peers_waits_for_a_peer_minimum() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+
+    let (net, nodes, leader) = start_cluster_in_first_term(Topology::Gateway).await;
+    restart_leader_and_check_keys(
+        &net,
+        nodes,
+        leader,
+        Topology::Gateway,
+        Restart::CutOffFromVoters { min_leader_peers: 1 },
+    )
+    .await
+    .assert_state_kept();
 }
 
 async fn restart_leader_and_check_keys(
@@ -364,7 +441,7 @@ async fn restart_leader_and_check_keys(
     leader: u64,
     topology: Topology,
     restart: Restart,
-) {
+) -> RestartOutcome {
     for key in 0..KEYS {
         nodes[&leader].submit_action((key, key)).await.unwrap();
     }
@@ -408,23 +485,31 @@ async fn restart_leader_and_check_keys(
         }
     }
 
+    let other_sync_servers = SYNC_SERVERS.into_iter().filter(|address| *address != leader).collect::<Vec<_>>();
+    if let Restart::CutOffFromVoters { .. } = restart {
+        for address in &other_sync_servers {
+            net.set_edge_blocked(leader, *address, true).await;
+        }
+    }
+
     /* the leader reboots: its process dies and comes back moments later
      * with an empty state. Production passes no initial peers and seeds them
      * after start */
     net.stop_node(leader).await;
     drop(nodes.remove(&leader));
-    let lone_leader_grace = match restart {
-        Restart::LoneClaim { .. } => Some(Duration::ZERO),
-        Restart::WaitForPeers => None,
-    };
-    let restarted = start_node(net, leader, Vec::new(), topology, lone_leader_grace).await;
+    let mut settings = fast_settings();
+    match restart {
+        Restart::LoneClaim { .. } => settings.leader_timing.lone_leader_grace = Some(Duration::ZERO),
+        Restart::WaitForPeers => {}
+        Restart::CutOffFromVoters { min_leader_peers } => {
+            settings.leader_timing.lone_leader_grace = Some(Duration::ZERO);
+            settings.min_leader_peers = min_leader_peers;
+        }
+    }
+    let restarted = start_node(net, leader, Vec::new(), topology, settings).await;
 
     let led_alone = Arc::new(AtomicBool::new(false));
-    if restart == Restart::WaitForPeers {
-        /* seeding lost the race against the first leader ticks in the
-         * outage; let a few run, still well inside the wait for peers */
-        tokio::time::sleep(fast_settings().leader_timing.tick_interval * 3).await;
-        seed_peers(&restarted, topology).await;
+    if matches!(restart, Restart::WaitForPeers | Restart::CutOffFromVoters { .. }) {
         let state = restarted.node().clone();
         let led_alone = led_alone.clone();
         watchers.push(tokio::spawn(async move {
@@ -437,6 +522,22 @@ async fn restart_leader_and_check_keys(
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         }));
+    }
+
+    if restart == Restart::WaitForPeers {
+        /* seeding lost the race against the first leader ticks in the
+         * outage; let a few run, still well inside the wait for peers */
+        tokio::time::sleep(fast_settings().leader_timing.tick_interval * 3).await;
+        seed_peers(&restarted, topology).await;
+    } else if let Restart::CutOffFromVoters { .. } = restart {
+        /* stay cut off for several discovery rounds while the tunnel
+         * servers keep dialing the load balancer, which routes every third
+         * connection to the restarted node */
+        tokio::time::sleep(fast_settings().discovery_timing.observation_interval * 8).await;
+        for address in &other_sync_servers {
+            net.set_edge_blocked(leader, *address, false).await;
+        }
+        seed_peers(&restarted, topology).await;
     } else {
         /* wait for the lone claim before seeding so the test does not
          * depend on winning the race against the first leader tick */
@@ -486,14 +587,9 @@ async fn restart_leader_and_check_keys(
         watcher.abort();
     }
 
-    assert!(
-        !led_alone.load(Ordering::SeqCst),
-        "the restarted leader led with its empty state before it heard of its peers"
-    );
-    assert!(
-        !wiped.load(Ordering::SeqCst) && missing.is_empty(),
-        "the restarted leader's empty state replaced the cluster's state (wiped while restarting: {}):\n{}",
-        wiped.load(Ordering::SeqCst),
-        missing.join("\n"),
-    );
+    RestartOutcome {
+        led_alone: led_alone.load(Ordering::SeqCst),
+        wiped: wiped.load(Ordering::SeqCst),
+        missing,
+    }
 }

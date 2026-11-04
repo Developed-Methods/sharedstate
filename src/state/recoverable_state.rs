@@ -63,6 +63,12 @@ impl RecoverableStateDetails {
         }
     }
 
+    /// How many leaders have taken authority over this state, counting its
+    /// creation as the first.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn next_seq(&self) -> u64 {
         self.outer_state_next_seq
     }

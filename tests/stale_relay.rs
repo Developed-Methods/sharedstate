@@ -129,6 +129,7 @@ fn fast_settings() -> SharedStateSettings {
             ..Default::default()
         },
         peer_expiry: Default::default(),
+        min_leader_peers: 0,
     }
 }
 
