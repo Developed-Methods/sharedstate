@@ -121,6 +121,7 @@ fn fast_settings() -> SharedStateSettings {
         },
         leader_timing: LeaderTiming {
             tick_interval: Duration::from_millis(25),
+            ..Default::default()
         },
         sync_timing: StateSyncTiming {
             leader_poll_interval: Duration::from_millis(20),
