@@ -8,7 +8,10 @@ use std::{
 use crate::{
     cluster::node_state::{ConnectStatus, NodeState, PeerState},
     protocol::messages::{ElectionTerm, LeaderState},
-    state::{deterministic_state::DeterministicState, recoverable_state::RecoverableStateDetails},
+    state::{
+        deterministic_state::DeterministicState,
+        recoverable_state::{FollowerRecovery, RecoverableStateDetails},
+    },
     transport::traits::SyncIOAddress,
     utils::now_ms,
 };
@@ -467,14 +470,15 @@ fn next_voter_state<A: SyncIOAddress>(
                 };
             }
 
-            /* prefer the candidate whose state can recover the most known
-             * peers (so the fewest nodes start fresh), then the one whose
-             * state went through the most generations and actions, then the
-             * one with the best connectivity to voters, then the lowest
-             * address. States from different lineages each recover only
-             * their own followers, so with two voters left a restarted,
-             * empty voter ties with the one holding the cluster's state, and
-             * progress is what keeps the empty one from winning */
+            /* prefer the candidate whose state the most known peers can
+             * follow without losing actions (so the fewest nodes start
+             * fresh), then the one whose state went through the most
+             * generations and actions, then the one with the best
+             * connectivity to voters, then the lowest address. An empty
+             * peer loses nothing by resetting to a state with actions, so
+             * every such candidate counts it: a voter that restarted empty
+             * only counts itself and the empty peers in its own lineage,
+             * and never outscores one holding the cluster's state */
             let known_states = peers
                 .iter()
                 .chain([me])
@@ -492,7 +496,12 @@ fn next_voter_state<A: SyncIOAddress>(
                     .map(|details| {
                         known_states
                             .iter()
-                            .filter(|follower| details.can_recover_follower(follower))
+                            .filter(|follower| {
+                                matches!(
+                                    details.can_recover_follower(follower),
+                                    FollowerRecovery::CanRecover | FollowerRecovery::FollowerShouldReset
+                                )
+                            })
                             .count()
                     })
                     .unwrap_or(0);
@@ -796,6 +805,28 @@ mod tests {
         let peers = [candidate, peer4, peer5];
         let next = next_voter_state(&myself, &ls(4, LeaderMode::Electing { vote: None }), &peers, 0);
         assert_eq!(next, ls(4, electing(3)));
+    }
+
+    #[test]
+    fn votes_for_the_only_state_with_actions_over_empty_ones() {
+        /* A and B restarted empty under new identities, C loaded a state at
+         * sequence 1000 without any history; C has the highest address */
+        let holder = RecoverableStateDetails::new(103, 1000);
+        for shared_empty_root in [false, true] {
+            let a = RecoverableStateDetails::new(101, 0);
+            /* B already reset to A's state, so A could replay onto it */
+            let b = if shared_empty_root { a.clone() } else { RecoverableStateDetails::new(102, 0) };
+
+            let mut myself = me(1);
+            myself.recovery = Some(a);
+            let mut peer_b = voter(2, None);
+            peer_b.recovery = Some(b);
+            let mut peer_c = voter(3, None);
+            peer_c.recovery = Some(holder.clone());
+
+            let next = next_voter_state(&myself, &ls(0, LeaderMode::NoLeader), &[peer_b, peer_c], 0);
+            assert_eq!(next, ls(0, electing(3)), "shared empty root: {shared_empty_root}");
+        }
     }
 
     #[test]

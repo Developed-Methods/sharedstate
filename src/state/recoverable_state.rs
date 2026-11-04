@@ -45,6 +45,22 @@ pub struct RecoverableStateDetails {
     history: VecDeque<RecovGenerationEnd>,
 }
 
+/// How a leader's state relates to a follower's, see
+/// [`RecoverableStateDetails::can_recover_follower`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FollowerRecovery {
+    /// The follower holds a prefix of the leader's history and catches up
+    /// by replaying the actions it is missing.
+    CanRecover,
+    /// The follower's state diverged from the leader's or is ahead of it.
+    /// Resetting it to the leader's state discards actions it holds.
+    CannotRecover,
+    /// The follower's state is empty (sequence 0) and the leader's is not.
+    /// It cannot replay into the leader's history either, but resetting it
+    /// to the leader's state loses nothing.
+    FollowerShouldReset,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct RecovGenerationEnd {
     old_id: u64,
@@ -108,7 +124,21 @@ impl RecoverableStateDetails {
         self.history.is_empty()
     }
 
-    pub fn can_recover_follower(&self, follower: &RecoverableStateDetails) -> bool {
+    /// Whether a follower with `follower` details can catch up to this
+    /// state by replaying actions, and if not, whether resetting it loses
+    /// anything. A state's sequence is the inner state's accept sequence,
+    /// so sequence 0 means no action was ever applied to it.
+    pub fn can_recover_follower(&self, follower: &RecoverableStateDetails) -> FollowerRecovery {
+        if self.replays_onto(follower) {
+            FollowerRecovery::CanRecover
+        } else if follower.inner_state_next_seq == 0 && self.inner_state_next_seq != 0 {
+            FollowerRecovery::FollowerShouldReset
+        } else {
+            FollowerRecovery::CannotRecover
+        }
+    }
+
+    fn replays_onto(&self, follower: &RecoverableStateDetails) -> bool {
         /* follower is in the future */
         if self.generation < follower.generation {
             return false;
@@ -317,7 +347,7 @@ mod test {
         state1.update(&RecoverableStateAction::StateAction { action: () });
         state1.update(&RecoverableStateAction::StateAction { action: () });
 
-        assert!(state1.details.can_recover_follower(&state2.details));
+        assert_eq!(state1.details.can_recover_follower(&state2.details), FollowerRecovery::CanRecover);
 
         state2.update(&RecoverableStateAction::BumpGeneration { new_id: 1234 });
         state2.update(&RecoverableStateAction::StateAction { action: () });
@@ -372,10 +402,10 @@ mod test {
             let mut fork = details.clone();
 
             details.apply_generation_bump(444);
-            assert!(details.can_recover_follower(&fork));
+            assert_eq!(details.can_recover_follower(&fork), FollowerRecovery::CanRecover);
 
             fork.apply_inner_state_seq(30);
-            assert!(!details.can_recover_follower(&fork));
+            assert_eq!(details.can_recover_follower(&fork), FollowerRecovery::CannotRecover);
         }
 
         let fork = details.clone();
@@ -387,18 +417,41 @@ mod test {
             details.apply_inner_state_seq(seq);
         }
 
-        assert!(details.can_recover_follower(&fork));
+        assert_eq!(details.can_recover_follower(&fork), FollowerRecovery::CanRecover);
 
         {
             let mut fork = fork.clone();
             fork.apply_generation_bump(555);
-            assert!(!details.can_recover_follower(&fork));
+            assert_eq!(details.can_recover_follower(&fork), FollowerRecovery::CannotRecover);
         }
 
         {
             let mut fork = fork.clone();
             fork.apply_inner_state_seq(30);
-            assert!(!details.can_recover_follower(&fork));
+            assert_eq!(details.can_recover_follower(&fork), FollowerRecovery::CannotRecover);
         }
+    }
+
+    #[test]
+    fn empty_follower_should_reset_to_a_state_with_actions() {
+        let mut leader = RecoverableStateDetails::new(1, 1000);
+        let empty = RecoverableStateDetails::new(2, 0);
+        assert_eq!(leader.can_recover_follower(&empty), FollowerRecovery::FollowerShouldReset);
+
+        /* a follower in the leader's own history still replays */
+        let mut same_root = RecoverableStateDetails::new(3, 0);
+        let follower = same_root.clone();
+        same_root.apply_inner_state_seq(0);
+        assert_eq!(same_root.can_recover_follower(&follower), FollowerRecovery::CanRecover);
+
+        /* nothing is lost between two empty states, but neither has
+         * anything for the other either */
+        let other_empty = RecoverableStateDetails::new(4, 0);
+        assert_eq!(empty.can_recover_follower(&other_empty), FollowerRecovery::CannotRecover);
+
+        /* an empty leader never resets a follower holding actions */
+        assert_eq!(empty.can_recover_follower(&leader), FollowerRecovery::CannotRecover);
+        leader.apply_generation_bump(5);
+        assert_eq!(leader.can_recover_follower(&empty), FollowerRecovery::FollowerShouldReset);
     }
 }

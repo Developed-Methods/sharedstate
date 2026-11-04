@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::state::{
     deterministic_state::DeterministicState,
-    recoverable_state::{RecoverableState, RecoverableStateAction, RecoverableStateDetails},
+    recoverable_state::{FollowerRecovery, RecoverableState, RecoverableStateAction, RecoverableStateDetails},
 };
 
 pub struct SubscribableState<D: DeterministicState> {
@@ -147,7 +147,9 @@ impl<D: DeterministicState> SubscribableState<D> {
             details
         };
 
-        if !leader_details.can_recover_follower(&recover) {
+        /* a follower that should reset gets a fresh snapshot, the same as
+         * one we cannot recover */
+        if leader_details.can_recover_follower(&recover) != FollowerRecovery::CanRecover {
             return Err(StateSubscribeError::CannotRecoverSubscriber);
         }
 
