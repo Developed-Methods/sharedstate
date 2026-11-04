@@ -55,9 +55,10 @@ pub enum FollowerRecovery {
     /// The follower's state diverged from the leader's or is ahead of it.
     /// Resetting it to the leader's state discards actions it holds.
     CannotRecover,
-    /// The follower's state is empty (sequence 0) and the leader's is not.
-    /// It cannot replay into the leader's history either, but resetting it
-    /// to the leader's state loses nothing.
+    /// The follower cannot replay into the leader's history, but its state
+    /// is worth less than the leader's: it is empty (sequence 0) while the
+    /// leader's is not, or both forked from a common history and the
+    /// follower applied fewer actions since.
     FollowerShouldReset,
 }
 
@@ -125,17 +126,49 @@ impl RecoverableStateDetails {
     }
 
     /// Whether a follower with `follower` details can catch up to this
-    /// state by replaying actions, and if not, whether resetting it loses
-    /// anything. A state's sequence is the inner state's accept sequence,
-    /// so sequence 0 means no action was ever applied to it.
+    /// state by replaying actions, and if not, whether resetting it to this
+    /// state is the better outcome. A state's sequence is the inner state's
+    /// accept sequence, so sequence 0 means no action was ever applied.
+    ///
+    /// Sequences only rank states that count from the same origin. Two
+    /// forks of one history do, so the one that applied more actions since
+    /// the fork is kept. Unrelated states do not: a state rebuilt from
+    /// scratch can hold newer data at a lower sequence than an old one, so
+    /// neither is reset for the other unless it is empty.
     pub fn can_recover_follower(&self, follower: &RecoverableStateDetails) -> FollowerRecovery {
         if self.replays_onto(follower) {
             FollowerRecovery::CanRecover
-        } else if follower.inner_state_next_seq == 0 && self.inner_state_next_seq != 0 {
+        } else if self.inner_state_next_seq <= follower.inner_state_next_seq {
+            FollowerRecovery::CannotRecover
+        } else if follower.inner_state_next_seq == 0 || self.shares_history_with(follower) {
             FollowerRecovery::FollowerShouldReset
         } else {
             FollowerRecovery::CannotRecover
         }
+    }
+
+    /// Whether both states descend from a common state. Every leader takes
+    /// authority under a new id, so an id both hold at the same generation
+    /// marks a state they had in common. Forks older than the retained
+    /// history are not found.
+    fn shares_history_with(&self, other: &RecoverableStateDetails) -> bool {
+        other
+            .history
+            .iter()
+            .map(|end| (end.generation, end.old_id))
+            .chain(std::iter::once((other.generation, other.id)))
+            .any(|(generation, id)| self.id_at(generation) == Some(id))
+    }
+
+    /// The id this state had at `generation`, if still in its history.
+    fn id_at(&self, generation: u64) -> Option<u64> {
+        if generation == self.generation {
+            return Some(self.id);
+        }
+        let depth = self.generation.checked_sub(generation)? as usize;
+        let end = self.history.get(self.history.len().checked_sub(depth)?)?;
+        debug_assert_eq!(end.generation, generation);
+        Some(end.old_id)
     }
 
     fn replays_onto(&self, follower: &RecoverableStateDetails) -> bool {
@@ -404,6 +437,7 @@ mod test {
             details.apply_generation_bump(444);
             assert_eq!(details.can_recover_follower(&fork), FollowerRecovery::CanRecover);
 
+            /* ahead of us */
             fork.apply_inner_state_seq(30);
             assert_eq!(details.can_recover_follower(&fork), FollowerRecovery::CannotRecover);
         }
@@ -419,17 +453,90 @@ mod test {
 
         assert_eq!(details.can_recover_follower(&fork), FollowerRecovery::CanRecover);
 
+        /* forks cannot replay, but share our history and applied fewer
+         * actions */
         {
             let mut fork = fork.clone();
             fork.apply_generation_bump(555);
-            assert_eq!(details.can_recover_follower(&fork), FollowerRecovery::CannotRecover);
+            assert_eq!(details.can_recover_follower(&fork), FollowerRecovery::FollowerShouldReset);
         }
 
         {
             let mut fork = fork.clone();
             fork.apply_inner_state_seq(30);
-            assert_eq!(details.can_recover_follower(&fork), FollowerRecovery::CannotRecover);
+            assert_eq!(details.can_recover_follower(&fork), FollowerRecovery::FollowerShouldReset);
         }
+    }
+
+    fn apply_actions(details: &mut RecoverableStateDetails, count: u64) {
+        for _ in 0..count {
+            let seq = details.inner_state_next_seq;
+            details.apply_inner_state_seq(seq);
+        }
+    }
+
+    /// A history at sequence 400 that went through a few leaders.
+    fn common_history() -> RecoverableStateDetails {
+        let mut details = RecoverableStateDetails::new(10, 0);
+        for new_id in 11..14 {
+            details.apply_generation_bump(new_id);
+            apply_actions(&mut details, 100);
+        }
+        details.apply_generation_bump(14);
+        apply_actions(&mut details, 100);
+        details
+    }
+
+    #[test]
+    fn fork_with_fewer_actions_should_reset_to_the_longer_fork() {
+        /* the old leader kept writing to A and B's fork after C's side
+         * elected a new leader */
+        let mut short = common_history();
+        apply_actions(&mut short, 100);
+        let mut long = common_history();
+        long.apply_generation_bump(20);
+        apply_actions(&mut long, 600);
+        assert_eq!(short.inner_state_next_seq, 500);
+        assert_eq!(long.inner_state_next_seq, 1000);
+
+        assert_eq!(long.can_recover_follower(&short), FollowerRecovery::FollowerShouldReset);
+        assert_eq!(short.can_recover_follower(&long), FollowerRecovery::CannotRecover);
+
+        /* the fork is found however many leaders either side went through */
+        let mut longer = long.clone();
+        for new_id in 21..30 {
+            longer.apply_generation_bump(new_id);
+            apply_actions(&mut longer, 10);
+        }
+        let mut shorter = short.clone();
+        shorter.apply_generation_bump(40);
+        assert_eq!(longer.can_recover_follower(&shorter), FollowerRecovery::FollowerShouldReset);
+        assert_eq!(shorter.can_recover_follower(&longer), FollowerRecovery::CannotRecover);
+    }
+
+    #[test]
+    fn forks_at_the_same_sequence_do_not_reset_each_other() {
+        let mut left = common_history();
+        left.apply_generation_bump(20);
+        apply_actions(&mut left, 100);
+        let mut right = common_history();
+        right.apply_generation_bump(30);
+        apply_actions(&mut right, 100);
+
+        assert_eq!(left.can_recover_follower(&right), FollowerRecovery::CannotRecover);
+        assert_eq!(right.can_recover_follower(&left), FollowerRecovery::CannotRecover);
+    }
+
+    #[test]
+    fn unrelated_states_with_actions_do_not_reset_each_other() {
+        /* a state rebuilt from scratch can be newer at a lower sequence */
+        let mut rebuilt = RecoverableStateDetails::new(50, 0);
+        apply_actions(&mut rebuilt, 100);
+        let mut old = common_history();
+        apply_actions(&mut old, 500);
+
+        assert_eq!(old.can_recover_follower(&rebuilt), FollowerRecovery::CannotRecover);
+        assert_eq!(rebuilt.can_recover_follower(&old), FollowerRecovery::CannotRecover);
     }
 
     #[test]
@@ -449,7 +556,8 @@ mod test {
         let other_empty = RecoverableStateDetails::new(4, 0);
         assert_eq!(empty.can_recover_follower(&other_empty), FollowerRecovery::CannotRecover);
 
-        /* an empty leader never resets a follower holding actions */
+        /* an empty leader never resets a follower holding actions, nor
+         * another empty one */
         assert_eq!(empty.can_recover_follower(&leader), FollowerRecovery::CannotRecover);
         leader.apply_generation_bump(5);
         assert_eq!(leader.can_recover_follower(&empty), FollowerRecovery::FollowerShouldReset);

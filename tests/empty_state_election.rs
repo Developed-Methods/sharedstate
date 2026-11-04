@@ -1,8 +1,9 @@
 //! Three sync-servers start together with no clients. Two of them come up
-//! with an empty state (sequence 0), each under a new state identity, and
-//! one kept the cluster's state. The one holding the data must lead: a
-//! node that follows a leader it cannot recover from resets to the
-//! leader's state, so electing an empty node wipes the data cluster-wide.
+//! with an empty state (sequence 0), each under a new state identity, or
+//! with a fork of the cluster's history that fell behind, and one holds
+//! the most actions. That one must lead: a node that follows a leader it
+//! cannot recover from resets to the leader's state, so electing another
+//! node discards its actions cluster-wide.
 
 use std::{
     collections::BTreeMap,
@@ -28,8 +29,8 @@ use sharedstate::{
     SharedState, SharedStateRecoverableConfig, SharedStateSettings,
 };
 
-/// A and B restarted empty; C kept the data. C has the highest address so
-/// the lowest-address tiebreak works against it.
+/// C holds the most actions and has the highest address, so the
+/// lowest-address tiebreak works against it.
 const A: u64 = 1;
 const B: u64 = 2;
 const C: u64 = 3;
@@ -141,6 +142,27 @@ fn empty(id: u64) -> RecoverableState<KvState> {
     RecoverableState::new(id, KvState::default())
 }
 
+/// Applies actions for `keys` under a new leader with id `leader_id`.
+fn lead(state: &mut RecoverableState<KvState>, leader_id: u64, keys: std::ops::Range<u64>) {
+    state.update(&RecoverableStateAction::BumpGeneration { new_id: leader_id });
+    for key in keys {
+        state.update(&RecoverableStateAction::StateAction { action: (key, key) });
+    }
+}
+
+/// The cluster's history up to sequence 400, then split: A and B stayed
+/// with an old leader that reached sequence 500, C's side elected a new
+/// leader and reached `KEPT_SEQUENCE`.
+fn forked(base: u64) -> [RecoverableState<KvState>; 3] {
+    let mut common = empty(base);
+    lead(&mut common, base + 10, 0..400);
+    let mut behind = common.clone();
+    lead(&mut behind, base + 20, 400..500);
+    let mut ahead = common;
+    lead(&mut ahead, base + 30, 400..KEPT_SEQUENCE);
+    [behind.clone(), behind, ahead]
+}
+
 async fn start_node(net: &SimulatedNet, address: u64, initial_state: RecoverableState<KvState>) -> Node {
     let io = net.start_io(address).await;
     SharedState::start_recoverable(SharedStateRecoverableConfig {
@@ -177,17 +199,18 @@ async fn wait_for_common_leader(nodes: &BTreeMap<u64, Node>) -> u64 {
     }
 }
 
-async fn assert_data_holder_leads(kept: fn(u64) -> RecoverableState<KvState>) {
+/// `states` gives A, B and C their initial states for an attempt; ids
+/// must differ per attempt, like a restart.
+async fn assert_data_holder_leads(states: fn(u64) -> [RecoverableState<KvState>; 3]) {
     let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
 
     for attempt in 0..ATTEMPTS {
         let net = SimulatedNet::new();
-        /* identities must differ per node and per attempt, like a restart */
         let base = 1_000 * (attempt as u64 + 1);
         let mut nodes = BTreeMap::new();
-        nodes.insert(A, start_node(&net, A, empty(base + A)).await);
-        nodes.insert(B, start_node(&net, B, empty(base + B)).await);
-        nodes.insert(C, start_node(&net, C, kept(base + C)).await);
+        for (address, state) in NODES.into_iter().zip(states(base)) {
+            nodes.insert(address, start_node(&net, address, state).await);
+        }
 
         let leader = wait_for_common_leader(&nodes).await;
         let mut sequences = BTreeMap::new();
@@ -196,8 +219,18 @@ async fn assert_data_holder_leads(kept: fn(u64) -> RecoverableState<KvState>) {
         }
         assert_eq!(
             leader, C,
-            "attempt {attempt}: node {leader} with an empty state was elected over C, sequences now {sequences:?}"
+            "attempt {attempt}: node {leader} with fewer actions was elected over C, sequences now {sequences:?}"
         );
+
+        /* everyone ends up with C's state */
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for (address, node) in &nodes {
+            let mut handle = node.state_handle();
+            while handle.read_with(|state| state.state().seq) != KEPT_SEQUENCE {
+                assert!(Instant::now() < deadline, "attempt {attempt}: node {address} never took C's state");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
 
         for address in NODES {
             net.stop_node(address).await;
@@ -210,11 +243,18 @@ async fn assert_data_holder_leads(kept: fn(u64) -> RecoverableState<KvState>) {
 /// sequence.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_holding_a_snapshot_is_elected_over_empty_nodes() {
-    assert_data_holder_leads(kept_snapshot).await;
+    assert_data_holder_leads(|base| [empty(base + A), empty(base + B), kept_snapshot(base + C)]).await;
 }
 
 /// C kept the recoverable state it held in the cluster.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_holding_cluster_history_is_elected_over_empty_nodes() {
-    assert_data_holder_leads(kept_history).await;
+    assert_data_holder_leads(|base| [empty(base + A), empty(base + B), kept_history(base + C)]).await;
+}
+
+/// A and B hold a fork of the cluster's history that fell behind C's, so
+/// they can recover each other but not C, and C cannot replay onto them.
+#[tokio::test(flavor = "multi_thread")]
+async fn node_holding_the_longer_fork_is_elected_over_a_shared_shorter_fork() {
+    assert_data_holder_leads(forked).await;
 }
