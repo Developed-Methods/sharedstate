@@ -7,6 +7,9 @@ pub type MessageSizeHeader = u32;
 const MESSAGE_HEADER_SIZE: usize = std::mem::size_of::<MessageSizeHeader>();
 const KEEPALIVE_FRAME_SIZE: MessageSizeHeader = 0;
 const CLOSE_FRAME_SIZE: MessageSizeHeader = MessageSizeHeader::MAX;
+/// Frame lengths above this are logged before the buffer is sized to them.
+/// Full state snapshots are the largest frames and stay well below it.
+const OVERSIZED_FRAME_LEN: usize = 256 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ReadMessageResult<M> {
@@ -68,6 +71,9 @@ pub async fn read_message_to_vec<R: AsyncRead + Unpin>(
     }
 
     let msg_len = msg_len as usize;
+    if msg_len > OVERSIZED_FRAME_LEN {
+        tracing::warn!(msg_len, "oversized frame length read from the wire");
+    }
     buffer.clear();
     buffer.resize(msg_len, 0u8);
 
